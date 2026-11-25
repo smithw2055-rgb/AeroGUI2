@@ -102,11 +102,14 @@ constexpr float kDegToRad = kPi / 180.0f;
     return localRect;
 }
 
-[[nodiscard]] std::vector<float> ParseCsvFloats(std::string_view raw) {
-    std::vector<float> out;
+[[nodiscard]] std::size_t ParseCsvFloatsFixed(
+    std::string_view raw,
+    float* out,
+    std::size_t maxCount) noexcept {
+    std::size_t count = 0u;
     const char* p = raw.data();
     const char* end = raw.data() + raw.size();
-    while (p < end) {
+    while (p < end && count < maxCount) {
         while (p < end && (std::isspace(static_cast<unsigned char>(*p)) || *p == ',' || *p == ';')) {
             ++p;
         }
@@ -119,10 +122,10 @@ constexpr float kDegToRad = kPi / 180.0f;
             ++p;
             continue;
         }
-        out.push_back(val);
+        out[count++] = val;
         p = next;
     }
-    return out;
+    return count;
 }
 
 [[nodiscard]] std::vector<Point> TrimPolylineRange(
@@ -921,7 +924,8 @@ std::size_t VisualRenderAdapter::EmitTextVisual(
         const float maxH = (txt.trim == TextTrimming::None)
             ? 1000000.0f
             : std::max(1.0f, textRect.height);
-        TextLayoutResult measured{};
+        TextLayoutResult uncachedLayout{};
+        const TextLayoutResult* measuredPtr = nullptr;
         const std::uint64_t curFontRev = store->Fonts().Revision();
         if (node.HasTextData() &&
             txt.hasCachedLayout &&
@@ -930,8 +934,9 @@ std::size_t VisualRenderAdapter::EmitTextVisual(
             std::fabs(txt.cachedMaxW - maxW) <= 1e-3f &&
             (std::fabs(txt.cachedMaxH - maxH) <= 1e-3f ||
              (txt.trim == TextTrimming::None && maxH >= txt.cachedLayout.totalHeight - 1e-3f && txt.cachedMaxH >= txt.cachedLayout.totalHeight - 1e-3f))) {
-            measured = txt.cachedLayout;
+            measuredPtr = &txt.cachedLayout;
         } else {
+            TextLayoutResult computed{};
             if (!txt.richSpans.empty()) {
                 std::vector<RichTextRunInput> runs;
                 runs.reserve(txt.richSpans.size());
@@ -947,7 +952,7 @@ std::size_t VisualRenderAdapter::EmitTextVisual(
                     r.decorations = sp.decorations;
                     runs.push_back(r);
                 }
-                measured = store->Fonts().MeasureRichLayout(
+                computed = store->Fonts().MeasureRichLayout(
                     runs,
                     txt.fontFamily,
                     txt.fontSize,
@@ -961,7 +966,7 @@ std::size_t VisualRenderAdapter::EmitTextVisual(
                     txt.trim,
                     maxH);
             } else {
-                measured = store->Fonts().MeasureLayout(
+                computed = store->Fonts().MeasureLayout(
                     txt.text,
                     txt.fontFamily,
                     txt.fontSize,
@@ -976,14 +981,19 @@ std::size_t VisualRenderAdapter::EmitTextVisual(
                     maxH);
             }
             if (node.HasTextData()) {
-                txt.cachedLayout = measured;
+                txt.cachedLayout = std::move(computed);
                 txt.cachedMaxW = maxW;
                 txt.cachedMaxH = maxH;
                 txt.cachedRtl = node.layout.effectiveRtl;
                 txt.cachedFontRev = curFontRev;
                 txt.hasCachedLayout = true;
+                measuredPtr = &txt.cachedLayout;
+            } else {
+                uncachedLayout = std::move(computed);
+                measuredPtr = &uncachedLayout;
             }
         }
+        const TextLayoutResult& measured = *measuredPtr;
 
         std::size_t count = 0u;
         struct ScopedTreeHintBounds {
@@ -1116,12 +1126,20 @@ std::size_t VisualRenderAdapter::EmitTextVisual(
                 }
             }
             if (hasDecorations && !measured.lines.empty()) {
-                TextLayoutResult decoLayout = measured;
-                ApplyTextAlignmentToLayout(decoLayout, txt.align, textRect.width);
+                TextLayoutResult justifiedDeco{};
+                const TextLayoutResult* decoLayoutPtr = &measured;
+                const bool useJustify = (txt.align == TextAlignment::Justify && textRect.width > 0.0f);
+                if (useJustify) {
+                    justifiedDeco = measured;
+                    ApplyTextAlignmentToLayout(justifiedDeco, txt.align, textRect.width);
+                    decoLayoutPtr = &justifiedDeco;
+                }
+                const TextLayoutResult& decoLayout = *decoLayoutPtr;
                 const float strokeH = std::max(1.0f, txt.fontSize * 0.07f);
                 const bool nodeU = (txt.decorations & 1) != 0;
                 const bool nodeS = (txt.decorations & 2) != 0;
                 for (const TextLineMetrics& lm : decoLayout.lines) {
+                    const float decoDx = useJustify ? 0.0f : lineAlignDx(lm);
                     const std::size_t gEnd = std::min(lm.firstGlyphIndex + lm.glyphCount, decoLayout.glyphs.size());
                     auto emitDecoRun = [&](bool isStrike) {
                         std::size_t k = lm.firstGlyphIndex;
@@ -1154,7 +1172,7 @@ std::size_t VisualRenderAdapter::EmitTextVisual(
                                     : (lm.baselineY + std::max(1.0f, lm.descent * 0.35f)));
                                 const auto beginNid = static_cast<std::uint32_t>(tree.nodes_.size());
                                 (void)tree.AllocateRoundedRectNode(
-                                    textRect.x + xStart,
+                                    textRect.x + decoDx + xStart,
                                     barY,
                                     xEnd - xStart,
                                     strokeH,
@@ -1994,10 +2012,11 @@ std::size_t VisualRenderAdapter::EmitVectorVisual(
                     vec.strokeWidth <= 0.0f || effStrokeOp <= 0.001f) {
                     break;
                 }
-                const std::vector<float> nums = ParseCsvFloats(vec.pathOrParams);
+                float nums[4]{};
+                const std::size_t numCount = ParseCsvFloatsFixed(vec.pathOrParams, nums, 4u);
                 Point p0{rect.x, rect.y};
                 Point p1{rect.x + rect.width, rect.y + rect.height};
-                if (nums.size() >= 4u) {
+                if (numCount >= 4u) {
                     p0 = Point{rect.x + nums[0], rect.y + nums[1]};
                     p1 = Point{rect.x + nums[2], rect.y + nums[3]};
                 }
@@ -2040,10 +2059,11 @@ std::size_t VisualRenderAdapter::EmitVectorVisual(
                 if (!HasAlpha(rgba)) {
                     break;
                 }
-                const std::vector<float> nums = ParseCsvFloats(vec.pathOrParams);
-                const float startDeg = (nums.size() >= 1u) ? nums[0] : 0.0f;
-                const float sweepDeg = (nums.size() >= 2u) ? nums[1] : 360.0f;
-                const float innerRatio = (nums.size() >= 3u)
+                float nums[3]{};
+                const std::size_t numCount = ParseCsvFloatsFixed(vec.pathOrParams, nums, 3u);
+                const float startDeg = (numCount >= 1u) ? nums[0] : 0.0f;
+                const float sweepDeg = (numCount >= 2u) ? nums[1] : 360.0f;
+                const float innerRatio = (numCount >= 3u)
                     ? std::clamp(nums[2], 0.0f, 0.99f)
                     : 0.7f;
                 const float s0 = std::clamp(vec.trimStart, 0.0f, 1.0f);
@@ -3209,34 +3229,65 @@ std::size_t VisualRenderAdapter::EmitDropShadowSubtreeRecursive(
             false);
 
         if (!node->children.empty()) {
-            struct ZChild {
-                VisualNodeId id{};
-                std::int32_t z = 0;
-                std::size_t order = 0u;
-            };
-            std::vector<ZChild> sorted;
-            sorted.reserve(node->children.size());
-            for (std::size_t ci = 0u; ci < node->children.size(); ++ci) {
-                if (const VisualNode* ch = world.GetNode(node->children[ci])) {
-                    sorted.push_back(ZChild{node->children[ci], ch->layout.zIndex, ci});
+            bool uniformZ = (node->children.size() <= 1u);
+            if (!uniformZ) {
+                std::int32_t firstZ = 0;
+                bool hasFirstZ = false;
+                uniformZ = true;
+                for (VisualNodeId cid : node->children) {
+                    if (const VisualNode* ch = world.GetNode(cid)) {
+                        if (!hasFirstZ) {
+                            firstZ = ch->layout.zIndex;
+                            hasFirstZ = true;
+                        } else if (ch->layout.zIndex != firstZ) {
+                            uniformZ = false;
+                            break;
+                        }
+                    }
                 }
             }
-            std::sort(sorted.begin(), sorted.end(), [](const ZChild& a, const ZChild& b) {
-                if (a.z != b.z) {
-                    return a.z < b.z;
+            if (uniformZ) {
+                for (VisualNodeId cid : node->children) {
+                    count += EmitDropShadowSubtreeRecursive(
+                        world,
+                        cid,
+                        effOpacity,
+                        outTree,
+                        dropShadow,
+                        dx,
+                        dy,
+                        blurR);
                 }
-                return a.order < b.order;
-            });
-            for (const ZChild& item : sorted) {
-                count += EmitDropShadowSubtreeRecursive(
-                    world,
-                    item.id,
-                    effOpacity,
-                    outTree,
-                    dropShadow,
-                    dx,
-                    dy,
-                    blurR);
+            } else {
+                struct ZChild {
+                    VisualNodeId id{};
+                    std::int32_t z = 0;
+                    std::size_t order = 0u;
+                };
+                std::vector<ZChild> sorted;
+                sorted.reserve(node->children.size());
+                for (std::size_t ci = 0u; ci < node->children.size(); ++ci) {
+                    if (const VisualNode* ch = world.GetNode(node->children[ci])) {
+                        sorted.push_back(ZChild{node->children[ci], ch->layout.zIndex, ci});
+                    }
+                }
+                std::sort(sorted.begin(), sorted.end(), [](const ZChild& a, const ZChild& b) {
+                    if (a.z != b.z) {
+                        return a.z < b.z;
+                    }
+                    return a.order < b.order;
+                });
+                for (const ZChild& item : sorted) {
+                    count += EmitDropShadowSubtreeRecursive(
+                        world,
+                        item.id,
+                        effOpacity,
+                        outTree,
+                        dropShadow,
+                        dx,
+                        dy,
+                        blurR);
+                }
             }
         }
     }
@@ -3267,12 +3318,14 @@ std::size_t VisualRenderAdapter::SyncPagedRenderTree(
     UIResourceStore* store = resourceStore ? resourceStore : world.ResourceStore();
     outTree.SetResourceStore(store);
 
-    const bool noCustomDraws = (drawBuffer == nullptr || drawBuffer->Empty());
+    const std::uint64_t drawVer =
+        (drawBuffer && !drawBuffer->Empty()) ? drawBuffer->GlobalVersion() : 0u;
+    const bool drawBufferUnchanged = (drawVer == outTree.SyncedDrawBufferVersion());
 
     // Fast Path 1: nothing dirty and render tree already matches this world & structure version
     if (!world.HasAnyDirty() &&
         !world.IsStructureDirty() &&
-        noCustomDraws &&
+        drawBufferUnchanged &&
         outTree.MatchesSyncedWorldState(world.WorldInstanceId(), world.StructureVersion())) {
         return outTree.NodeCount();
     }
@@ -3280,7 +3333,7 @@ std::size_t VisualRenderAdapter::SyncPagedRenderTree(
     // Fast Path 2: visual-only leaf solid-box updates in place
     const auto& dirtyList = world.DirtyNodes();
     if (!world.IsStructureDirty() &&
-        noCustomDraws &&
+        drawBufferUnchanged &&
         !dirtyList.empty() &&
         outTree.MatchesSyncedWorldState(world.WorldInstanceId(), world.StructureVersion())) {
         bool allPatched = true;
@@ -3299,7 +3352,8 @@ std::size_t VisualRenderAdapter::SyncPagedRenderTree(
                 node->Effect().kind != UIEffectKind::None ||
                 node->OpacityMask().enabled ||
                 node->layout.layoutRect.width <= 0.0f ||
-                node->layout.layoutRect.height <= 0.0f) {
+                node->layout.layoutRect.height <= 0.0f ||
+                (drawBuffer != nullptr && drawBuffer->HasCommands(id))) {
                 allPatched = false;
                 break;
             }
@@ -3351,14 +3405,14 @@ std::size_t VisualRenderAdapter::SyncPagedRenderTree(
     outTree.Clear();
     outTree.SetResourceStore(store);
     if (!world.Root().IsValid()) {
-        outTree.SetSyncedWorldState(world.WorldInstanceId(), world.StructureVersion());
+        outTree.SetSyncedWorldState(world.WorldInstanceId(), world.StructureVersion(), drawVer);
         world.ClearDirtyFlags();
         return 0u;
     }
     outTree.ReserveCapacity(world.LiveNodeCount() * 2u);
     const std::size_t count =
         EmitNodeRecursive(&world, world, drawBuffer, world.Root(), 1.0f, outTree);
-    outTree.SetSyncedWorldState(world.WorldInstanceId(), world.StructureVersion());
+    outTree.SetSyncedWorldState(world.WorldInstanceId(), world.StructureVersion(), drawVer);
     world.ClearDirtyFlags();
     return count;
 }

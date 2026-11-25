@@ -523,7 +523,7 @@ void BakeGradientRowsIntoBuffer(
 
     std::uint32_t lowestRow = bottomRow;
     const std::size_t brushCount = registry.BrushCount();
-    GradientBrushDesc brushDesc{};
+    GradientEvalPod brushDesc{};
     for (std::size_t idx = 0; idx < brushCount; ++idx) {
         if (atlasSize < 4u + static_cast<std::uint32_t>(idx * 2u)) {
             break;
@@ -536,22 +536,22 @@ void BakeGradientRowsIntoBuffer(
         lowestRow = std::min(lowestRow, metaRow);
 
         const auto brushId = static_cast<std::uint32_t>(idx + 1u);
-        if (!registry.TryGetBrush(brushId, brushDesc)) {
+        if (!registry.TryGetEvalPod(brushId, brushDesc)) {
             continue;
         }
 
         if (rampRow >= bufferStartRow && (rampRow - bufferStartRow) < bufferRowCount) {
             const std::size_t localRampRow = static_cast<std::size_t>(rampRow - bufferStartRow);
-            const std::uint32_t rampWidth = std::min<std::uint32_t>(atlasSize, GradientBrushDesc::kLutWidth);
-            if (rampWidth == GradientBrushDesc::kLutWidth) {
+            const std::uint32_t rampWidth = std::min<std::uint32_t>(atlasSize, GradientEvalPod::kLutWidth);
+            if (rampWidth == GradientEvalPod::kLutWidth) {
                 std::memcpy(
                     bufferRgba8 + localRampRow * atlasSize * 4u,
                     brushDesc.bakedRampRgba8.data(),
-                    GradientBrushDesc::kLutWidth * 4u);
+                    GradientEvalPod::kLutWidth * 4u);
             } else if (rampWidth > 1u) {
                 for (std::uint32_t x = 0; x < rampWidth; ++x) {
                     const float t = static_cast<float>(x) / static_cast<float>(rampWidth - 1u);
-                    const Color c = SampleGradientRampAtT(brushDesc, t);
+                    const Color c = SampleGradientPodAtT(brushDesc, t);
                     const std::uint32_t packed = PackColorRgba8(c, 1.0f);
                     const std::size_t off = (localRampRow * atlasSize + x) * 4u;
                     bufferRgba8[off + 0u] = static_cast<std::uint8_t>(packed & 0xFFu);
@@ -1531,10 +1531,11 @@ void OpenGlDeviceBackend::Shutdown() noexcept {
     imageSlotTextures_.clear();
     ringSlotTailZeroed_.clear();
     ringSlotHasCustomClipW_.clear();
+    pageNeedsTailPad_.clear();
     uiAtlasScratchRgba8_.clear();
     imageUploadScratchRgba8_.clear();
     effectReadbackBottomUp_.clear();
-    effectReadbackTopDown_.clear();
+    effectRowScratch_.clear();
     effectPatchScratch_.clear();
     quadIndexMirror_.clear();
     initialized_ = false;
@@ -2011,15 +2012,19 @@ void OpenGlDeviceBackend::SyncUnifiedUiAtlas(const PagedRenderTree& tree) {
     const std::uint64_t curFontRev = fontAtlas.Revision();
     if (curFontRev != syncedFontRevision_) {
         std::uint32_t fontW = 0u;
+        std::uint32_t fontYOff = 0u;
         std::uint32_t fontRows = 0u;
-        std::uint64_t snapRev = curFontRev;
-        fontAtlas.CopyGlyphRegionRgba8(512u, uiAtlasScratchRgba8_, fontW, fontRows, &snapRev);
-        if (fontW == kUnifiedUiAtlasSize && fontRows > 0u) {
+        bool fullBand = false;
+        std::uint64_t snapRev = syncedFontRevision_;
+        fontAtlas.CopyGlyphDirtyBandRgba8(
+            512u, snapRev, uiAtlasScratchRgba8_, fontW, fontYOff, fontRows, fullBand);
+        if (fontW == kUnifiedUiAtlasSize && fontRows > 0u && fontYOff < 512u) {
+            const std::uint32_t clampedRows = std::min<std::uint32_t>(512u - fontYOff, fontRows);
             (void)UpdateAtlasSubRegion(
                 0u,
-                0u,
+                fontYOff,
                 fontW,
-                std::min<std::uint32_t>(512u, fontRows),
+                clampedRows,
                 uiAtlasScratchRgba8_.data());
         }
         syncedFontRevision_ = snapRev;
@@ -2162,16 +2167,6 @@ AeroGLuint OpenGlDeviceBackend::ResolveBatchImageTexture(
         }
     }
 
-    if (!imageAtlas.HasTextureSlot(textureId)) {
-        if (textureId < imageSlotTextures_.size() && imageSlotTextures_[textureId].texId != 0u) {
-            if (gl_.DeleteTextures) {
-                gl_.DeleteTextures(1, &imageSlotTextures_[textureId].texId);
-            }
-            imageSlotTextures_[textureId] = GlImageSlotState{};
-        }
-        return fallbackTex != 0u ? fallbackTex : atlasTextureId_;
-    }
-
     if (textureId >= imageSlotTextures_.size()) {
         imageSlotTextures_.resize(static_cast<std::size_t>(textureId) + 1u);
     }
@@ -2197,6 +2192,12 @@ AeroGLuint OpenGlDeviceBackend::ResolveBatchImageTexture(
             wasUpdated) ||
         slotW == 0u ||
         slotH == 0u) {
+        if (slot.texId != 0u) {
+            if (gl_.DeleteTextures) {
+                gl_.DeleteTextures(1, &slot.texId);
+            }
+            slot = GlImageSlotState{};
+        }
         return fallbackTex != 0u ? fallbackTex : atlasTextureId_;
     }
 
@@ -2259,6 +2260,9 @@ AeroGLuint OpenGlDeviceBackend::ResolveBatchImageTexture(
                 imageUploadScratchRgba8_.data());
         }
     }
+    if (imageUploadScratchRgba8_.capacity() > 256u * 1024u) {
+        std::vector<std::uint8_t>().swap(imageUploadScratchRgba8_);
+    }
 
     return slot.texId;
 }
@@ -2307,13 +2311,13 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
 
     // Only interior pages of a multi-page coalesced GpuClipDrawBatch require trailing zero-padding;
     // single-page batches and the final page of a batch draw exact clampedVerts via glDrawElements!
-    std::vector<std::uint8_t> pageNeedsTailPad(tree.PageCount(), 0u);
+    pageNeedsTailPad_.assign(tree.PageCount(), 0u);
     for (const GpuClipDrawBatch& batch : drawBatches) {
         if (batch.pageCount > 1u) {
             for (std::uint32_t i = 0u; i + 1u < batch.pageCount; ++i) {
                 const std::size_t pIdx = static_cast<std::size_t>(batch.firstPageIndex) + i;
-                if (pIdx < pageNeedsTailPad.size()) {
-                    pageNeedsTailPad[pIdx] = 1u;
+                if (pIdx < pageNeedsTailPad_.size()) {
+                    pageNeedsTailPad_[pIdx] = 1u;
                 }
             }
         }
@@ -2332,7 +2336,7 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
             continue;
         }
 
-        const bool mustPadTail = (span.pageIndex < pageNeedsTailPad.size() && pageNeedsTailPad[span.pageIndex] != 0u);
+        const bool mustPadTail = (span.pageIndex < pageNeedsTailPad_.size() && pageNeedsTailPad_[span.pageIndex] != 0u);
         if (mustPadTail && clampedBytes < kPageVertexBytes) {
             AeroVertex paddedPage[kVerticesPerCommandPage]{};
             std::memcpy(paddedPage, span.sourcePageVertexPtr, clampedBytes);
@@ -2374,7 +2378,7 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
             }
             const std::size_t activeBytes = activeVerts * sizeof(AeroVertex);
             const std::size_t dstOffset = slotIdx * kPageVertexBytes;
-            const bool mustPadTail = (p < pageNeedsTailPad.size() && pageNeedsTailPad[p] != 0u);
+            const bool mustPadTail = (p < pageNeedsTailPad_.size() && pageNeedsTailPad_[p] != 0u);
             if (mustPadTail && activeBytes < kPageVertexBytes && dstOffset + kPageVertexBytes <= ringBufferBytes_) {
                 AeroVertex paddedPage[kVerticesPerCommandPage]{};
                 std::memcpy(paddedPage, page.vertices.data(), activeBytes);
@@ -2400,8 +2404,8 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
     }
 
     // Ensure any pre-existing interior page of a newly coalesced multi-page batch has its tail zeroed
-    for (std::size_t pIdx = 0u; pIdx < pageNeedsTailPad.size(); ++pIdx) {
-        if (pageNeedsTailPad[pIdx] == 0u) {
+    for (std::size_t pIdx = 0u; pIdx < pageNeedsTailPad_.size(); ++pIdx) {
+        if (pageNeedsTailPad_[pIdx] == 0u) {
             continue;
         }
         const std::size_t slotIdx = pIdx % effRingPages;
@@ -3343,18 +3347,19 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
                 kGlUnsignedByte,
                 effectReadbackBottomUp_.data());
 
-            effectReadbackTopDown_.resize(effectReadbackBottomUp_.size());
-            for (int ry = 0; ry < bh; ++ry) {
-                const int srcRow = (bh - 1) - ry;
-                std::memcpy(
-                    effectReadbackTopDown_.data() + static_cast<std::size_t>(ry) * rowBytes,
-                    effectReadbackBottomUp_.data() + static_cast<std::size_t>(srcRow) * rowBytes,
-                    rowBytes);
+            effectRowScratch_.resize(rowBytes);
+            for (int ry = 0; ry < bh / 2; ++ry) {
+                const int oppRow = (bh - 1) - ry;
+                std::uint8_t* topPtr = effectReadbackBottomUp_.data() + static_cast<std::size_t>(ry) * rowBytes;
+                std::uint8_t* botPtr = effectReadbackBottomUp_.data() + static_cast<std::size_t>(oppRow) * rowBytes;
+                std::memcpy(effectRowScratch_.data(), topPtr, rowBytes);
+                std::memcpy(topPtr, botPtr, rowBytes);
+                std::memcpy(botPtr, effectRowScratch_.data(), rowBytes);
             }
             if (clearColor.a >= 0.999f) {
                 const std::size_t pxCount = static_cast<std::size_t>(bw) * static_cast<std::size_t>(bh);
                 for (std::size_t i = 0u; i < pxCount; ++i) {
-                    effectReadbackTopDown_[i * 4u + 3u] = 255u;
+                    effectReadbackBottomUp_[i * 4u + 3u] = 255u;
                 }
             }
 
@@ -3367,7 +3372,7 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
                     by0,
                     bw,
                     bh,
-                    effectReadbackTopDown_.data(),
+                    effectReadbackBottomUp_.data(),
                     patchX,
                     patchY,
                     patchW,
@@ -3457,6 +3462,16 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
     }
     gl_.ActiveTexture(kGlTexture0);
 
+    if (effectReadbackBottomUp_.capacity() > 512u * 1024u) {
+        std::vector<std::uint8_t>().swap(effectReadbackBottomUp_);
+    }
+    if (effectRowScratch_.capacity() > 64u * 1024u) {
+        std::vector<std::uint8_t>().swap(effectRowScratch_);
+    }
+    if (effectPatchScratch_.capacity() > 512u * 1024u) {
+        std::vector<std::uint8_t>().swap(effectPatchScratch_);
+    }
+
     telemetry_.framesPresented += 1u;
     stats.frameIndex = telemetry_.framesPresented;
     stats.succeeded = true;
@@ -3530,13 +3545,6 @@ bool SoftwareSurfaceBackend::Initialize(const GpuBackendConfig& config) {
         return false;
     }
 
-    if (config.autoBuildDefaultAtlas) {
-        PagedRenderTree refTree;
-        std::vector<std::uint8_t> defaultAtlas;
-        BuildDefaultUiAtlasRgba8(refTree, config.defaultAtlasSize, defaultAtlas);
-        (void)UploadAtlasTexture(config.defaultAtlasSize, config.defaultAtlasSize, defaultAtlas.data());
-    }
-
     framebufferWidth_ = config.initialViewportWidth;
     framebufferHeight_ = config.initialViewportHeight;
     lastRenderedTreeId_ = 0xFFFFFFFFu;
@@ -3557,7 +3565,6 @@ void SoftwareSurfaceBackend::Shutdown() noexcept {
     framebufferHeight_ = 0u;
     lastRenderedTreeId_ = 0xFFFFFFFFu;
     lastRenderedNodeCount_ = 0u;
-    ringMirrorBytes_.clear();
     quadIndexMirror_.clear();
     atlasRgba8_.clear();
     framebufferRgba8_.clear();
@@ -3626,12 +3633,11 @@ bool SoftwareSurfaceBackend::AllocateRingVertexBuffer(std::size_t maxPagesInRing
         return false;
     }
     maxPagesInRing_ = maxPagesInRing;
-    ringMirrorBytes_.assign(maxPagesInRing_ * kPageVertexBytes, 0u);
     return true;
 }
 
 bool SoftwareSurfaceBackend::EnsureQuadIndexCapacity(std::size_t requiredQuadCount) {
-    if (requiredQuadCount <= quadCapacity_ && !quadIndexMirror_.empty()) {
+    if (requiredQuadCount <= quadCapacity_) {
         return true;
     }
     std::size_t nextCap = std::max<std::size_t>(64u, quadCapacity_);
@@ -3642,12 +3648,19 @@ bool SoftwareSurfaceBackend::EnsureQuadIndexCapacity(std::size_t requiredQuadCou
         nextCap = std::max<std::size_t>(64u, requiredQuadCount);
     }
     const bool expanded = (quadCapacity_ > 0u);
-    BuildStaticQuadIndexBuffer(nextCap, quadIndexMirror_);
+    quadIndexMirror_.clear();
     quadCapacity_ = nextCap;
     if (expanded) {
         telemetry_.quadEboExpansionCount += 1u;
     }
     return true;
+}
+
+const std::vector<std::uint32_t>& SoftwareSurfaceBackend::QuadIndexCpuMirror() const noexcept {
+    if (quadIndexMirror_.empty() && quadCapacity_ > 0u) {
+        BuildStaticQuadIndexBuffer(quadCapacity_, quadIndexMirror_);
+    }
+    return quadIndexMirror_;
 }
 
 GpuBackendFrameStats SoftwareSurfaceBackend::ExecuteSubmission(
@@ -3677,18 +3690,7 @@ GpuBackendFrameStats SoftwareSurfaceBackend::ExecuteSubmission(
         if (!span.sourcePageVertexPtr || span.byteSize == 0u) {
             continue;
         }
-        const std::size_t slotIdx = span.pageIndex % effRingPages;
-        const std::size_t dstOffset = slotIdx * kPageVertexBytes;
         const std::size_t clampedBytes = std::min<std::size_t>(span.byteSize, kPageVertexBytes);
-        if (dstOffset + kPageVertexBytes <= ringMirrorBytes_.size()) {
-            std::memcpy(ringMirrorBytes_.data() + dstOffset, span.sourcePageVertexPtr, clampedBytes);
-            if (clampedBytes < kPageVertexBytes) {
-                std::memset(
-                    ringMirrorBytes_.data() + dstOffset + clampedBytes,
-                    0,
-                    kPageVertexBytes - clampedBytes);
-            }
-        }
         stats.dirtySpansUploaded += 1u;
         stats.bytesUploaded += clampedBytes;
     }

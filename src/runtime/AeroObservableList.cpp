@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
@@ -62,6 +63,16 @@ struct GlobalHookRegistry {
     std::unordered_set<SymbolId> wrapperTypes;
     std::unordered_map<std::uint64_t, PerHeapState> heaps;
 };
+
+[[nodiscard]] constexpr std::uint64_t wrapperBloomMask(SymbolId id) noexcept {
+    const std::uint64_t h0 = (static_cast<std::uint64_t>(id) * 11400714819323198485ull) >> 58u;
+    const std::uint64_t h1 = (static_cast<std::uint64_t>(id) * 7046029254386353131ull) >> 58u;
+    return (1ull << h0) | (1ull << h1);
+}
+
+std::atomic<std::uint64_t> gTrackedSlotEntries{0ull};
+std::atomic<std::uint64_t> gWrapperTypeBloom{0ull};
+std::atomic<bool> gHasWrapperTypes{false};
 
 GlobalHookRegistry& hookRegistry() noexcept {
     static GlobalHookRegistry instance;
@@ -155,7 +166,11 @@ void onHeapArrayMutated(
         auto& reg = hookRegistry();
         std::lock_guard<std::mutex> lock(reg.mutex);
         auto& hState = reg.heaps[heap.heapId()];
-        auto& entry = hState.arrays[slotKey(array)];
+        const auto [aIt, inserted] = hState.arrays.try_emplace(slotKey(array));
+        if (inserted) {
+            gTrackedSlotEntries.fetch_add(1ull, std::memory_order_release);
+        }
+        auto& entry = aIt->second;
         entry.arrayRef = array;
 
         const std::uint64_t nextVer = ++entry.mutationVersion;
@@ -222,7 +237,8 @@ void onHeapSlotSwept(
     void*,
     ManagedHeap& heap,
     ObjectRef sweptRef) {
-    if (!sweptRef.valid()) {
+    if (!sweptRef.valid() ||
+        gTrackedSlotEntries.load(std::memory_order_acquire) == 0ull) {
         return;
     }
     const std::uint64_t key = slotKey(sweptRef);
@@ -233,7 +249,8 @@ void onHeapSlotSwept(
         if (hIt == reg.heaps.end()) {
             return;
         }
-        hIt->second.uiObserverCounts.erase(key);
+        std::uint64_t removedEntries = 0ull;
+        removedEntries += static_cast<std::uint64_t>(hIt->second.uiObserverCounts.erase(key));
         if (sweptRef.kind == ObjectKind::Record) {
             const auto oIt = hIt->second.ownerArrays.find(key);
             if (oIt != hIt->second.ownerArrays.end()) {
@@ -248,6 +265,7 @@ void onHeapSlotSwept(
                     }
                 }
                 hIt->second.ownerArrays.erase(oIt);
+                ++removedEntries;
             }
         } else if (sweptRef.kind == ObjectKind::Array) {
             const auto aIt = hIt->second.arrays.find(key);
@@ -259,11 +277,16 @@ void onHeapSlotSwept(
                         vec.erase(std::remove(vec.begin(), vec.end(), key), vec.end());
                         if (vec.empty()) {
                             hIt->second.ownerArrays.erase(oIt);
+                            ++removedEntries;
                         }
                     }
                 }
                 hIt->second.arrays.erase(aIt);
+                ++removedEntries;
             }
+        }
+        if (removedEntries > 0ull) {
+            gTrackedSlotEntries.fetch_sub(removedEntries, std::memory_order_release);
         }
     }
 }
@@ -355,6 +378,13 @@ void ReleaseHeapHookUser(ManagedHeap* heap) noexcept {
             --hIt->second.attachedDomainUsers;
         }
         if (hIt->second.attachedDomainUsers == 0u && hIt->second.fieldListeners.empty()) {
+            const std::uint64_t dropCount =
+                static_cast<std::uint64_t>(hIt->second.arrays.size()) +
+                static_cast<std::uint64_t>(hIt->second.ownerArrays.size()) +
+                static_cast<std::uint64_t>(hIt->second.uiObserverCounts.size());
+            if (dropCount > 0ull) {
+                gTrackedSlotEntries.fetch_sub(dropCount, std::memory_order_release);
+            }
             reg.heaps.erase(hIt);
             uninstallCallbacks = true;
         }
@@ -374,11 +404,18 @@ void ObservableListHelper::RegisterWrapperType(SymbolId wrapperTypeId) {
     }
     auto& reg = hookRegistry();
     std::lock_guard<std::mutex> lock(reg.mutex);
-    reg.wrapperTypes.insert(wrapperTypeId);
+    if (reg.wrapperTypes.insert(wrapperTypeId).second) {
+        gWrapperTypeBloom.fetch_or(wrapperBloomMask(wrapperTypeId), std::memory_order_release);
+        gHasWrapperTypes.store(true, std::memory_order_release);
+    }
 }
 
 bool ObservableListHelper::IsWrapperType(SymbolId typeId) noexcept {
-    if (typeId == 0) {
+    if (typeId == 0 || !gHasWrapperTypes.load(std::memory_order_acquire)) {
+        return false;
+    }
+    const std::uint64_t reqMask = wrapperBloomMask(typeId);
+    if ((gWrapperTypeBloom.load(std::memory_order_acquire) & reqMask) != reqMask) {
         return false;
     }
     auto& reg = hookRegistry();
@@ -426,8 +463,11 @@ void ObservableListHelper::EnableTracking(
         std::lock_guard<std::mutex> lock(reg.mutex);
         auto& hState = reg.heaps[heap.heapId()];
         installHooksLocked(heap, hState);
-        auto& entry = hState.arrays[slotKey(arrRef)];
-        entry.arrayRef = arrRef;
+        const auto [aIt, inserted] = hState.arrays.try_emplace(slotKey(arrRef));
+        if (inserted) {
+            gTrackedSlotEntries.fetch_add(1ull, std::memory_order_release);
+        }
+        aIt->second.arrayRef = arrRef;
     }
     (void)heap.setArrayObserved(arrRef, true);
 }
@@ -610,7 +650,11 @@ void ObservableListHelper::BindOwnerProperty(
     auto& hState = reg.heaps[heap.heapId()];
     const std::uint64_t aKey = slotKey(arrRef);
     const std::uint64_t oKey = slotKey(ownerRef);
-    auto& entry = hState.arrays[aKey];
+    const auto [aIt, aInserted] = hState.arrays.try_emplace(aKey);
+    if (aInserted) {
+        gTrackedSlotEntries.fetch_add(1ull, std::memory_order_release);
+    }
+    auto& entry = aIt->second;
     entry.arrayRef = arrRef;
     for (const auto& existing : entry.owners) {
         if (existing.ownerRef == ownerRef && existing.bitIndex == bitIndex) {
@@ -618,7 +662,11 @@ void ObservableListHelper::BindOwnerProperty(
         }
     }
     entry.owners.push_back(OwnerBinding{ownerRef, bitIndex});
-    auto& oVec = hState.ownerArrays[oKey];
+    const auto [oIt, oInserted] = hState.ownerArrays.try_emplace(oKey);
+    if (oInserted) {
+        gTrackedSlotEntries.fetch_add(1ull, std::memory_order_release);
+    }
+    auto& oVec = oIt->second;
     if (std::find(oVec.begin(), oVec.end(), aKey) == oVec.end()) {
         oVec.push_back(aKey);
     }
@@ -665,6 +713,7 @@ void ObservableListHelper::UnbindOwnerProperty(
             vec.erase(std::remove(vec.begin(), vec.end(), aKey), vec.end());
             if (vec.empty()) {
                 hIt->second.ownerArrays.erase(oIt);
+                gTrackedSlotEntries.fetch_sub(1ull, std::memory_order_release);
             }
         }
     }
@@ -674,7 +723,8 @@ void ObservableListHelper::UnbindAllForOwnerField(
     ManagedHeap& heap,
     ObjectRef ownerRef,
     std::uint8_t bitIndex) noexcept {
-    if (!ownerRef.valid()) {
+    if (!ownerRef.valid() ||
+        gTrackedSlotEntries.load(std::memory_order_acquire) == 0ull) {
         return;
     }
     auto& reg = hookRegistry();
@@ -717,6 +767,7 @@ void ObservableListHelper::UnbindAllForOwnerField(
     }
     if (boundArrKeys.empty()) {
         hIt->second.ownerArrays.erase(oIt);
+        gTrackedSlotEntries.fetch_sub(1ull, std::memory_order_release);
     }
 }
 
@@ -732,7 +783,11 @@ void ObservableListHelper::AddUiObserver(
         std::lock_guard<std::mutex> lock(reg.mutex);
         auto& hState = reg.heaps[heap.heapId()];
         installHooksLocked(heap, hState);
-        auto& count = hState.uiObserverCounts[slotKey(ref)];
+        const auto [cIt, inserted] = hState.uiObserverCounts.try_emplace(slotKey(ref), 0u);
+        if (inserted) {
+            gTrackedSlotEntries.fetch_add(1ull, std::memory_order_release);
+        }
+        auto& count = cIt->second;
         firstObserver = (count == 0u);
         ++count;
     }
@@ -762,6 +817,7 @@ void ObservableListHelper::RemoveUiObserver(
         }
         if (cIt->second <= 1u) {
             counts.erase(cIt);
+            gTrackedSlotEntries.fetch_sub(1ull, std::memory_order_release);
             lastObserver = true;
         } else {
             --(cIt->second);

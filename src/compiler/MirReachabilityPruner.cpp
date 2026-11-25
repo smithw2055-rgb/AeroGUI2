@@ -202,9 +202,10 @@ constexpr std::array<std::string_view, 24> kColdSubsystemPropertyNames = {
     return false;
 }
 
-[[nodiscard]] std::unordered_set<SymbolId> CollectDispatchSlotIds(
-    const rs_sem::TypeSymbol& type) {
-    std::unordered_set<SymbolId> slots;
+void CollectDispatchSlotIdsInto(
+    const rs_sem::TypeSymbol& type,
+    std::unordered_set<SymbolId>& slots) {
+    slots.clear();
     for (const SymbolId targetId : type.virtualDispatchTable) {
         if (targetId != 0u) {
             slots.insert(targetId);
@@ -217,7 +218,6 @@ constexpr std::array<std::string_view, 24> kColdSubsystemPropertyNames = {
             }
         }
     }
-    return slots;
 }
 
 [[nodiscard]] std::size_t CountDistinctTypes(const std::vector<rs_mir::Module>& modules) {
@@ -321,8 +321,17 @@ bool PruneUnreachableStdlibMir(
     }
 
     // 1. Index all types, array-to-element mappings, functions, and declaring types.
+    std::size_t totalMirTypes = 0u;
+    std::size_t totalMirFns = 0u;
+    for (const auto& mod : mirModules) {
+        totalMirTypes += mod.types.size();
+        totalMirFns += mod.functions.size();
+    }
+
     std::unordered_map<SymbolId, const rs_sem::TypeSymbol*> typeById;
+    typeById.reserve(totalMirTypes);
     std::unordered_map<std::string, SymbolId> typeIdByCanonicalName;
+    typeIdByCanonicalName.reserve(totalMirTypes * 2u);
     for (const auto& mod : mirModules) {
         for (const auto& t : mod.types) {
             if (t.id == 0u) {
@@ -346,6 +355,7 @@ bool PruneUnreachableStdlibMir(
     }
 
     std::unordered_map<SymbolId, SymbolId> arrayTypeIdToElementTypeId;
+    arrayTypeIdToElementTypeId.reserve(typeById.size());
     for (const auto& [tid, tPtr] : typeById) {
         PrimitiveType elemPrim = PrimitiveType::Object;
         if (tPtr->kind == rs_sem::TypeKind::Struct) {
@@ -359,7 +369,9 @@ bool PruneUnreachableStdlibMir(
     }
 
     std::unordered_map<SymbolId, const rs_mir::Function*> funcById;
+    funcById.reserve(totalMirFns);
     std::unordered_map<std::string, std::vector<SymbolId>> funcIdsByName;
+    funcIdsByName.reserve(totalMirFns * 2u);
     for (const auto& mod : mirModules) {
         for (const auto& fn : mod.functions) {
             if (fn.symbolId != 0u) {
@@ -379,6 +391,7 @@ bool PruneUnreachableStdlibMir(
     // Inherited methods live inside derived TypeSymbol::methods with the SAME SymbolId,
     // so we MUST resolve declaring type from MIR function names before inspecting TypeSymbol::methods.
     std::unordered_map<SymbolId, SymbolId> funcIdToDeclaringTypeId;
+    funcIdToDeclaringTypeId.reserve(totalMirFns);
     for (const auto& mod : mirModules) {
         for (const auto& fn : mod.functions) {
             if (fn.symbolId == 0u || funcIdToDeclaringTypeId.count(fn.symbolId) != 0u) {
@@ -428,8 +441,11 @@ bool PruneUnreachableStdlibMir(
 
     // 2. Worklists & reachability closure helpers.
     std::unordered_set<SymbolId> liveTypeIds;
+    liveTypeIds.reserve(totalMirTypes / 4u + 64u);
     std::unordered_set<SymbolId> instantiatedTypeIds;
+    instantiatedTypeIds.reserve(totalMirTypes / 8u + 32u);
     std::unordered_set<SymbolId> liveFuncIds;
+    liveFuncIds.reserve(totalMirFns / 4u + 128u);
     std::vector<SymbolId> typeQueue;
     std::vector<SymbolId> funcQueue;
 
@@ -530,8 +546,15 @@ bool PruneUnreachableStdlibMir(
     };
 
     // 3. Seed roots: all non-stdlib modules + collect user reflection/binding property tokens.
-    std::unordered_set<std::string> userReferencedTokens;
+    constexpr std::uint32_t kAllColdPropMask =
+        (kColdSubsystemPropertyNames.size() >= 32u)
+            ? 0xFFFFFFFFu
+            : ((1u << kColdSubsystemPropertyNames.size()) - 1u);
+    std::uint32_t referencedColdPropMask = 0u;
     auto collectTokensFromString = [&](std::string_view sv) {
+        if (referencedColdPropMask == kAllColdPropMask) {
+            return;
+        }
         std::size_t i = 0u;
         while (i < sv.size()) {
             while (i < sv.size() &&
@@ -546,9 +569,16 @@ bool PruneUnreachableStdlibMir(
             }
             if (i > start && (i - start) <= 64u) {
                 const std::string_view tok = sv.substr(start, i - start);
-                userReferencedTokens.emplace(tok);
+                if (const int idx = FindColdSubsystemPropIndex(tok); idx >= 0) {
+                    referencedColdPropMask |= (1u << static_cast<unsigned>(idx));
+                }
                 if ((StartsWith(tok, "get_") || StartsWith(tok, "set_")) && tok.size() > 4u) {
-                    userReferencedTokens.emplace(tok.substr(4u));
+                    if (const int idx = FindColdSubsystemPropIndex(tok.substr(4u)); idx >= 0) {
+                        referencedColdPropMask |= (1u << static_cast<unsigned>(idx));
+                    }
+                }
+                if (referencedColdPropMask == kAllColdPropMask) {
+                    return;
                 }
             }
         }
@@ -560,13 +590,15 @@ bool PruneUnreachableStdlibMir(
         }
         for (const auto& fn : mod.functions) {
             markFuncId(fn.symbolId);
-            for (const auto& bb : fn.blocks) {
-                for (const auto& inst : bb.instructions) {
-                    if (!inst.stringImmediate.empty()) {
-                        collectTokensFromString(inst.stringImmediate);
-                    }
-                    if (!inst.symbolName.empty()) {
-                        collectTokensFromString(inst.symbolName);
+            if (referencedColdPropMask != kAllColdPropMask) {
+                for (const auto& bb : fn.blocks) {
+                    for (const auto& inst : bb.instructions) {
+                        if (!inst.stringImmediate.empty()) {
+                            collectTokensFromString(inst.stringImmediate);
+                        }
+                        if (!inst.symbolName.empty()) {
+                            collectTokensFromString(inst.symbolName);
+                        }
                     }
                 }
             }
@@ -575,13 +607,6 @@ bool PruneUnreachableStdlibMir(
             if (!IsPrunableStdlibModule(t.moduleName)) {
                 markInstantiatedTypeId(t.id);
             }
-        }
-    }
-
-    std::uint32_t referencedColdPropMask = 0u;
-    for (std::size_t idx = 0u; idx < kColdSubsystemPropertyNames.size(); ++idx) {
-        if (userReferencedTokens.count(std::string(kColdSubsystemPropertyNames[idx])) != 0u) {
-            referencedColdPropMask |= (1u << idx);
         }
     }
 
@@ -794,13 +819,14 @@ bool PruneUnreachableStdlibMir(
                 }),
             mod.types.end());
 
+        std::unordered_set<SymbolId> slotIds;
         for (auto& t : mod.types) {
             const std::string_view ownerMod =
                 !t.moduleName.empty() ? std::string_view(t.moduleName) : std::string_view(mod.name);
             if (!IsPrunableStdlibModule(ownerMod)) {
                 continue;
             }
-            const auto slotIds = CollectDispatchSlotIds(t);
+            CollectDispatchSlotIdsInto(t, slotIds);
             const bool isInstantiatedOwner = instantiatedTypeIds.count(t.id) != 0u;
             t.methods.erase(
                 std::remove_if(

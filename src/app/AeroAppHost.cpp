@@ -1017,6 +1017,9 @@ void AeroAppHost::WireKernelBridges() {
     platformHooks_.playSound = [this](std::string_view uri, float volume) {
         const float clampedVol = std::clamp(volume, 0.0f, 1.0f);
         const std::string resolved = ResolveSoundAssetPath(uri);
+        if (playedSounds_.size() >= 256u) {
+            playedSounds_.erase(playedSounds_.begin(), playedSounds_.begin() + 128);
+        }
         playedSounds_.push_back(PlayedSoundRecord{std::string(uri), resolved, clampedVol});
         if (!config_.headless && !resolved.empty()) {
             windowHost_.PlaySoundFile(resolved, clampedVol);
@@ -1492,12 +1495,6 @@ bool AeroAppHost::CompileAndLoad(
         }
         return false;
     }
-#ifdef _WIN32
-#ifdef _MSC_VER
-    (void)_heapmin();
-#endif
-    (void)HeapCompact(GetProcessHeap(), 0u);
-#endif
     return true;
 }
 
@@ -1596,7 +1593,7 @@ Interpreter* AeroAppHost::SimInterpreter() {
 
 bool AeroAppHost::InvokeSymbol(
     SymbolId fnId,
-    const std::vector<UnifiedValue>& args,
+    rs_rt::ValueSpan args,
     UnifiedValue* outResult,
     DomainKind domain) const {
     if (fnId == 0u) {
@@ -1618,7 +1615,7 @@ bool AeroAppHost::InvokeSymbol(
         rs_rt::ExecutionOptions execOpts{};
         execOpts.limits.instructionBudget = 128'000'000u;
         execOpts.limits.gcWorkBudget = 0u;
-        const auto exec = domains_.invokeMethod(domain, targetInterp, fnId, args, execOpts);
+        const auto exec = domains_.invokeMethod(domain, targetInterp, fnId, args.data(), args.size(), execOpts);
         if (IsAeroTraceEnabled()) {
             std::fprintf(stderr, "[AERO_TRACE] InvokeSymbol: returned ok=%d err=%s\n",
                 exec.succeeded ? 1 : 0, exec.error.message.c_str());
@@ -1695,7 +1692,7 @@ bool AeroAppHost::InstantiateAndMountEntry(std::string_view entryHint) {
             std::fflush(stderr);
         }
         UnifiedValue res{};
-        if (!InvokeSymbol(fnId, {}, &res, DomainKind::UiPresentation)) {
+        if (!InvokeSymbol(fnId, rs_rt::ValueSpan{}, &res, DomainKind::UiPresentation)) {
             if (trace) {
                 std::fprintf(stderr, "[AERO_TRACE] fnId=%llu invoke failed\n",
                     static_cast<unsigned long long>(fnId));
@@ -1903,11 +1900,13 @@ bool AeroAppHost::InstantiateAndMountEntry(std::string_view entryHint) {
                     ctorId = FindBytecodeFunctionSymbol(*programImage_, qName + "::.ctor");
                 }
                 if (ctorId != 0u) {
-                    (void)InvokeSymbol(ctorId, {UnifiedValue{*alloc}}, nullptr, DomainKind::UiPresentation);
+                    const UnifiedValue ctorArgs[1]{UnifiedValue{*alloc}};
+                    (void)InvokeSymbol(ctorId, rs_rt::ValueSpan{ctorArgs, 1u}, nullptr, DomainKind::UiPresentation);
                 }
                 const SymbolId initSym = FindBytecodeClassMethod(*programImage_, fullTs.id, "InitializeComponent", 0u);
                 if (initSym != 0u) {
-                    (void)InvokeSymbol(initSym, {UnifiedValue{*alloc}}, nullptr, DomainKind::UiPresentation);
+                    const UnifiedValue initArgs[1]{UnifiedValue{*alloc}};
+                    (void)InvokeSymbol(initSym, rs_rt::ValueSpan{initArgs, 1u}, nullptr, DomainKind::UiPresentation);
                 }
             }
         }
@@ -2078,7 +2077,8 @@ bool AeroAppHost::MountScriptRootObject(ObjectRef candidate) {
             ? FindBytecodeClassMethod(*programImage_, candTypeId, "InitializeComponent", 0u)
             : (aotDescriptor_ ? FindAotClassMethod(*aotDescriptor_, candTypeId, "InitializeComponent", 1u) : 0u);
         if (initSym != 0u) {
-            (void)InvokeSymbol(initSym, {UnifiedValue{candidate}}, nullptr, DomainKind::UiPresentation);
+            const UnifiedValue initArgs[1]{UnifiedValue{candidate}};
+            (void)InvokeSymbol(initSym, rs_rt::ValueSpan{initArgs, 1u}, nullptr, DomainKind::UiPresentation);
         }
         UnifiedValue checkWinVal{};
         const bool hasMainWin = ReadMemberFromHeap(
@@ -2097,9 +2097,10 @@ bool AeroAppHost::MountScriptRootObject(ObjectRef candidate) {
                 ? FindBytecodeClassMethod(*programImage_, candTypeId, "Run", 1u)
                 : (aotDescriptor_ ? FindAotClassMethod(*aotDescriptor_, candTypeId, "Run", 2u) : 0u);
             if (runSym != 0u) {
+                const UnifiedValue runArgs[2]{UnifiedValue{candidate}, UnifiedValue{rs_rt::NullObject{}}};
                 (void)InvokeSymbol(
                     runSym,
-                    {UnifiedValue{candidate}, UnifiedValue{rs_rt::NullObject{}}},
+                    rs_rt::ValueSpan{runArgs, 2u},
                     nullptr,
                     DomainKind::UiPresentation);
             } else {
@@ -2107,7 +2108,8 @@ bool AeroAppHost::MountScriptRootObject(ObjectRef candidate) {
                     ? FindBytecodeClassMethod(*programImage_, candTypeId, "Run", 0u)
                     : (aotDescriptor_ ? FindAotClassMethod(*aotDescriptor_, candTypeId, "Run", 1u) : 0u);
                 if (runSym != 0u) {
-                    (void)InvokeSymbol(runSym, {UnifiedValue{candidate}}, nullptr, DomainKind::UiPresentation);
+                    const UnifiedValue runArgs[1]{UnifiedValue{candidate}};
+                    (void)InvokeSymbol(runSym, rs_rt::ValueSpan{runArgs, 1u}, nullptr, DomainKind::UiPresentation);
                 }
             }
         }
@@ -2153,6 +2155,7 @@ bool AeroAppHost::MountScriptRootObject(ObjectRef candidate) {
         if (programImage_) {
             deferredShowSym = FindBytecodeClassMethod(*programImage_, typeId, "Show", 0u);
             symbols_.stepGame = FindBytecodeClassMethod(*programImage_, typeId, "StepGame", 1u);
+            symbols_.rootSyncHudFromSim = FindBytecodeClassMethod(*programImage_, typeId, "SyncHudFromSim", 0u);
             if (deferredShowSym == 0u && symbols_.windowShow != 0u) {
                 const rs_sem::TypeSymbol* rt = programImage_->resolveType(typeId);
                 if (rt && IsBytecodeTypeDerivedFrom(*programImage_, rt, "Window")) {
@@ -2162,6 +2165,7 @@ bool AeroAppHost::MountScriptRootObject(ObjectRef candidate) {
         } else if (aotDescriptor_) {
             deferredShowSym = FindAotClassMethod(*aotDescriptor_, typeId, "Show", 1u);
             symbols_.stepGame = FindAotClassMethod(*aotDescriptor_, typeId, "StepGame", 2u);
+            symbols_.rootSyncHudFromSim = FindAotClassMethod(*aotDescriptor_, typeId, "SyncHudFromSim", 1u);
             if (deferredShowSym == 0u && symbols_.windowShow != 0u) {
                 const rs_aot::TypeDescriptor* rt = FindAotTypeById(*aotDescriptor_, typeId);
                 if (rt && IsAotTypeDerivedFrom(*aotDescriptor_, rt, "Window")) {
@@ -2172,8 +2176,9 @@ bool AeroAppHost::MountScriptRootObject(ObjectRef candidate) {
 
         logTrace("MountScriptRootObject: invoking SetOverlayHost/ApplyTemplateSubtree");
         if (symbols_.popupSetOverlayHost != 0u) {
+            const UnifiedValue overlayArgs[1]{UnifiedValue{rootObject_}};
             (void)InvokeSymbol(
-                symbols_.popupSetOverlayHost, {UnifiedValue{rootObject_}}, nullptr, DomainKind::UiPresentation);
+                symbols_.popupSetOverlayHost, rs_rt::ValueSpan{overlayArgs, 1u}, nullptr, DomainKind::UiPresentation);
         }
         SymbolId tplSym = 0u;
         SymbolId loadSym = 0u;
@@ -2205,7 +2210,8 @@ bool AeroAppHost::MountScriptRootObject(ObjectRef candidate) {
             }
         }
         if (tplSym != 0u) {
-            (void)InvokeSymbol(tplSym, {UnifiedValue{rootObject_}}, nullptr, DomainKind::UiPresentation);
+            const UnifiedValue tplArgs[1]{UnifiedValue{rootObject_}};
+            (void)InvokeSymbol(tplSym, rs_rt::ValueSpan{tplArgs, 1u}, nullptr, DomainKind::UiPresentation);
         }
         deferredLoadSym = loadSym;
     }
@@ -2269,17 +2275,20 @@ bool AeroAppHost::MountScriptRootObject(ObjectRef candidate) {
         bool invokedShow = false;
         if (deferredShowSym != 0u) {
             logTrace("MountScriptRootObject: invoking deferred Show");
+            const UnifiedValue showArgs[1]{UnifiedValue{rootObject_}};
             invokedShow = InvokeSymbol(
-                deferredShowSym, {UnifiedValue{rootObject_}}, nullptr, DomainKind::UiPresentation);
+                deferredShowSym, rs_rt::ValueSpan{showArgs, 1u}, nullptr, DomainKind::UiPresentation);
         }
         if (!invokedShow && deferredLoadSym != 0u) {
-            (void)InvokeSymbol(deferredLoadSym, {UnifiedValue{rootObject_}}, nullptr, DomainKind::UiPresentation);
+            const UnifiedValue loadArgs[1]{UnifiedValue{rootObject_}};
+            (void)InvokeSymbol(deferredLoadSym, rs_rt::ValueSpan{loadArgs, 1u}, nullptr, DomainKind::UiPresentation);
         }
         world_.UpdateLayout(initW, initH);
         FlushBindings();
     } else if (deferredShowSym != 0u) {
         logTrace("MountScriptRootObject: invoking Show without visual root");
-        (void)InvokeSymbol(deferredShowSym, {UnifiedValue{rootObject_}}, nullptr, DomainKind::UiPresentation);
+        const UnifiedValue showArgs[1]{UnifiedValue{rootObject_}};
+        (void)InvokeSymbol(deferredShowSym, rs_rt::ValueSpan{showArgs, 1u}, nullptr, DomainKind::UiPresentation);
     }
 
     // Optional Dual-Domain SimDeterministic factory discovery (CreateSimState / CreateSim)
@@ -2290,12 +2299,22 @@ bool AeroAppHost::MountScriptRootObject(ObjectRef candidate) {
         if (simFnId != 0u) {
             UnifiedValue simRes{};
             domains_.setActiveDomain(DomainKind::SimDeterministic);
-            const bool okSim = InvokeSymbol(simFnId, {}, &simRes, DomainKind::SimDeterministic);
+            const bool okSim = InvokeSymbol(simFnId, rs_rt::ValueSpan{}, &simRes, DomainKind::SimDeterministic);
             domains_.setActiveDomain(DomainKind::UiPresentation);
             if (okSim) {
                 if (const auto* simRef = std::get_if<ObjectRef>(&simRes); simRef && simRef->valid()) {
                     simObject_ = *simRef;
                     simObjectPin_ = domains_.simHeap().retain(simObject_);
+                    const SymbolId simTypeId = domains_.simHeap().objectTypeIdFast(simObject_);
+                    if (simTypeId != 0u) {
+                        if (programImage_) {
+                            symbols_.simAdvanceTick = FindBytecodeClassMethod(
+                                *programImage_, simTypeId, "AdvanceTick", 1u);
+                        } else if (aotDescriptor_) {
+                            symbols_.simAdvanceTick = FindAotClassMethod(
+                                *aotDescriptor_, simTypeId, "AdvanceTick", 2u);
+                        }
+                    }
                     (void)InvokeScriptMethod(
                         rootObject_,
                         "AttachSimState",
@@ -2340,7 +2359,7 @@ bool AeroAppHost::HandleScriptInputEvent(
             }
             const NativeHandle argHandle =
                 (node && node->nativeHandle.valid()) ? node->nativeHandle : NativeHandle{};
-            const std::vector<UnifiedValue> args{
+            const UnifiedValue args[8]{
                 UnifiedValue{argHandle},
                 UnifiedValue{static_cast<std::int64_t>(static_cast<std::uint32_t>(flag))},
                 UnifiedValue{FloatValue{ev.x}},
@@ -2350,7 +2369,7 @@ bool AeroAppHost::HandleScriptInputEvent(
                 UnifiedValue{FloatValue{ev.deltaX}},
                 UnifiedValue{FloatValue{ev.deltaY}},
             };
-            if (!InvokeSymbol(symbols_.dispatchPointer, args, &res, DomainKind::UiPresentation)) {
+            if (!InvokeSymbol(symbols_.dispatchPointer, rs_rt::ValueSpan{args, 8u}, &res, DomainKind::UiPresentation)) {
                 return false;
             }
             bool handled = false;
@@ -2368,13 +2387,13 @@ bool AeroAppHost::HandleScriptInputEvent(
             if (symbols_.dispatchKey == 0u) {
                 return false;
             }
-            const std::vector<UnifiedValue> args{
+            const UnifiedValue args[4]{
                 UnifiedValue{node->nativeHandle},
                 UnifiedValue{static_cast<std::int64_t>(static_cast<std::uint32_t>(flag))},
                 UnifiedValue{static_cast<std::int64_t>(static_cast<std::uint16_t>(ev.key))},
                 UnifiedValue{static_cast<std::int64_t>(ev.modifiers)},
             };
-            if (!InvokeSymbol(symbols_.dispatchKey, args, &res, DomainKind::UiPresentation)) {
+            if (!InvokeSymbol(symbols_.dispatchKey, rs_rt::ValueSpan{args, 4u}, &res, DomainKind::UiPresentation)) {
                 return false;
             }
             bool handled = false;
@@ -2392,11 +2411,11 @@ bool AeroAppHost::HandleScriptInputEvent(
                 return false;
             }
             const std::string text(ev.utf8Bytes.data(), ev.utf8Length);
-            const std::vector<UnifiedValue> args{
+            const UnifiedValue args[2]{
                 UnifiedValue{node->nativeHandle},
                 UnifiedValue{StringValue{text}},
             };
-            if (!InvokeSymbol(symbols_.dispatchText, args, &res, DomainKind::UiPresentation)) {
+            if (!InvokeSymbol(symbols_.dispatchText, rs_rt::ValueSpan{args, 2u}, &res, DomainKind::UiPresentation)) {
                 return false;
             }
             bool handled = false;
@@ -2413,11 +2432,11 @@ bool AeroAppHost::HandleScriptInputEvent(
             if (symbols_.dispatchFocus == 0u) {
                 return false;
             }
-            const std::vector<UnifiedValue> args{
+            const UnifiedValue args[2]{
                 UnifiedValue{node->nativeHandle},
                 UnifiedValue{ev.isDown},
             };
-            return InvokeSymbol(symbols_.dispatchFocus, args, nullptr, DomainKind::UiPresentation);
+            return InvokeSymbol(symbols_.dispatchFocus, rs_rt::ValueSpan{args, 2u}, nullptr, DomainKind::UiPresentation);
         }
         default:
             return false;
@@ -2435,13 +2454,13 @@ Size AeroAppHost::HandleCustomMeasure(
     if (symbols_.dispatchCustomMeasure != 0u && node->nativeHandle.valid()) {
         const float aw = std::isfinite(availSize.width) ? availSize.width : -1.0f;
         const float ah = std::isfinite(availSize.height) ? availSize.height : -1.0f;
-        const std::vector<UnifiedValue> args{
+        const UnifiedValue args[3]{
             UnifiedValue{node->nativeHandle},
             UnifiedValue{FloatValue{aw}},
             UnifiedValue{FloatValue{ah}},
         };
         domains_.setActiveDomain(DomainKind::UiPresentation);
-        (void)InvokeSymbol(symbols_.dispatchCustomMeasure, args, nullptr, DomainKind::UiPresentation);
+        (void)InvokeSymbol(symbols_.dispatchCustomMeasure, rs_rt::ValueSpan{args, 3u}, nullptr, DomainKind::UiPresentation);
     }
 
     const VisualNode* updated = world.GetNode(nodeId);
@@ -2496,7 +2515,7 @@ void AeroAppHost::FlushBindings() {
         return;
     }
     domains_.setActiveDomain(DomainKind::UiPresentation);
-    (void)InvokeSymbol(symbols_.bindingFlush, {}, nullptr, DomainKind::UiPresentation);
+    (void)InvokeSymbol(symbols_.bindingFlush, rs_rt::ValueSpan{}, nullptr, DomainKind::UiPresentation);
 }
 
 void AeroAppHost::FlushBindingsPostLayout() {
@@ -2505,7 +2524,7 @@ void AeroAppHost::FlushBindingsPostLayout() {
         return;
     }
     domains_.setActiveDomain(DomainKind::UiPresentation);
-    (void)InvokeSymbol(symbols_.bindingFlushPostLayout, {}, nullptr, DomainKind::UiPresentation);
+    (void)InvokeSymbol(symbols_.bindingFlushPostLayout, rs_rt::ValueSpan{}, nullptr, DomainKind::UiPresentation);
 }
 
 bool AeroAppHost::DispatchPendingCanvasDraws() {
@@ -2523,17 +2542,29 @@ bool AeroAppHost::DispatchPendingCanvasDraws() {
             }
         }
     }
+    const auto& canvasNodes = world_.CanvasDrawNodes();
+    if (canvasNodes.empty()) {
+        return false;
+    }
+    VisualNodeId stackBuf[16];
+    std::vector<VisualNodeId> heapBuf;
+    const std::size_t snapshotCount = canvasNodes.size();
+    const VisualNodeId* snapshotPtr = stackBuf;
+    if (snapshotCount <= 16u) {
+        for (std::size_t i = 0u; i < snapshotCount; ++i) {
+            stackBuf[i] = canvasNodes[i];
+        }
+    } else {
+        heapBuf.assign(canvasNodes.begin(), canvasNodes.end());
+        snapshotPtr = heapBuf.data();
+    }
     bool anyDispatched = false;
-    const std::size_t slots = world_.ArenaSlotCount();
-    for (std::size_t s = 0u; s < slots; ++s) {
-        const VisualNode* node = world_.NodeAtSlot(s);
+    for (std::size_t idx = 0u; idx < snapshotCount; ++idx) {
+        const VisualNodeId nid = snapshotPtr[idx];
+        const VisualNode* node = world_.GetNode(nid);
         if (!node || !node->nativeHandle.valid()) {
             continue;
         }
-        if (node->kind != VisualKind::CanvasDraw && (node->callbackMask & VisualCallback_Draw) == 0u) {
-            continue;
-        }
-        const VisualNodeId nid = node->id;
         const float curW = node->layout.layoutRect.width;
         const float curH = node->layout.layoutRect.height;
         const std::uint64_t key = VisualNodeKey(nid);
@@ -2546,8 +2577,9 @@ bool AeroAppHost::DispatchPendingCanvasDraws() {
         }
         if (node->drawDirty || !drawBuffer_.FindCommands(nid) || sizeChanged) {
             lastCanvasDrawSizes_[key] = {curW, curH};
+            const UnifiedValue drawArgs[1]{UnifiedValue{node->nativeHandle}};
             domains_.setActiveDomain(DomainKind::UiPresentation);
-            (void)InvokeSymbol(symbols_.dispatchDraw, {UnifiedValue{node->nativeHandle}}, nullptr, DomainKind::UiPresentation);
+            (void)InvokeSymbol(symbols_.dispatchDraw, rs_rt::ValueSpan{drawArgs, 1u}, nullptr, DomainKind::UiPresentation);
             anyDispatched = true;
         }
     }
@@ -2605,12 +2637,25 @@ void AeroAppHost::StepFrameInternal(float dtSeconds, bool forceRenderSync, bool 
         simUpdated = true;
     }
     if (simObject_.valid() && dt > 0.0f) {
-        if (InvokeScriptMethod(
-                simObject_,
-                "AdvanceTick",
-                {UnifiedValue{FloatValue{dt}}},
-                nullptr,
-                DomainKind::SimDeterministic)) {
+        if (symbols_.simAdvanceTick != 0u) {
+            const DomainKind prevDomain = domains_.activeDomain();
+            domains_.setActiveDomain(DomainKind::SimDeterministic);
+            const UnifiedValue tickArgs[2]{UnifiedValue{simObject_}, UnifiedValue{FloatValue{dt}}};
+            if (InvokeSymbol(
+                    symbols_.simAdvanceTick,
+                    rs_rt::ValueSpan{tickArgs, 2u},
+                    nullptr,
+                    DomainKind::SimDeterministic)) {
+                pendingScriptSync_ = true;
+                simUpdated = true;
+            }
+            domains_.setActiveDomain(prevDomain);
+        } else if (InvokeScriptMethod(
+                       simObject_,
+                       "AdvanceTick",
+                       {UnifiedValue{FloatValue{dt}}},
+                       nullptr,
+                       DomainKind::SimDeterministic)) {
             simUpdated = true;
         }
     }
@@ -2652,23 +2697,39 @@ void AeroAppHost::StepFrameInternal(float dtSeconds, bool forceRenderSync, bool 
     simUpdated |= flushPendingSim();
 
     if (simUpdated && rootObject_.valid()) {
-        (void)InvokeScriptMethod(
-            rootObject_, "SyncHudFromSim", {}, nullptr, DomainKind::UiPresentation);
+        if (symbols_.rootSyncHudFromSim != 0u) {
+            const DomainKind prevDomain = domains_.activeDomain();
+            domains_.setActiveDomain(DomainKind::UiPresentation);
+            const UnifiedValue syncArgs[1]{UnifiedValue{rootObject_}};
+            if (InvokeSymbol(
+                    symbols_.rootSyncHudFromSim,
+                    rs_rt::ValueSpan{syncArgs, 1u},
+                    nullptr,
+                    DomainKind::UiPresentation)) {
+                pendingScriptSync_ = true;
+            }
+            domains_.setActiveDomain(prevDomain);
+        } else {
+            (void)InvokeScriptMethod(
+                rootObject_, "SyncHudFromSim", {}, nullptr, DomainKind::UiPresentation);
+        }
     }
 
     bool ranStepGame = false;
     if (!skipScriptFrameCallbacks && dt > 0.0f) {
         if (symbols_.stepGame != 0u && rootObject_.valid()) {
+            const UnifiedValue stepArgs[2]{UnifiedValue{rootObject_}, UnifiedValue{FloatValue{dt}}};
             ranStepGame = InvokeSymbol(
                 symbols_.stepGame,
-                {UnifiedValue{rootObject_}, UnifiedValue{FloatValue{dt}}},
+                rs_rt::ValueSpan{stepArgs, 2u},
                 nullptr,
                 DomainKind::UiPresentation);
         }
         if (symbols_.bindingStepFrameTicks != 0u) {
+            const UnifiedValue tickArgs[1]{UnifiedValue{FloatValue{dt}}};
             (void)InvokeSymbol(
                 symbols_.bindingStepFrameTicks,
-                {UnifiedValue{FloatValue{dt}}},
+                rs_rt::ValueSpan{tickArgs, 1u},
                 nullptr,
                 DomainKind::UiPresentation);
         }
@@ -2809,7 +2870,10 @@ void AeroAppHost::StepFrameInternal(float dtSeconds, bool forceRenderSync, bool 
 
     if (willTickWindowHost) {
         logTrace("TickAndPresentFrame");
-        (void)windowHost_.TickAndPresentFrame(0.0f, forceRenderSync || viewportChanged);
+        (void)windowHost_.TickAndPresentFrame(
+            0.0f,
+            forceRenderSync || viewportChanged,
+            needSync ? UiPhase_RenderRecord : UiPhase_None);
     }
     if (domains_.uiHeap().phase() == rs_rt::GcPhase::Idle &&
         domains_.uiHeap().nurserySize() >= 4096u) {
@@ -2861,7 +2925,7 @@ bool AeroAppHost::RenderHeadlessRgba(
         windowHost_.Mode() == NativeWindowMode::HeadlessSoftware &&
         windowHost_.Width() == width &&
         windowHost_.Height() == height) {
-        (void)windowHost_.TickAndPresentFrame(0.0f, true);
+        (void)windowHost_.TickAndPresentFrame(0.0f, true, UiPhase_RenderRecord);
     }
 
     std::uint32_t capW = 0u;
@@ -3139,9 +3203,13 @@ std::uint64_t AeroAppHost::RunWindowedLoop(std::uint64_t maxFrames) {
                 lastActiveTick = now;
                 hasLastActiveTick = true;
                 if (symbols_.stepGame != 0u && rootObject_.valid()) {
+                    const UnifiedValue stepArgs[2]{
+                        UnifiedValue{rootObject_},
+                        UnifiedValue{FloatValue{activeStepDt}},
+                    };
                     if (InvokeSymbol(
                             symbols_.stepGame,
-                            {UnifiedValue{rootObject_}, UnifiedValue{FloatValue{activeStepDt}}},
+                            rs_rt::ValueSpan{stepArgs, 2u},
                             nullptr,
                             DomainKind::UiPresentation)) {
                         pendingScriptSync_ = true;
@@ -3158,9 +3226,10 @@ std::uint64_t AeroAppHost::RunWindowedLoop(std::uint64_t maxFrames) {
             lastFrameTick = now;
             hasLastFrameTick = true;
             if (symbols_.bindingStepFrameTicks != 0u) {
+                const UnifiedValue tickArgs[1]{UnifiedValue{FloatValue{timerDt}}};
                 (void)InvokeSymbol(
                     symbols_.bindingStepFrameTicks,
-                    {UnifiedValue{FloatValue{timerDt}}},
+                    rs_rt::ValueSpan{tickArgs, 1u},
                     nullptr,
                     DomainKind::UiPresentation);
             }
@@ -3317,7 +3386,11 @@ bool AeroAppHost::InvokeScriptFunction(
     }
     const DomainKind prevDomain = domains_.activeDomain();
     domains_.setActiveDomain(domain);
-    const bool ok = InvokeSymbol(fnId, args, outResult, domain);
+    const bool ok = InvokeSymbol(
+        fnId,
+        rs_rt::ValueSpan{args.data(), args.size()},
+        outResult,
+        domain);
     if (ok) {
         pendingScriptSync_ = true;
     }
@@ -3365,7 +3438,11 @@ bool AeroAppHost::InvokeScriptMethod(
 
     const DomainKind prevDomain = domains_.activeDomain();
     domains_.setActiveDomain(domain);
-    const bool ok = InvokeSymbol(fnId, fullArgs, outResult, domain);
+    const bool ok = InvokeSymbol(
+        fnId,
+        rs_rt::ValueSpan{fullArgs.data(), fullArgs.size()},
+        outResult,
+        domain);
     if (ok) {
         pendingScriptSync_ = true;
     }

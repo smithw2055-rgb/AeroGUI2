@@ -97,6 +97,30 @@ namespace {
     return {};
 }
 
+[[nodiscard]] std::string_view ArgStringView(rs_rt::ValueSpan args, std::size_t idx) noexcept {
+    if (idx >= args.size()) return {};
+    if (const auto* sv = std::get_if<rs_rt::StringValue>(&args[idx])) {
+        return sv->str();
+    }
+    return {};
+}
+
+[[nodiscard]] std::string_view ArgStringView(
+    const ExecutionDomainContext& domains,
+    rs_rt::ValueSpan args,
+    std::size_t idx) {
+    if (idx >= args.size()) return {};
+    if (const auto* sv = std::get_if<rs_rt::StringValue>(&args[idx])) {
+        return sv->str();
+    }
+    if (const auto* ov = std::get_if<rs_rt::ObjectRef>(&args[idx]); ov && ov->valid()) {
+        if (const auto view = domains.stringViewAcrossDomains(*ov)) {
+            return *view;
+        }
+    }
+    return {};
+}
+
 [[nodiscard]] rs_rt::ObjectRef ArgObject(rs_rt::ValueSpan args, std::size_t idx) noexcept {
     if (idx >= args.size()) return rs_rt::ObjectRef{};
     if (const auto* ov = std::get_if<rs_rt::ObjectRef>(&args[idx])) {
@@ -233,6 +257,33 @@ struct ReflectHostEnv {
         }
     }
     return false;
+}
+
+[[nodiscard]] std::string_view ExtractStringArgView(
+    const ReflectHostEnv& env,
+    rs_rt::ValueSpan args,
+    std::size_t idx,
+    std::string& scratch) {
+    if (idx >= args.size()) return {};
+    if (const auto* sv = std::get_if<rs_rt::StringValue>(&args[idx])) {
+        return sv->str();
+    }
+    if (const auto* ov = std::get_if<rs_rt::ObjectRef>(&args[idx]); ov && ov->valid()) {
+        if (env.domains) {
+            if (const auto view = env.domains->stringViewAcrossDomains(*ov)) {
+                return *view;
+            }
+        }
+        if (rs_rt::ManagedHeap* h = ResolveTargetHeap(env, *ov)) {
+            if (const auto view = h->stringView(*ov)) {
+                return *view;
+            }
+        }
+    }
+    if (TryExtractStringValue(env, args[idx], scratch)) {
+        return scratch;
+    }
+    return {};
 }
 
 [[nodiscard]] std::string AotTypeQualifiedName(const rs_aot::TypeDescriptor& td) {
@@ -1344,7 +1395,7 @@ bool RegisterVisualHostBindings(
         desc.endPoint = Point{ArgFloat(args, 2, 1.0f), ArgFloat(args, 3, 1.0f)};
         desc.spreadMethod = static_cast<GradientSpreadMethod>(ArgInt(args, 4, 0));
         desc.mappingMode = static_cast<BrushMappingMode>(ArgInt(args, 5, 0));
-        ParseStopsSpec(ArgString(domains, args, 6), desc);
+        ParseStopsSpec(ArgStringView(domains, args, 6), desc);
         const std::uint32_t id = world.ResourceStore()->GradientBrushes().RegisterBrush(std::move(desc));
         return rs_rt::Value{static_cast<std::int64_t>(id)};
     });
@@ -1357,7 +1408,7 @@ bool RegisterVisualHostBindings(
         desc.radiusY = ArgFloat(args, 5, 0.5f);
         desc.spreadMethod = static_cast<GradientSpreadMethod>(ArgInt(args, 6, 0));
         desc.mappingMode = static_cast<BrushMappingMode>(ArgInt(args, 7, 0));
-        ParseStopsSpec(ArgString(domains, args, 8), desc);
+        ParseStopsSpec(ArgStringView(domains, args, 8), desc);
         const std::uint32_t id = world.ResourceStore()->GradientBrushes().RegisterBrush(std::move(desc));
         return rs_rt::Value{static_cast<std::int64_t>(id)};
     });
@@ -1367,7 +1418,7 @@ bool RegisterVisualHostBindings(
         desc.center = Point{ArgFloat(args, 0, 0.5f), ArgFloat(args, 1, 0.5f)};
         desc.spreadMethod = static_cast<GradientSpreadMethod>(ArgInt(args, 2, 0));
         desc.mappingMode = static_cast<BrushMappingMode>(ArgInt(args, 3, 0));
-        ParseStopsSpec(ArgString(domains, args, 4), desc);
+        ParseStopsSpec(ArgStringView(domains, args, 4), desc);
         const std::uint32_t id = world.ResourceStore()->GradientBrushes().RegisterBrush(std::move(desc));
         return rs_rt::Value{static_cast<std::int64_t>(id)};
     });
@@ -1463,8 +1514,8 @@ bool RegisterVisualHostBindings(
     ok &= bindFn("Visual_SetText", [&world, &domains](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         (void)world.SetText(
             ArgNode(args, 0, world),
-            ArgString(domains, args, 1),
-            ArgString(domains, args, 2),
+            ArgStringView(domains, args, 1),
+            ArgStringView(domains, args, 2),
             ArgFloat(args, 3, 14.0f),
             ArgUInt(args, 4, 0xFF000000u),
             static_cast<TextWrapping>(ArgInt(args, 5, 0)),
@@ -1502,8 +1553,8 @@ bool RegisterVisualHostBindings(
     ok &= bindFn("Visual_AddTextSpan", [&world, &domains](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         (void)world.AddTextSpan(
             ArgNode(args, 0, world),
-            ArgString(domains, args, 1),
-            ArgString(domains, args, 2),
+            ArgStringView(domains, args, 1),
+            ArgStringView(domains, args, 2),
             ArgFloat(args, 3, 0.0f),
             static_cast<int>(ArgInt(args, 4, 0)),
             static_cast<std::int8_t>(ArgInt(args, 5, -1)),
@@ -1525,8 +1576,8 @@ bool RegisterVisualHostBindings(
     });
     ok &= bindFn("Visual_MeasureText", [&world, &domains](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         const Size measured = world.MeasureText(
-            ArgString(domains, args, 0),
-            ArgString(domains, args, 1),
+            ArgStringView(domains, args, 0),
+            ArgStringView(domains, args, 1),
             ArgFloat(args, 2, 14.0f),
             ArgFloat(args, 3, 1000000.0f),
             static_cast<TextWrapping>(ArgInt(args, 4, 0)));
@@ -1539,7 +1590,7 @@ bool RegisterVisualHostBindings(
     ok &= bindFn("Visual_SetImage", [&world, &domains](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         (void)world.SetImage(
             ArgNode(args, 0, world),
-            ArgString(domains, args, 1),
+            ArgStringView(domains, args, 1),
             static_cast<Stretch>(ArgInt(args, 2, 2)),
             static_cast<StretchDirection>(ArgInt(args, 3, 2)),
             ArgUInt(args, 4, 0xFFFFFFFFu));
@@ -1581,7 +1632,7 @@ bool RegisterVisualHostBindings(
         (void)world.SetVectorShape(
             ArgNode(args, 0, world),
             static_cast<VectorShapeKind>(ArgInt(args, 1, 0)),
-            ArgString(domains, args, 2),
+            ArgStringView(domains, args, 2),
             ArgUInt(args, 3),
             static_cast<std::int32_t>(ArgInt(args, 4, -1)),
             ArgUInt(args, 5),
@@ -1602,7 +1653,7 @@ bool RegisterVisualHostBindings(
     ok &= bindFn("Visual_SetVectorStrokeDash", [&world, &domains](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         (void)world.SetVectorStrokeDash(
             ArgNode(args, 0, world),
-            ArgString(domains, args, 1),
+            ArgStringView(domains, args, 1),
             static_cast<std::int32_t>(ArgInt(args, 2, 0)),
             static_cast<std::int32_t>(ArgInt(args, 3, 0)),
             static_cast<std::int32_t>(ArgInt(args, 4, 0)));
@@ -1649,18 +1700,18 @@ bool RegisterVisualHostBindings(
         return rs_rt::Value{std::int64_t{0}};
     });
     ok &= bindFn("Draw_Path", [&world, &drawBuffer, &domains](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
-        drawBuffer.DrawPath(ArgNode(args, 0, world), ArgString(domains, args, 1), ArgFloat(args, 2), ArgFloat(args, 3), ArgFloat(args, 4), ArgFloat(args, 5), ArgUInt(args, 6), ArgUInt(args, 7), ArgFloat(args, 8, 1.0f));
+        drawBuffer.DrawPath(ArgNode(args, 0, world), ArgStringView(domains, args, 1), ArgFloat(args, 2), ArgFloat(args, 3), ArgFloat(args, 4), ArgFloat(args, 5), ArgUInt(args, 6), ArgUInt(args, 7), ArgFloat(args, 8, 1.0f));
         return rs_rt::Value{std::int64_t{0}};
     });
     ok &= bindFn("Draw_Text", [&world, &drawBuffer, &domains](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         drawBuffer.DrawText(
             ArgNode(args, 0, world),
-            ArgString(domains, args, 1),
+            ArgStringView(domains, args, 1),
             ArgFloat(args, 2),
             ArgFloat(args, 3),
             ArgFloat(args, 4),
             ArgFloat(args, 5),
-            ArgString(domains, args, 6),
+            ArgStringView(domains, args, 6),
             ArgFloat(args, 7, 14.0f),
             ArgUInt(args, 8, 0xFF000000u),
             static_cast<HorizontalAlignment>(ArgInt(args, 9, 0)),
@@ -1886,7 +1937,7 @@ bool RegisterVisualHostBindings(
         return rs_rt::Value{rs_rt::StringValue{inputRouter.GetClipboardText()}};
     });
     ok &= bindFn("Host_SetClipboardText", [&inputRouter, &domains](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
-        inputRouter.SetClipboardText(ArgString(domains, args, 0));
+        inputRouter.SetClipboardText(ArgStringView(domains, args, 0));
         return rs_rt::Value{std::int64_t{0}};
     });
     ok &= bindFn("Host_RequestWake", [platformHooks](const rs_bc::FunctionReference&, rs_rt::ValueSpan, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
@@ -1914,7 +1965,7 @@ bool RegisterVisualHostBindings(
     });
     ok &= bindFn("Host_PlaySound", [platformHooks, &domains](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         if (platformHooks && platformHooks->playSound) {
-            platformHooks->playSound(ArgString(domains, args, 0), ArgFloat(args, 1, 1.0f));
+            platformHooks->playSound(ArgStringView(domains, args, 0), ArgFloat(args, 1, 1.0f));
         }
         return rs_rt::Value{std::int64_t{0}};
     });
@@ -1949,12 +2000,13 @@ bool RegisterVisualHostBindings(
     // Reflection & color utilities
     ok &= bindFn("Reflect_GetPropString", [reflectEnv](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         const rs_rt::ObjectRef target = ArgObject(args, 0);
-        std::string propPath;
-        if (!TryExtractStringValue(reflectEnv, args.size() > 1u ? args[1] : rs_rt::Value{}, propPath)) {
-            propPath = ArgString(args, 1);
-        }
+        std::string propPathScratch;
+        const std::string_view propPath = ExtractStringArgView(reflectEnv, args, 1, propPathScratch);
         rs_rt::Value val{};
         if (ReadDotPathValue(reflectEnv, target, propPath, val)) {
+            if (const auto* sv = std::get_if<rs_rt::StringValue>(&val)) {
+                return rs_rt::Value{*sv};
+            }
             std::string outStr;
             if (TryExtractStringValue(reflectEnv, val, outStr)) {
                 return rs_rt::Value{rs_rt::StringValue{std::move(outStr)}};
@@ -1964,10 +2016,8 @@ bool RegisterVisualHostBindings(
     });
     ok &= bindFn("Reflect_GetPropFloat", [reflectEnv](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         const rs_rt::ObjectRef target = ArgObject(args, 0);
-        std::string propPath;
-        if (!TryExtractStringValue(reflectEnv, args.size() > 1u ? args[1] : rs_rt::Value{}, propPath)) {
-            propPath = ArgString(args, 1);
-        }
+        std::string propPathScratch;
+        const std::string_view propPath = ExtractStringArgView(reflectEnv, args, 1, propPathScratch);
         rs_rt::Value val{};
         if (ReadDotPathValue(reflectEnv, target, propPath, val)) {
             float fv = 0.0f;
@@ -1984,10 +2034,8 @@ bool RegisterVisualHostBindings(
     });
     ok &= bindFn("Reflect_GetPropInt", [reflectEnv](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         const rs_rt::ObjectRef target = ArgObject(args, 0);
-        std::string propPath;
-        if (!TryExtractStringValue(reflectEnv, args.size() > 1u ? args[1] : rs_rt::Value{}, propPath)) {
-            propPath = ArgString(args, 1);
-        }
+        std::string propPathScratch;
+        const std::string_view propPath = ExtractStringArgView(reflectEnv, args, 1, propPathScratch);
         rs_rt::Value val{};
         if (ReadDotPathValue(reflectEnv, target, propPath, val)) {
             std::int64_t iv = 0;
@@ -2007,14 +2055,10 @@ bool RegisterVisualHostBindings(
     ok &= bindFn("Reflect_ResolveEnumOrdinal", [reflectEnv](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         constexpr std::int64_t kNotFound = std::int64_t{-2147483647};
         const rs_rt::ObjectRef target = ArgObject(args, 0);
-        std::string propPath;
-        if (!TryExtractStringValue(reflectEnv, args.size() > 1u ? args[1] : rs_rt::Value{}, propPath)) {
-            propPath = ArgString(args, 1);
-        }
-        std::string memberName;
-        if (!TryExtractStringValue(reflectEnv, args.size() > 2u ? args[2] : rs_rt::Value{}, memberName)) {
-            memberName = ArgString(args, 2);
-        }
+        std::string propPathScratch;
+        const std::string_view propPath = ExtractStringArgView(reflectEnv, args, 1, propPathScratch);
+        std::string memberNameScratch;
+        const std::string_view memberName = ExtractStringArgView(reflectEnv, args, 2, memberNameScratch);
         rs_rt::Value val{};
         rs_rt::EnumValue ev{};
         if (memberName.empty() || !ReadDotPathValue(reflectEnv, target, propPath, val) || !val.tryGetEnum(ev) || ev.typeId == 0u) {
@@ -2044,10 +2088,8 @@ bool RegisterVisualHostBindings(
     });
     ok &= bindFn("Reflect_GetPropBool", [reflectEnv](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         const rs_rt::ObjectRef target = ArgObject(args, 0);
-        std::string propPath;
-        if (!TryExtractStringValue(reflectEnv, args.size() > 1u ? args[1] : rs_rt::Value{}, propPath)) {
-            propPath = ArgString(args, 1);
-        }
+        std::string propPathScratch;
+        const std::string_view propPath = ExtractStringArgView(reflectEnv, args, 1, propPathScratch);
         rs_rt::Value val{};
         if (ReadDotPathValue(reflectEnv, target, propPath, val)) {
             bool bv = false;
@@ -2059,10 +2101,8 @@ bool RegisterVisualHostBindings(
     });
     ok &= bindFn("Reflect_GetPropObject", [reflectEnv](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         const rs_rt::ObjectRef target = ArgObject(args, 0);
-        std::string propPath;
-        if (!TryExtractStringValue(reflectEnv, args.size() > 1u ? args[1] : rs_rt::Value{}, propPath)) {
-            propPath = ArgString(args, 1);
-        }
+        std::string propPathScratch;
+        const std::string_view propPath = ExtractStringArgView(reflectEnv, args, 1, propPathScratch);
         rs_rt::Value val{};
         if (ReadDotPathValue(reflectEnv, target, propPath, val)) {
             if (const auto* ov = std::get_if<rs_rt::ObjectRef>(&val);
@@ -2074,10 +2114,8 @@ bool RegisterVisualHostBindings(
     });
     ok &= bindFn("Reflect_GetPropTypeKind", [reflectEnv](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         const rs_rt::ObjectRef target = ArgObject(args, 0);
-        std::string propPath;
-        if (!TryExtractStringValue(reflectEnv, args.size() > 1u ? args[1] : rs_rt::Value{}, propPath)) {
-            propPath = ArgString(args, 1);
-        }
+        std::string propPathScratch;
+        const std::string_view propPath = ExtractStringArgView(reflectEnv, args, 1, propPathScratch);
         rs_rt::Value val{};
         if (!ReadDotPathValue(reflectEnv, target, propPath, val)) {
             return rs_rt::Value{std::int64_t{0}};
@@ -2117,9 +2155,12 @@ bool RegisterVisualHostBindings(
     });
     ok &= bindFn("Reflect_SetPropString", [reflectEnv](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         const rs_rt::ObjectRef target = ArgObject(args, 0);
-        std::string propPath;
-        if (!TryExtractStringValue(reflectEnv, args.size() > 1u ? args[1] : rs_rt::Value{}, propPath)) {
-            propPath = ArgString(args, 1);
+        std::string propPathScratch;
+        const std::string_view propPath = ExtractStringArgView(reflectEnv, args, 1, propPathScratch);
+        if (args.size() > 2u) {
+            if (const auto* sv = std::get_if<rs_rt::StringValue>(&args[2])) {
+                return rs_rt::Value{WriteDotPathValue(reflectEnv, target, propPath, rs_rt::Value{*sv})};
+            }
         }
         std::string newVal;
         if (!TryExtractStringValue(reflectEnv, args.size() > 2u ? args[2] : rs_rt::Value{}, newVal)) {
@@ -2129,34 +2170,26 @@ bool RegisterVisualHostBindings(
     });
     ok &= bindFn("Reflect_SetPropFloat", [reflectEnv](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         const rs_rt::ObjectRef target = ArgObject(args, 0);
-        std::string propPath;
-        if (!TryExtractStringValue(reflectEnv, args.size() > 1u ? args[1] : rs_rt::Value{}, propPath)) {
-            propPath = ArgString(args, 1);
-        }
+        std::string propPathScratch;
+        const std::string_view propPath = ExtractStringArgView(reflectEnv, args, 1, propPathScratch);
         return rs_rt::Value{WriteDotPathValue(reflectEnv, target, propPath, MakeRtFloat(ArgFloat(args, 2)))};
     });
     ok &= bindFn("Reflect_SetPropInt", [reflectEnv](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         const rs_rt::ObjectRef target = ArgObject(args, 0);
-        std::string propPath;
-        if (!TryExtractStringValue(reflectEnv, args.size() > 1u ? args[1] : rs_rt::Value{}, propPath)) {
-            propPath = ArgString(args, 1);
-        }
+        std::string propPathScratch;
+        const std::string_view propPath = ExtractStringArgView(reflectEnv, args, 1, propPathScratch);
         return rs_rt::Value{WriteDotPathValue(reflectEnv, target, propPath, rs_rt::Value{ArgInt(args, 2)})};
     });
     ok &= bindFn("Reflect_SetPropBool", [reflectEnv](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         const rs_rt::ObjectRef target = ArgObject(args, 0);
-        std::string propPath;
-        if (!TryExtractStringValue(reflectEnv, args.size() > 1u ? args[1] : rs_rt::Value{}, propPath)) {
-            propPath = ArgString(args, 1);
-        }
+        std::string propPathScratch;
+        const std::string_view propPath = ExtractStringArgView(reflectEnv, args, 1, propPathScratch);
         return rs_rt::Value{WriteDotPathValue(reflectEnv, target, propPath, rs_rt::Value{ArgBool(args, 2)})};
     });
     ok &= bindFn("Reflect_SetPropObject", [reflectEnv](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         const rs_rt::ObjectRef target = ArgObject(args, 0);
-        std::string propPath;
-        if (!TryExtractStringValue(reflectEnv, args.size() > 1u ? args[1] : rs_rt::Value{}, propPath)) {
-            propPath = ArgString(args, 1);
-        }
+        std::string propPathScratch;
+        const std::string_view propPath = ExtractStringArgView(reflectEnv, args, 1, propPathScratch);
         const rs_rt::Value objVal = (args.size() > 2u) ? args[2] : rs_rt::Value{rs_rt::NullObject{}};
         return rs_rt::Value{WriteDotPathValue(reflectEnv, target, propPath, objVal)};
     });
@@ -2215,13 +2248,16 @@ bool RegisterVisualHostBindings(
     });
     ok &= bindFn("Reflect_InvokeCommand", [reflectEnv](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         const rs_rt::ObjectRef target = ArgObject(args, 0);
-        std::string propPath;
-        if (!TryExtractStringValue(reflectEnv, args.size() > 1u ? args[1] : rs_rt::Value{}, propPath)) {
-            propPath = ArgString(args, 1);
-        }
-        std::string param;
-        if (!TryExtractStringValue(reflectEnv, args.size() > 2u ? args[2] : rs_rt::Value{}, param)) {
-            param = ArgString(args, 2);
+        std::string propPathScratch;
+        const std::string_view propPath = ExtractStringArgView(reflectEnv, args, 1, propPathScratch);
+        std::string paramScratch;
+        const std::string* paramPtr = &paramScratch;
+        if (args.size() > 2u) {
+            if (const auto* sv = std::get_if<rs_rt::StringValue>(&args[2])) {
+                paramPtr = &sv->str();
+            } else if (!TryExtractStringValue(reflectEnv, args[2], paramScratch)) {
+                paramScratch = ArgString(args, 2);
+            }
         }
         rs_rt::ObjectRef recvObj{};
         std::string_view leafName;
@@ -2237,7 +2273,7 @@ bool RegisterVisualHostBindings(
                 rs_rt::Value canExecRes{};
                 bool hasCanExec = false;
                 const bool canExecOk = TryInvokeObjectMethod(
-                    reflectEnv, *cmdRef, "CanExecute", &param, canExecRes, &hasCanExec);
+                    reflectEnv, *cmdRef, "CanExecute", paramPtr, canExecRes, &hasCanExec);
                 if (hasCanExec && canExecOk) {
                     bool allowed = true;
                     if (canExecRes.tryGetBool(allowed) && !allowed) {
@@ -2247,7 +2283,7 @@ bool RegisterVisualHostBindings(
                 rs_rt::Value execRes{};
                 bool hasExec = false;
                 const bool execOk = TryInvokeObjectMethod(
-                    reflectEnv, *cmdRef, "Execute", &param, execRes, &hasExec);
+                    reflectEnv, *cmdRef, "Execute", paramPtr, execRes, &hasExec);
                 if (hasExec) {
                     return rs_rt::Value{execOk};
                 }
@@ -2257,7 +2293,7 @@ bool RegisterVisualHostBindings(
         // Case 2: Direct command/action method on target (or nested sub-object) or [SimCommand].
         rs_rt::Value directRes{};
         return rs_rt::Value{TryInvokeObjectMethod(
-            reflectEnv, recvObj, leafName, &param, directRes)};
+            reflectEnv, recvObj, leafName, paramPtr, directRes)};
     });
     ok &= bindFn("Reflect_GetDirtyMask", [reflectEnv](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         const rs_rt::ObjectRef target = ArgObject(args, 0);
@@ -2277,10 +2313,8 @@ bool RegisterVisualHostBindings(
         return rs_rt::Value{static_cast<std::int64_t>(-1)};
     });
     ok &= bindFn("Color_ParseRgba", [reflectEnv](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
-        std::string rawColor;
-        if (!TryExtractStringValue(reflectEnv, args.size() > 0u ? args[0] : rs_rt::Value{}, rawColor)) {
-            rawColor = ArgString(args, 0);
-        }
+        std::string rawColorScratch;
+        const std::string_view rawColor = ExtractStringArgView(reflectEnv, args, 0, rawColorScratch);
         return MakeUInt(ParseColorRgba32(rawColor));
     });
 

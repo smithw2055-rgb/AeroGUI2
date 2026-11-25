@@ -163,14 +163,19 @@ public:
     [[nodiscard]] const DrawingCommandList* FindCommands(VisualNodeId node) const noexcept;
     [[nodiscard]] bool HasCommands(VisualNodeId node) const noexcept;
     [[nodiscard]] bool Empty() const noexcept { return streams_.empty(); }
+    [[nodiscard]] std::uint64_t GlobalVersion() const noexcept { return globalVersion_; }
 
 private:
     [[nodiscard]] static std::uint64_t PackNodeKey(VisualNodeId node) noexcept {
         return (static_cast<std::uint64_t>(node.generation) << 32u) | node.index;
     }
     DrawingCommandList* EnsureActiveList(VisualNodeId node);
+    void PushCommand(VisualNodeId node, DrawCommand&& cmd);
 
     std::unordered_map<std::uint64_t, DrawingCommandList> streams_;
+    std::uint64_t globalVersion_ = 1u;
+    std::uint64_t lastActiveKey_ = 0u;
+    DrawingCommandList* lastActiveList_ = nullptr;
 };
 
 } // namespace aero

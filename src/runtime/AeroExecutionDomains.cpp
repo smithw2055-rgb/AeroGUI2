@@ -49,6 +49,20 @@ void setDomainErrorRef(RuntimeError& error, ErrorCode code, std::string message)
         static_cast<std::uint64_t>(ref.generation);
 }
 
+[[nodiscard]] constexpr std::uint64_t cancelControlKey(NativeHandle h) noexcept {
+    return (static_cast<std::uint64_t>(h.generation) << 32) |
+        static_cast<std::uint64_t>(h.slot);
+}
+
+[[nodiscard]] inline std::uint64_t hashMemberName(std::string_view sv) noexcept {
+    std::uint64_t h = 14695981039346656037ull;
+    for (const unsigned char c : sv) {
+        h ^= c;
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
 [[nodiscard]] Value sanitizeCrossHeapValue(const ManagedHeap& sourceHeap, const Value& val) {
     if (const auto* objRef = std::get_if<ObjectRef>(&val)) {
         if (objRef->kind == ObjectKind::String) {
@@ -732,21 +746,23 @@ void ExecutionDomainContext::handleFieldMutated(
                     if (dirtyBit < 64u) {
                         ObservableListHelper::BindOwnerProperty(heap, *arrRef, object, dirtyBit);
                     }
-                    std::vector<WrapperOwnerLink> ownersCopy;
-                    {
-                        std::lock_guard<std::mutex> lock(mutex_);
-                        const auto hIt = wrapperOwnersByHeap_.find(heapKey);
-                        if (hIt != wrapperOwnersByHeap_.end()) {
-                            const auto wIt = hIt->second.find(objKey);
-                            if (wIt != hIt->second.end()) {
-                                ownersCopy = wIt->second;
+                    if (hasWrapperOwners_.load(std::memory_order_acquire)) {
+                        std::vector<WrapperOwnerLink> ownersCopy;
+                        {
+                            std::lock_guard<std::mutex> lock(mutex_);
+                            const auto hIt = wrapperOwnersByHeap_.find(heapKey);
+                            if (hIt != wrapperOwnersByHeap_.end()) {
+                                const auto wIt = hIt->second.find(objKey);
+                                if (wIt != hIt->second.end()) {
+                                    ownersCopy = wIt->second;
+                                }
                             }
                         }
-                    }
-                    for (const auto& link : ownersCopy) {
-                        if (link.ownerRef.valid() && link.bitIndex < 64u) {
-                            ObservableListHelper::BindOwnerProperty(
-                                heap, *arrRef, link.ownerRef, link.bitIndex);
+                        for (const auto& link : ownersCopy) {
+                            if (link.ownerRef.valid() && link.bitIndex < 64u) {
+                                ObservableListHelper::BindOwnerProperty(
+                                    heap, *arrRef, link.ownerRef, link.bitIndex);
+                            }
                         }
                     }
                 }
@@ -760,24 +776,43 @@ void ExecutionDomainContext::handleFieldMutated(
     }
 
     ObservableListHelper::UnbindAllForOwnerField(heap, object, dirtyBit);
-    {
+    if (hasWrapperOwners_.load(std::memory_order_acquire)) {
         std::lock_guard<std::mutex> lock(mutex_);
-        auto hIt = wrapperOwnersByHeap_.find(heapKey);
-        if (hIt != wrapperOwnersByHeap_.end()) {
-            for (auto wIt = hIt->second.begin(); wIt != hIt->second.end();) {
-                auto& links = wIt->second;
-                links.erase(
-                    std::remove_if(
-                        links.begin(),
-                        links.end(),
-                        [&](const WrapperOwnerLink& link) {
-                            return link.ownerRef == object && link.bitIndex == dirtyBit;
-                        }),
-                    links.end());
-                if (links.empty()) {
-                    wIt = hIt->second.erase(wIt);
-                } else {
-                    ++wIt;
+        const auto revHeapIt = ownerFieldToWrappersByHeap_.find(heapKey);
+        if (revHeapIt != ownerFieldToWrappersByHeap_.end()) {
+            const OwnerFieldRefKey revKey{objKey, dirtyBit};
+            const auto revIt = revHeapIt->second.find(revKey);
+            if (revIt != revHeapIt->second.end()) {
+                const auto hIt = wrapperOwnersByHeap_.find(heapKey);
+                if (hIt != wrapperOwnersByHeap_.end()) {
+                    for (const std::uint64_t wrapperKey : revIt->second) {
+                        const auto wIt = hIt->second.find(wrapperKey);
+                        if (wIt == hIt->second.end()) {
+                            continue;
+                        }
+                        auto& links = wIt->second;
+                        const std::size_t before = links.size();
+                        links.erase(
+                            std::remove_if(
+                                links.begin(),
+                                links.end(),
+                                [&](const WrapperOwnerLink& link) {
+                                    return link.ownerRef == object && link.bitIndex == dirtyBit;
+                                }),
+                            links.end());
+                        const std::size_t removed = before - links.size();
+                        if (removed > 0u) {
+                            wrapperOwnerLinkCount_ =
+                                (removed <= wrapperOwnerLinkCount_) ? (wrapperOwnerLinkCount_ - removed) : 0u;
+                        }
+                        if (links.empty()) {
+                            hIt->second.erase(wIt);
+                        }
+                    }
+                }
+                revHeapIt->second.erase(revIt);
+                if (wrapperOwnerLinkCount_ == 0u) {
+                    hasWrapperOwners_.store(false, std::memory_order_release);
                 }
             }
         }
@@ -813,6 +848,12 @@ void ExecutionDomainContext::handleFieldMutated(
                     });
                 if (!exists) {
                     links.push_back(WrapperOwnerLink{object, dirtyBit});
+                    auto& revWrappers = ownerFieldToWrappersByHeap_[heapKey][OwnerFieldRefKey{objKey, dirtyBit}];
+                    if (std::find(revWrappers.begin(), revWrappers.end(), wrapperKey) == revWrappers.end()) {
+                        revWrappers.push_back(wrapperKey);
+                    }
+                    ++wrapperOwnerLinkCount_;
+                    hasWrapperOwners_.store(true, std::memory_order_release);
                 }
             }
             const ObjectRef backingArr = ObservableListHelper::ResolveBackingArray(heap, *valRef);
@@ -980,6 +1021,9 @@ void ExecutionDomainContext::ensureProgramMetadataComputedLocked(
         dirtyBatch.reserve(orderedTypes.size());
     }
     bool sawAnySimState = false;
+    bool sawAnyObservable = false;
+    std::uint64_t newSimStateBloom = 0ull;
+    std::uint64_t newObservableBloom = 0ull;
 
     for (const TypeSymbol* type : orderedTypes) {
         if (type->id == 0) continue;
@@ -1002,6 +1046,8 @@ void ExecutionDomainContext::ensureProgramMetadataComputedLocked(
             meta.isCollectionWrapper = true;
             meta.fieldToBitMap = {0u};
             typeMeta_[type->id] = std::move(meta);
+            newObservableBloom |= ComputeSimCommandBloomMask(type->id);
+            sawAnyObservable = true;
             continue;
         }
 
@@ -1039,6 +1085,14 @@ void ExecutionDomainContext::ensureProgramMetadataComputedLocked(
             meta.isObservable = true;
         }
 
+        if (meta.isSimState) {
+            newSimStateBloom |= ComputeSimCommandBloomMask(type->id);
+        }
+        if (meta.isObservable) {
+            newObservableBloom |= ComputeSimCommandBloomMask(type->id);
+            sawAnyObservable = true;
+        }
+
         if (pushToHeaps && anyDirtyBit && !meta.fieldToBitMap.empty()) {
             dirtyBatch.emplace_back(type->id, meta.fieldToBitMap);
         }
@@ -1052,9 +1106,17 @@ void ExecutionDomainContext::ensureProgramMetadataComputedLocked(
     }
     if (pushToHeaps) {
         registeredImages_.insert(imageKey);
+        propSlotCache_.erase(imageKey);
+    }
+    if (newSimStateBloom != 0ull) {
+        simStateTypeBloom_.fetch_or(newSimStateBloom, std::memory_order_release);
     }
     if (sawAnySimState) {
         hasSimStateTypes_.store(true, std::memory_order_release);
+    }
+    if (sawAnyObservable) {
+        observableTypeBloom_.fetch_or(newObservableBloom, std::memory_order_release);
+        hasObservableTypes_.store(true, std::memory_order_release);
     }
     if (!simCommandFunctions_.empty()) {
         std::uint64_t bloom = simCommandBloom_.load(std::memory_order_relaxed);
@@ -1148,6 +1210,10 @@ void ExecutionDomainContext::registerAotProgramAttributes(
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
+    bool sawAnySimState = false;
+    bool sawAnyObservable = false;
+    std::uint64_t newSimStateBloom = 0ull;
+    std::uint64_t newObservableBloom = 0ull;
 
     if (program.types && program.typeCount > 0u) {
         for (std::uint32_t ti = 0; ti < program.typeCount; ++ti) {
@@ -1172,6 +1238,8 @@ void ExecutionDomainContext::registerAotProgramAttributes(
                 meta.isCollectionWrapper = true;
                 meta.fieldToBitMap = {0u};
                 typeMeta_[td.id] = std::move(meta);
+                newObservableBloom |= ComputeSimCommandBloomMask(td.id);
+                sawAnyObservable = true;
                 continue;
             }
 
@@ -1181,7 +1249,8 @@ void ExecutionDomainContext::registerAotProgramAttributes(
             const bool typeObs = classObs[td.id];
             const bool typeSim = classSim[td.id];
             if (typeSim) {
-                hasSimStateTypes_.store(true, std::memory_order_release);
+                sawAnySimState = true;
+                newSimStateBloom |= ComputeSimCommandBloomMask(td.id);
             }
 
             std::vector<std::uint8_t> bitMap(td.fieldCount, 0xffu);
@@ -1223,6 +1292,10 @@ void ExecutionDomainContext::registerAotProgramAttributes(
             meta.isObservable = typeObs || anyFieldBit;
             meta.isSimState = typeSim;
             meta.fieldToBitMap = std::move(bitMap);
+            if (meta.isObservable) {
+                newObservableBloom |= ComputeSimCommandBloomMask(td.id);
+                sawAnyObservable = true;
+            }
             typeMeta_[td.id] = std::move(meta);
         }
     }
@@ -1281,6 +1354,16 @@ void ExecutionDomainContext::registerAotProgramAttributes(
             }
         }
     }
+    if (newSimStateBloom != 0ull) {
+        simStateTypeBloom_.fetch_or(newSimStateBloom, std::memory_order_release);
+    }
+    if (sawAnySimState) {
+        hasSimStateTypes_.store(true, std::memory_order_release);
+    }
+    if (sawAnyObservable) {
+        observableTypeBloom_.fetch_or(newObservableBloom, std::memory_order_release);
+        hasObservableTypes_.store(true, std::memory_order_release);
+    }
     if (!simCommandFunctions_.empty()) {
         std::uint64_t bloom = simCommandBloom_.load(std::memory_order_relaxed);
         for (const auto& [fnId, _] : simCommandFunctions_) {
@@ -1292,14 +1375,22 @@ void ExecutionDomainContext::registerAotProgramAttributes(
 }
 
 bool ExecutionDomainContext::isTypeSimState(SymbolId typeId) const noexcept {
-    if (typeId == 0) return false;
+    if (typeId == 0 || !hasSimStateTypes_.load(std::memory_order_acquire)) return false;
+    const std::uint64_t reqMask = ComputeSimCommandBloomMask(typeId);
+    if ((simStateTypeBloom_.load(std::memory_order_acquire) & reqMask) != reqMask) {
+        return false;
+    }
     std::lock_guard<std::mutex> lock(mutex_);
     const auto it = typeMeta_.find(typeId);
     return it != typeMeta_.end() && it->second.isSimState;
 }
 
 bool ExecutionDomainContext::isTypeObservable(SymbolId typeId) const noexcept {
-    if (typeId == 0) return false;
+    if (typeId == 0 || !hasObservableTypes_.load(std::memory_order_acquire)) return false;
+    const std::uint64_t reqMask = ComputeSimCommandBloomMask(typeId);
+    if ((observableTypeBloom_.load(std::memory_order_acquire) & reqMask) != reqMask) {
+        return false;
+    }
     std::lock_guard<std::mutex> lock(mutex_);
     const auto it = typeMeta_.find(typeId);
     return it != typeMeta_.end() && it->second.isObservable;
@@ -1425,12 +1516,32 @@ std::optional<PropertySlotHandle> ExecutionDomainContext::resolvePropertySlot(
     const ProgramImage& program,
     SymbolId typeId,
     std::string_view memberName) const noexcept {
-    const TypeSymbol* rootType = program.resolveType(typeId);
-    if (!rootType) return std::nullopt;
+    if (typeId == 0) return std::nullopt;
 
     std::lock_guard<std::mutex> lock(mutex_);
-    if (registeredImages_.find(&program.modules()) == registeredImages_.end()) {
+    const void* imageKey = &program.modules();
+    if (registeredImages_.find(imageKey) == registeredImages_.end()) {
         ensureProgramMetadataComputedLocked(program, true);
+    }
+
+    const std::uint64_t mHash = hashMemberName(memberName);
+    auto& bucket = propSlotCache_[imageKey][typeId];
+    for (const auto& entry : bucket) {
+        if (entry.nameHash == mHash && entry.name == memberName) {
+            return entry.handle;
+        }
+    }
+
+    auto cacheAndReturn = [&](std::optional<PropertySlotHandle> res) -> std::optional<PropertySlotHandle> {
+        if (bucket.size() < 256u) {
+            bucket.push_back(CachedPropertySlotEntry{mHash, std::string(memberName), res});
+        }
+        return res;
+    };
+
+    const TypeSymbol* rootType = program.resolveType(typeId);
+    if (!rootType) {
+        return cacheAndReturn(std::nullopt);
     }
 
     auto findTypeMeta = [&](SymbolId tid) -> const TypeObservableMeta* {
@@ -1496,7 +1607,7 @@ std::optional<PropertySlotHandle> ExecutionDomainContext::resolvePropertySlot(
                     }
                 }
             }
-            return handle;
+            return cacheAndReturn(handle);
         }
         if (cur->baseTypeId == 0 || cur->baseTypeId == cur->id) {
             break;
@@ -1519,11 +1630,11 @@ std::optional<PropertySlotHandle> ExecutionDomainContext::resolvePropertySlot(
             }
             handle.isReadOnly = field.readonlyField || field.constField;
             handle.isSimState = rootMeta && rootMeta->isSimState;
-            return handle;
+            return cacheAndReturn(handle);
         }
     }
 
-    return std::nullopt;
+    return cacheAndReturn(std::nullopt);
 }
 
 std::optional<PropertySlotHandle> ExecutionDomainContext::resolvePropertySlot(
@@ -1844,7 +1955,7 @@ UiTaskId ExecutionDomainContext::spawnReentrantSequenceTask(
         return id;
     }
     if (boundControl.valid() &&
-        (cancelledControlSlots_.count(boundControl.slot) != 0 ||
+        (cancelledControlKeys_.count(cancelControlKey(boundControl)) != 0 ||
          (nativeHandles_ && nativeHandles_->resolveRawFast(boundControl) == nullptr))) {
         frame->status = UiTaskStatus::Cancelled;
         const UiTaskId id = frame->taskId;
@@ -1982,7 +2093,7 @@ UiTaskId ExecutionDomainContext::spawnCallbackTask(
     frame->isSequenceTask = false;
     frame->stepCallback = std::move(stepCallback);
     if (boundControl.valid() &&
-        (cancelledControlSlots_.count(boundControl.slot) != 0 ||
+        (cancelledControlKeys_.count(cancelControlKey(boundControl)) != 0 ||
          (nativeHandles_ && nativeHandles_->resolveRawFast(boundControl) == nullptr))) {
         frame->status = UiTaskStatus::Cancelled;
     } else {
@@ -2009,7 +2120,7 @@ bool ExecutionDomainContext::stepUiTask(UiTaskId taskId, const Interpreter* uiIn
     }
 
     if (frame->boundControl.valid()) {
-        if (cancelledControlSlots_.count(frame->boundControl.slot) != 0 ||
+        if (cancelledControlKeys_.count(cancelControlKey(frame->boundControl)) != 0 ||
             (nativeHandles_ && nativeHandles_->resolveRawFast(frame->boundControl) == nullptr)) {
             frame->status = UiTaskStatus::Cancelled;
             return false;
@@ -2034,7 +2145,7 @@ bool ExecutionDomainContext::stepUiTask(UiTaskId taskId, const Interpreter* uiIn
         }
         const bool finished = frame->stepCallback(frame->stepIndex++, frame->result);
         if (frame->boundControl.valid() &&
-            (cancelledControlSlots_.count(frame->boundControl.slot) != 0 ||
+            (cancelledControlKeys_.count(cancelControlKey(frame->boundControl)) != 0 ||
              (nativeHandles_ && nativeHandles_->resolveRawFast(frame->boundControl) == nullptr))) {
             frame->status = UiTaskStatus::Cancelled;
             return false;
@@ -2141,6 +2252,47 @@ std::size_t ExecutionDomainContext::stepAllUiTasks(const Interpreter* uiInterpre
             }
         }
     }
+    if (uiTasks_.size() > 64u) {
+        std::unordered_set<UiTaskId> neededPrereqs;
+        for (const auto& t : uiTasks_) {
+            if ((t->status == UiTaskStatus::Pending || t->status == UiTaskStatus::Suspended) &&
+                t->prerequisiteTaskId != 0) {
+                neededPrereqs.insert(t->prerequisiteTaskId);
+            }
+        }
+        std::size_t terminalUnreferenced = 0;
+        for (const auto& t : uiTasks_) {
+            const bool isTerminal =
+                t->status == UiTaskStatus::Completed ||
+                t->status == UiTaskStatus::Cancelled ||
+                t->status == UiTaskStatus::Faulted;
+            if (isTerminal && neededPrereqs.find(t->taskId) == neededPrereqs.end()) {
+                ++terminalUnreferenced;
+            }
+        }
+        constexpr std::size_t kMaxRetainedTerminalTasks = 32u;
+        if (terminalUnreferenced > kMaxRetainedTerminalTasks) {
+            std::size_t dropCount = terminalUnreferenced - kMaxRetainedTerminalTasks;
+            std::size_t writeIdx = 0;
+            for (std::size_t i = 0; i < uiTasks_.size(); ++i) {
+                auto& t = uiTasks_[i];
+                const bool isTerminal =
+                    t->status == UiTaskStatus::Completed ||
+                    t->status == UiTaskStatus::Cancelled ||
+                    t->status == UiTaskStatus::Faulted;
+                if (dropCount > 0 && isTerminal &&
+                    neededPrereqs.find(t->taskId) == neededPrereqs.end()) {
+                    --dropCount;
+                    continue;
+                }
+                if (writeIdx != i) {
+                    uiTasks_[writeIdx] = std::move(t);
+                }
+                ++writeIdx;
+            }
+            uiTasks_.resize(writeIdx);
+        }
+    }
     return steppedCount;
 }
 
@@ -2159,7 +2311,7 @@ bool ExecutionDomainContext::cancelUiTask(UiTaskId taskId) noexcept {
 
 std::size_t ExecutionDomainContext::cancelUiTasksForControl(NativeHandle boundControl) noexcept {
     if (!boundControl.valid()) return 0;
-    cancelledControlSlots_.insert(boundControl.slot);
+    cancelledControlKeys_.insert(cancelControlKey(boundControl));
     std::size_t cancelledCount = 0;
     for (const auto& item : uiTasks_) {
         if (item->boundControl.valid() &&

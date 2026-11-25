@@ -3226,16 +3226,15 @@ void NativeWindowHost::SwapOrBlitPlatformSurface() noexcept {
         x11_->glXSwapBuffers(x11_->display, x11_->window);
     } else if (mode_ == NativeWindowMode::LinuxX11Software && x11_ && x11_->display && x11_->window != 0 &&
                x11_->XCreateImage && x11_->XPutImage && x11_->XDefaultVisual && x11_->XDefaultGC && x11_->XDefaultDepth) {
-        std::vector<std::uint8_t> rgba;
         std::uint32_t rw = 0u;
         std::uint32_t rh = 0u;
-        if (gpuBackend_ && gpuBackend_->ReadbackFramebufferRgba8(rgba, rw, rh)) {
-            x11_->swBlitBgraBuffer.resize(rgba.size());
+        if (gpuBackend_ && gpuBackend_->ReadbackFramebufferRgba8(swReadbackRgbaBuffer_, rw, rh)) {
+            x11_->swBlitBgraBuffer.resize(swReadbackRgbaBuffer_.size());
             const std::size_t pxCount = static_cast<std::size_t>(rw) * rh;
             for (std::size_t i = 0; i < pxCount; ++i) {
-                x11_->swBlitBgraBuffer[i * 4u + 0u] = rgba[i * 4u + 2u];
-                x11_->swBlitBgraBuffer[i * 4u + 1u] = rgba[i * 4u + 1u];
-                x11_->swBlitBgraBuffer[i * 4u + 2u] = rgba[i * 4u + 0u];
+                x11_->swBlitBgraBuffer[i * 4u + 0u] = swReadbackRgbaBuffer_[i * 4u + 2u];
+                x11_->swBlitBgraBuffer[i * 4u + 1u] = swReadbackRgbaBuffer_[i * 4u + 1u];
+                x11_->swBlitBgraBuffer[i * 4u + 2u] = swReadbackRgbaBuffer_[i * 4u + 0u];
                 x11_->swBlitBgraBuffer[i * 4u + 3u] = 255u;
             }
             auto* img = x11_->XCreateImage(
@@ -3299,17 +3298,16 @@ void NativeWindowHost::SwapOrBlitPlatformSurface() noexcept {
                     SRCCOPY);
             }
         } else {
-            std::vector<std::uint8_t> rgba;
             std::uint32_t rw = 0u;
             std::uint32_t rh = 0u;
-            if (gpuBackend_ && gpuBackend_->ReadbackFramebufferRgba8(rgba, rw, rh)) {
-                std::vector<std::uint8_t> bgra(rgba.size());
+            if (gpuBackend_ && gpuBackend_->ReadbackFramebufferRgba8(swReadbackRgbaBuffer_, rw, rh)) {
+                swWin32BgraBuffer_.resize(swReadbackRgbaBuffer_.size());
                 const std::size_t pxCount = static_cast<std::size_t>(rw) * rh;
                 for (std::size_t i = 0; i < pxCount; ++i) {
-                    bgra[i * 4u + 0u] = rgba[i * 4u + 2u];
-                    bgra[i * 4u + 1u] = rgba[i * 4u + 1u];
-                    bgra[i * 4u + 2u] = rgba[i * 4u + 0u];
-                    bgra[i * 4u + 3u] = 255u;
+                    swWin32BgraBuffer_[i * 4u + 0u] = swReadbackRgbaBuffer_[i * 4u + 2u];
+                    swWin32BgraBuffer_[i * 4u + 1u] = swReadbackRgbaBuffer_[i * 4u + 1u];
+                    swWin32BgraBuffer_[i * 4u + 2u] = swReadbackRgbaBuffer_[i * 4u + 0u];
+                    swWin32BgraBuffer_[i * 4u + 3u] = 255u;
                 }
                 BITMAPINFO bmi{};
                 bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -3323,7 +3321,7 @@ void NativeWindowHost::SwapOrBlitPlatformSurface() noexcept {
                     static_cast<HDC>(win32Hdc_),
                     0, 0, static_cast<int>(width_), static_cast<int>(height_),
                     0, 0, static_cast<int>(rw), static_cast<int>(rh),
-                    bgra.data(),
+                    swWin32BgraBuffer_.data(),
                     &bmi,
                     DIB_RGB_COLORS,
                     SRCCOPY);
@@ -3333,7 +3331,10 @@ void NativeWindowHost::SwapOrBlitPlatformSurface() noexcept {
 #endif
 }
 
-GpuBackendFrameStats NativeWindowHost::TickAndPresentFrame(float dtSeconds, bool forcePresent) {
+GpuBackendFrameStats NativeWindowHost::TickAndPresentFrame(
+    float dtSeconds,
+    bool forcePresent,
+    std::uint32_t phaseMask) {
     GpuBackendFrameStats frameStats{};
     if (inTickAndPresent_ || !IsInitialized() || !gpuBackend_ || !activeGpuStream_) {
         return frameStats;
@@ -3344,20 +3345,6 @@ GpuBackendFrameStats NativeWindowHost::TickAndPresentFrame(float dtSeconds, bool
         ~TickPresentScopeGuard() noexcept { flag = false; }
     } presentGuard(inTickAndPresent_);
     (void)EffectiveResourceStore();
-
-    auto markAllTreePagesDirty = [](PagedRenderTree& tree) noexcept {
-        if (tree.DirtyPageCount() >= tree.PageCount()) {
-            return;
-        }
-        const auto totalNodes = static_cast<std::uint32_t>(tree.NodeCount());
-        for (std::uint32_t nid = 0u; nid < totalNodes; ++nid) {
-            if (const RenderNodeDescriptor* nd = tree.GetNode(nid)) {
-                if (!tree.IsPageDirty(nd->pageIndex)) {
-                    (void)tree.InvalidateNodePage(nid);
-                }
-            }
-        }
-    };
 
     const bool swScaledBlit = (mode_ == NativeWindowMode::Win32GdiSoftware);
     const std::uint32_t presentW = swScaledBlit ? std::max<std::uint32_t>(1u, logicalWidth_) : width_;
@@ -3373,13 +3360,15 @@ GpuBackendFrameStats NativeWindowHost::TickAndPresentFrame(float dtSeconds, bool
     };
 
     if (desktopHost_) {
-        if (forcePresent && desktopHost_->CanSleepIdle()) {
-            desktopHost_->NotifyDirtyLayout();
+        if (phaseMask != UiPhase_None) {
+            if (forcePresent && desktopHost_->CanSleepIdle()) {
+                desktopHost_->NotifyDirtyLayout();
+            }
+            desktopHost_->TickUi(dtSeconds, phaseMask);
         }
-        desktopHost_->TickUi(dtSeconds, UiPhase_All);
         if (renderTree_) {
             if (forcePresent && renderTree_->PageCount() > 0u) {
-                markAllTreePagesDirty(*renderTree_);
+                renderTree_->MarkAllPagesDirty();
             }
             const ZeroCopySubmissionStats subStats = desktopHost_->RecordGpuCommands(*renderTree_, *activeGpuStream_);
             if (forcePresent || needsInitialRender_ || subStats.dirtyPagesUploaded > 0u || subStats.drawCallCount > 0u) {
@@ -3401,13 +3390,15 @@ GpuBackendFrameStats NativeWindowHost::TickAndPresentFrame(float dtSeconds, bool
             webHost_->CanSleepIdle() &&
             (!renderTree_ || renderTree_->DirtyPageCount() == 0u);
         if (!skipIdleWebTick) {
-            if (forcePresent) {
-                webHost_->RequestWakeFrame();
+            if (phaseMask != UiPhase_None) {
+                if (forcePresent) {
+                    webHost_->RequestWakeFrame();
+                }
+                webHost_->TickUi(dtSeconds, phaseMask);
             }
-            webHost_->TickUi(dtSeconds, UiPhase_All);
             if (renderTree_) {
                 if (forcePresent && renderTree_->PageCount() > 0u) {
-                    markAllTreePagesDirty(*renderTree_);
+                    renderTree_->MarkAllPagesDirty();
                 }
                 const bool shouldPresent = forcePresent || needsInitialRender_ || renderTree_->DirtyPageCount() > 0u;
                 if (shouldPresent) {

@@ -422,10 +422,14 @@ public class ItemsControl : Control {
 
     protected virtual void PrepareContainerForItem(UIElement container, DependencyObject itemBox, int index) {
         if (container == null) { return; }
-        object rawData = DependencyObject.Unbox(itemBox);
-        if (rawData != null) {
-            container.DataContext = rawData;
+        if (itemBox != null) {
+            container.DataContextBox = itemBox;
         }
+        bool needRaw = _displayMemberPath.Length > 0 ||
+            (_itemTemplate == null && itemBox != null &&
+             !(itemBox is BoxedString) && !(itemBox is BoxedFloat) &&
+             !(itemBox is BoxedInt) && !(itemBox is BoxedBool));
+        object rawData = needRaw ? DependencyObject.Unbox(itemBox) : null;
         DependencyObject displayBox = itemBox;
         if (_displayMemberPath.Length > 0 && rawData != null) {
             DependencyObject memberBox = BindingEngine.ReadPathBox(rawData, _displayMemberPath);
@@ -551,11 +555,16 @@ public class ItemsControl : Control {
                 continue;
             }
             int hit = -1;
-            for (int k = 0; k < prevCount; k += 1) {
-                if (prevUsed[k]) { continue; }
-                if (k < prevBoxes.Length && ItemsControl.SameItemBox(prevBoxes[k], box) && IsContainerRecyclable(prevContainers[k])) {
-                    hit = k;
-                    break;
+            if (j < prevCount && !prevUsed[j] && j < prevBoxes.Length &&
+                ItemsControl.SameItemBox(prevBoxes[j], box) && IsContainerRecyclable(prevContainers[j])) {
+                hit = j;
+            } else {
+                for (int k = 0; k < prevCount; k += 1) {
+                    if (prevUsed[k]) { continue; }
+                    if (k < prevBoxes.Length && ItemsControl.SameItemBox(prevBoxes[k], box) && IsContainerRecyclable(prevContainers[k])) {
+                        hit = k;
+                        break;
+                    }
                 }
             }
             if (hit >= 0) {

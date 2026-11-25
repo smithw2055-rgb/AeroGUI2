@@ -253,6 +253,8 @@ public class TextBlock : FrameworkElement {
     private int _maxLines = 0;
     private int _decorations = 0;
     private Inline[] _inlines;
+    private static Inline[] _emptyInlines;
+    private bool _hadNativeSpans = false;
     private bool _hasExplicitFontSize = false;
     private bool _hasExplicitFontFamily = false;
     private bool _hasExplicitFontWeight = false;
@@ -262,15 +264,12 @@ public class TextBlock : FrameworkElement {
     internal static Action<TextBlock, string> _richTextHandler;
 
     public TextBlock() : base(VisualKind.Text) {
-        _inlines = new Inline[0];
         _foreground = Brushes.DefaultForeground();
-        SyncTextToNative();
     }
     public TextBlock(string text) : base(VisualKind.Text) {
-        _inlines = new Inline[0];
         _foreground = Brushes.DefaultForeground();
         _text = text == null ? "" : text;
-        SyncTextToNative();
+        if (_text.Length > 0) { SyncTextToNative(); }
     }
 
     public override string GetTypeName() { return "TextBlock"; }
@@ -297,23 +296,51 @@ public class TextBlock : FrameworkElement {
     }
     public string FontFamily {
         get { return _fontFamily; }
-        set { _hasExplicitFontFamily = true; _fontFamily = value == null ? "Segoe UI" : value; SyncTextToNative(); }
+        set {
+            _hasExplicitFontFamily = true;
+            string nv = value == null ? "Segoe UI" : value;
+            if (_fontFamily == nv) { return; }
+            _fontFamily = nv;
+            SyncTextToNative();
+        }
     }
     public float FontSize {
         get { return _fontSize; }
-        set { _hasExplicitFontSize = true; _fontSize = value > 0.0f ? value : 14.0f; SyncTextToNative(); }
+        set {
+            _hasExplicitFontSize = true;
+            float nv = value > 0.0f ? value : 14.0f;
+            if (_fontSize == nv) { return; }
+            _fontSize = nv;
+            SyncTextToNative();
+        }
     }
     public string FontWeight {
         get { return _fontWeight; }
-        set { _hasExplicitFontWeight = true; _fontWeight = value == null ? "Normal" : value; SyncTextToNative(); }
+        set {
+            _hasExplicitFontWeight = true;
+            string nv = value == null ? "Normal" : value;
+            if (_fontWeight == nv) { return; }
+            _fontWeight = nv;
+            SyncTextToNative();
+        }
     }
     public string FontStyle {
         get { return _fontStyle; }
-        set { _fontStyle = value == null ? "Normal" : value; SyncTextToNative(); }
+        set {
+            string nv = value == null ? "Normal" : value;
+            if (_fontStyle == nv) { return; }
+            _fontStyle = nv;
+            SyncTextToNative();
+        }
     }
     public Brush Foreground {
         get { return _foreground; }
-        set { _hasExplicitForeground = true; _foreground = value; SyncTextToNative(); }
+        set {
+            _hasExplicitForeground = true;
+            if (_foreground == value) { return; }
+            _foreground = value;
+            SyncTextToNative();
+        }
     }
 
     internal override void OnInheritedTypographyChanged() {
@@ -342,37 +369,42 @@ public class TextBlock : FrameworkElement {
     }
     public TextWrapping TextWrapping {
         get { return _textWrapping; }
-        set { _textWrapping = value; SyncTextToNative(); }
+        set { if (_textWrapping == value) { return; } _textWrapping = value; SyncTextToNative(); }
     }
     public TextAlignment TextAlignment {
         get { return _textAlignment; }
-        set { _textAlignment = value; SyncTextToNative(); }
+        set { if (_textAlignment == value) { return; } _textAlignment = value; SyncTextToNative(); }
     }
     public TextTrimming TextTrimming {
         get { return _textTrimming; }
-        set { _textTrimming = value; SyncTextToNative(); }
+        set { if (_textTrimming == value) { return; } _textTrimming = value; SyncTextToNative(); }
     }
     public float LineHeight {
         get { return _lineHeight; }
-        set { _lineHeight = value; SyncTextMetricsToNative(); }
+        set { if (_lineHeight == value) { return; } _lineHeight = value; SyncTextMetricsToNative(); }
     }
     public float CharacterSpacing {
         get { return _charSpacing; }
-        set { _charSpacing = value; SyncTextMetricsToNative(); }
+        set { if (_charSpacing == value) { return; } _charSpacing = value; SyncTextMetricsToNative(); }
     }
     public int MaxLines {
         get { return _maxLines; }
-        set { _maxLines = value; SyncTextMetricsToNative(); }
+        set { if (_maxLines == value) { return; } _maxLines = value; SyncTextMetricsToNative(); }
     }
     public int TextDecorations {
         get { return _decorations; }
-        set { _decorations = value; SyncTextMetricsToNative(); }
+        set { if (_decorations == value) { return; } _decorations = value; SyncTextMetricsToNative(); }
     }
 
-    public Inline[] Inlines() { return _inlines; }
+    public Inline[] Inlines() {
+        if (_inlines != null) { return _inlines; }
+        if (_emptyInlines == null) { _emptyInlines = new Inline[0]; }
+        return _emptyInlines;
+    }
 
     public void AddInline(Inline inline) {
         if (inline == null) { return; }
+        if (_inlines == null) { _inlines = new Inline[0]; }
         inline.OwnerTextBlock = this;
         _inlines.Push(inline);
         RebuildFromInlines();
@@ -380,10 +412,12 @@ public class TextBlock : FrameworkElement {
     internal void NotifyInlineChanged() { RebuildFromInlines(); }
     public void AddRun(Run run) { AddInline(run); }
     public void ClearInlines() {
-        for (int i = 0; i < _inlines.Length; i += 1) {
-            if (_inlines[i] != null) { _inlines[i].OwnerTextBlock = null; }
+        if (_inlines != null) {
+            for (int i = 0; i < _inlines.Length; i += 1) {
+                if (_inlines[i] != null) { _inlines[i].OwnerTextBlock = null; }
+            }
+            _inlines.Clear();
         }
-        _inlines.Clear();
         _text = "";
         SyncTextToNative();
     }
@@ -419,8 +453,10 @@ public class TextBlock : FrameworkElement {
 
     private void RebuildFromInlines() {
         string combined = "";
-        for (int i = 0; i < _inlines.Length; i += 1) {
-            combined = combined + _inlines[i].Text;
+        if (_inlines != null) {
+            for (int i = 0; i < _inlines.Length; i += 1) {
+                combined = combined + _inlines[i].Text;
+            }
         }
         _text = combined;
         SyncTextToNative();
@@ -482,8 +518,12 @@ public class TextBlock : FrameworkElement {
             IsItalicStyle(_fontStyle),
             fgGradId);
         Visual_SetTextBrushOpacity(__nativeHandle, fgOp);
-        Visual_ClearTextSpans(__nativeHandle);
+        if (_hadNativeSpans) {
+            Visual_ClearTextSpans(__nativeHandle);
+            _hadNativeSpans = false;
+        }
         if (_inlines != null && _inlines.Length > 0) {
+            _hadNativeSpans = true;
             for (int i = 0; i < _inlines.Length; i += 1) {
                 Inline inl = _inlines[i];
                 if (inl == null) { continue; }
@@ -514,6 +554,7 @@ public class TextBlock : FrameworkElement {
     public float StrokeThickness { get; set; } = 0.0f;
 
     internal void ClearRichInlines() {
+        if (_inlines == null) { return; }
         for (int k = 0; k < _inlines.Length; k += 1) {
             if (_inlines[k] != null) { _inlines[k].OwnerTextBlock = null; }
         }
@@ -522,6 +563,7 @@ public class TextBlock : FrameworkElement {
 
     internal void PushRichInline(Inline inl) {
         if (inl == null) { return; }
+        if (_inlines == null) { _inlines = new Inline[0]; }
         inl.OwnerTextBlock = this;
         _inlines.Push(inl);
     }
@@ -727,8 +769,9 @@ public class Shape : FrameworkElement {
     private bool _ownsClonedFill = false;
     private bool _ownsClonedStroke = false;
     private bool _hadFillImage = false;
+    private bool _hasNativeDash = false;
     private float _strokeThickness = 1.0f;
-    private Stretch _stretch = Stretch.Fill;
+    protected Stretch _stretch = Stretch.Fill;
     private float _trimStart = 0.0f;
     private float _trimEnd = 1.0f;
 
@@ -756,7 +799,7 @@ public class Shape : FrameworkElement {
             _fillOpacity = value != null ? Math.Clampf(value.Opacity, 0.0f, 1.0f) : 1.0f;
             SyncVectorShape();
             SyncVectorBrushOpacity();
-            SyncInteractiveFlags();
+            if (!ParseUtil.IsValidHandle(__nativeHandle)) { SyncInteractiveFlags(); }
         }
     }
     public Brush Stroke {
@@ -767,16 +810,22 @@ public class Shape : FrameworkElement {
             _strokeOpacity = value != null ? Math.Clampf(value.Opacity, 0.0f, 1.0f) : 1.0f;
             SyncVectorShape();
             SyncVectorBrushOpacity();
-            SyncInteractiveFlags();
+            if (!ParseUtil.IsValidHandle(__nativeHandle)) { SyncInteractiveFlags(); }
         }
     }
     public float StrokeThickness {
         get { return _strokeThickness; }
-        set { _strokeThickness = value >= 0.0f ? value : 0.0f; SyncVectorShape(); SyncInteractiveFlags(); }
+        set {
+            float nv = value >= 0.0f ? value : 0.0f;
+            if (_strokeThickness == nv) { return; }
+            _strokeThickness = nv;
+            SyncVectorShape();
+            if (!ParseUtil.IsValidHandle(__nativeHandle)) { SyncInteractiveFlags(); }
+        }
     }
     public Stretch Stretch {
         get { return _stretch; }
-        set { _stretch = value; SyncVectorShape(); }
+        set { if (_stretch == value) { return; } _stretch = value; SyncVectorShape(); }
     }
     public float TrimStart {
         get { return _trimStart; }
@@ -858,12 +907,17 @@ public class Shape : FrameworkElement {
             _strokeThickness,
             EnumConvert.ToInt(_stretch),
             _trimStart, _trimEnd);
-        Visual_SetVectorStrokeDash(
-            __nativeHandle,
-            _strokeDashArray,
-            _strokeDashCap,
-            _strokeStartLineCap,
-            _strokeEndLineCap);
+        if (_strokeDashArray.Length > 0 || _strokeDashCap != 0 ||
+            _strokeStartLineCap != 0 || _strokeEndLineCap != 0 || _hasNativeDash) {
+            Visual_SetVectorStrokeDash(
+                __nativeHandle,
+                _strokeDashArray,
+                _strokeDashCap,
+                _strokeStartLineCap,
+                _strokeEndLineCap);
+            _hasNativeDash = (_strokeDashArray.Length > 0 || _strokeDashCap != 0 ||
+                _strokeStartLineCap != 0 || _strokeEndLineCap != 0);
+        }
         SyncInteractiveFlags();
     }
 
@@ -1093,11 +1147,12 @@ public class Path : Shape {
     private string _data = "";
 
     public Path() : base() {
-        Stretch = Stretch.None;
+        _stretch = Stretch.None;
     }
     public Path(string svgPath) : base() {
         _data = svgPath == null ? "" : svgPath;
-        Stretch = Stretch.None;
+        _stretch = Stretch.None;
+        if (_data.Length > 0) { SyncVectorShape(); }
     }
 
     public override string GetTypeName() { return "Path"; }

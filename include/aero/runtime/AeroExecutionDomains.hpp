@@ -405,24 +405,57 @@ private:
     mutable DomainPolicy simPolicy_;
     mutable DomainPolicy uiPolicy_;
 
+    struct OwnerFieldRefKey {
+        std::uint64_t ownerKey = 0;
+        std::uint8_t dirtyBit = 0;
+        bool operator==(const OwnerFieldRefKey& other) const noexcept {
+            return ownerKey == other.ownerKey && dirtyBit == other.dirtyBit;
+        }
+    };
+    struct OwnerFieldRefKeyHash {
+        std::size_t operator()(const OwnerFieldRefKey& k) const noexcept {
+            std::size_t h = std::hash<std::uint64_t>{}(k.ownerKey);
+            h ^= std::hash<std::uint8_t>{}(k.dirtyBit) + 0x9e3779b9u + (h << 6) + (h >> 2);
+            return h;
+        }
+    };
+    struct CachedPropertySlotEntry {
+        std::uint64_t nameHash = 0;
+        std::string name;
+        std::optional<PropertySlotHandle> handle;
+    };
+
     mutable std::mutex mutex_;
     mutable std::unordered_map<realscript::semantic::SymbolId, TypeObservableMeta> typeMeta_;
     mutable std::unordered_map<realscript::semantic::SymbolId, bool> simCommandFunctions_;
     mutable std::atomic<std::uint64_t> simCommandBloom_{0ull};
+    mutable std::atomic<std::uint64_t> simStateTypeBloom_{0ull};
+    mutable std::atomic<std::uint64_t> observableTypeBloom_{0ull};
     mutable std::unordered_set<const void*> registeredImages_;
+    mutable std::unordered_map<
+        const void*,
+        std::unordered_map<realscript::semantic::SymbolId, std::vector<CachedPropertySlotEntry>>>
+        propSlotCache_;
 
     // Keyed by ((heapId << 48) ^ ((slot << 32) | generation)) -> owners watching wrapper field 0
     std::unordered_map<std::uint64_t, std::unordered_map<std::uint64_t, std::vector<WrapperOwnerLink>>>
         wrapperOwnersByHeap_;
+    std::unordered_map<
+        std::uint64_t,
+        std::unordered_map<OwnerFieldRefKey, std::vector<std::uint64_t>, OwnerFieldRefKeyHash>>
+        ownerFieldToWrappersByHeap_;
+    std::size_t wrapperOwnerLinkCount_ = 0u;
+    std::atomic<bool> hasWrapperOwners_{false};
 
     std::vector<SimCommandEnvelope> pendingSimCommands_;
     UiTaskId nextUiTaskId_ = 1;
     std::vector<std::unique_ptr<UiAsyncTaskFrame>> uiTasks_;
-    std::unordered_set<std::uint32_t> cancelledControlSlots_;
+    std::unordered_set<std::uint64_t> cancelledControlKeys_;
     std::shared_ptr<const DesktopJitInvokerFn> desktopJitInvoker_{};
     std::atomic<bool> hasDesktopJitInvoker_{false};
     mutable std::atomic<bool> hasSimCommands_{false};
     mutable std::atomic<bool> hasSimStateTypes_{false};
+    mutable std::atomic<bool> hasObservableTypes_{false};
     mutable std::atomic<std::uint64_t> desktopJitInvokeHits_{0u};
     mutable std::atomic<std::uint64_t> desktopJitFallbackHits_{0u};
 };

@@ -336,15 +336,6 @@ namespace {
         return nullptr;
     }
 
-    const std::uint64_t actualLazyChecksum = ComputeStdlibDllChecksum64(
-        hdr->lazyBytecodeBytes, static_cast<std::size_t>(hdr->lazyBytecodeSize));
-    if (actualLazyChecksum != hdr->lazyBytecodeChecksum) {
-        if (outError) {
-            *outError = "Stdlib DLL lazy bytecode checksum mismatch in '" + resolved.generic_string() + "'";
-        }
-        return nullptr;
-    }
-
     auto decodedPack = std::make_shared<rs_comp::PrecompiledFrontendPack>();
     std::string packErr;
     if (!rs_comp::decodePrecompiledFrontendPack(
@@ -368,7 +359,7 @@ namespace {
             *lazyBundle,
             /*copyBlob=*/false,
             bundleDiag,
-            /*skipChecksum=*/true) ||
+            /*skipChecksum=*/false) ||
         bundleDiag.hasErrors()) {
         if (outError) {
             std::ostringstream oss;
@@ -467,10 +458,14 @@ std::shared_ptr<LoadedStdlibDll> LoadStdlibDllOneShot(
 #endif
 }
 
-void ClearStdlibDllCacheForTesting() noexcept {
+void ClearStdlibDllCache() noexcept {
     auto& state = GetStdlibDllCacheState();
     std::lock_guard<std::mutex> lock(state.mutex);
     state.entries.clear();
+}
+
+void ClearStdlibDllCacheForTesting() noexcept {
+    ClearStdlibDllCache();
 }
 
 } // namespace aero

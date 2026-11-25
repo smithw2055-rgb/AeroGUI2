@@ -132,7 +132,10 @@ public:
     std::uint64_t RunEventLoop(std::uint64_t maxFrames = 0u);
 
     // Explicitly execute a single UI + GPU frame tick & swap/present
-    GpuBackendFrameStats TickAndPresentFrame(float dtSeconds = 0.016f, bool forcePresent = false);
+    GpuBackendFrameStats TickAndPresentFrame(
+        float dtSeconds = 0.016f,
+        bool forcePresent = false,
+        std::uint32_t phaseMask = UiPhase_All);
 
     // Unified cross-platform input translation & injection entry points (used by OS window procedures,
     // HTML5 DOM listeners, and deterministic headless / CI integration tests)
@@ -274,6 +277,8 @@ private:
     float lastRafTimeMs_ = -1.0f;
 #endif
 
+    mutable std::vector<std::uint8_t> swReadbackRgbaBuffer_;
+    mutable std::vector<std::uint8_t> swWin32BgraBuffer_;
     std::string diagnostics_;
     NativeWindowTelemetry telemetry_{};
     mutable std::mutex clipboardMutex_;

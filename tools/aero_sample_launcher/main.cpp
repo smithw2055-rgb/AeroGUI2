@@ -336,6 +336,7 @@ int main(int argc, char** argv) {
         std::cerr << err << "\n";
         return 1;
     }
+    compileInput = {};
 
     const auto tReady = std::chrono::steady_clock::now();
 

@@ -3,16 +3,17 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
-#include <deque>
 #include <functional>
 #include <limits>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "aero/core/RsAliases.hpp"
 #include "aero/drawing/Geometry.hpp"
+#include "aero/foundation/ChunkedArena.hpp"
 #include "aero/render/FontAtlas.hpp"
 
 namespace aero {
@@ -289,6 +290,22 @@ struct VisualVectorData {
 };
 
 struct VisualLayoutData {
+    VisualLayoutData() noexcept
+        : clipToBounds(false)
+        , isEnabled(true)
+        , isHitTestVisible(true)
+        , isFocusable(false)
+        , hasExplicitFlowDirection(false)
+        , explicitRtl(false)
+        , effectiveRtl(false)
+        , hasLayoutTransform(false)
+        , hasPerspective3D(false)
+        , hasValidMeasure(false)
+        , hasValidArrange(false)
+        , needsLayoutClip(false)
+        , lastMeasureInnerInfW(false)
+        , lastMeasureInnerInfH(false) {}
+
     float width = std::numeric_limits<float>::quiet_NaN();
     float height = std::numeric_limits<float>::quiet_NaN();
     float minWidth = 0.0f;
@@ -297,20 +314,9 @@ struct VisualLayoutData {
     float maxHeight = std::numeric_limits<float>::infinity();
     Thickness margin{};
     Thickness padding{};
-    HorizontalAlignment hAlign = HorizontalAlignment::Stretch;
-    VerticalAlignment vAlign = VerticalAlignment::Stretch;
-    Visibility visibility = Visibility::Visible;
     float opacity = 1.0f;
     std::int32_t zIndex = 0;
-    bool clipToBounds = false;
-    bool isEnabled = true;
-    bool isHitTestVisible = true;
-    bool isFocusable = false;
-    bool hasExplicitFlowDirection = false;
-    bool explicitRtl = false;
-    bool effectiveRtl = false;
 
-    LayoutMode layoutMode = LayoutMode::Manual;
     float layoutParam0 = 0.0f;
     float layoutParam1 = 0.0f;
     std::int32_t layoutInt0 = 0;
@@ -320,7 +326,6 @@ struct VisualLayoutData {
     std::int32_t gridCol = 0;
     std::int32_t gridRowSpan = 1;
     std::int32_t gridColSpan = 1;
-    Dock dock = Dock::Left;
 
     float canvasLeft = std::numeric_limits<float>::quiet_NaN();
     float canvasTop = std::numeric_limits<float>::quiet_NaN();
@@ -336,13 +341,6 @@ struct VisualLayoutData {
     Size scrollExtent{};
     Matrix2D worldTransform{};
     VisualLayoutTransform2D layoutTransform2D{};
-    bool hasLayoutTransform = false;
-    bool hasPerspective3D = false;
-    bool hasValidMeasure = false;
-    bool hasValidArrange = false;
-    bool needsLayoutClip = false;
-    bool lastMeasureInnerInfW = false;
-    bool lastMeasureInnerInfH = false;
     Size lastMeasureConstraint{
         std::numeric_limits<float>::quiet_NaN(),
         std::numeric_limits<float>::quiet_NaN()};
@@ -355,9 +353,30 @@ struct VisualLayoutData {
     float viewboxScaleY = 1.0f;
     float viewboxOriginX = 0.0f;
     float viewboxOriginY = 0.0f;
-    std::uint16_t treeDepth = 0u;
     std::uint32_t renderNodeId = 0u;
     std::uint32_t renderNodeCount = 0u;
+    std::uint16_t treeDepth = 0u;
+
+    HorizontalAlignment hAlign = HorizontalAlignment::Stretch;
+    VerticalAlignment vAlign = VerticalAlignment::Stretch;
+    Visibility visibility = Visibility::Visible;
+    LayoutMode layoutMode = LayoutMode::Manual;
+    Dock dock = Dock::Left;
+
+    bool clipToBounds : 1;
+    bool isEnabled : 1;
+    bool isHitTestVisible : 1;
+    bool isFocusable : 1;
+    bool hasExplicitFlowDirection : 1;
+    bool explicitRtl : 1;
+    bool effectiveRtl : 1;
+    bool hasLayoutTransform : 1;
+    bool hasPerspective3D : 1;
+    bool hasValidMeasure : 1;
+    bool hasValidArrange : 1;
+    bool needsLayoutClip : 1;
+    bool lastMeasureInnerInfW : 1;
+    bool lastMeasureInnerInfH : 1;
 };
 
 struct VisualSpatial3DData {
@@ -388,26 +407,33 @@ struct VisualNodeExtras {
 };
 
 struct VisualNode {
-    VisualNodeId id{};
-    VisualKind kind = VisualKind::Box;
-    bool alive = false;
-    std::uint8_t dirtyFlags = VisualDirty_All;
+    VisualNode() noexcept
+        : alive(false)
+        , hasScriptOwner(false)
+        , drawDirty(false)
+        , inCanvasDrawList(false) {}
 
+    VisualNodeId id{};
     VisualNodeId parent{};
     std::vector<VisualNodeId> children;
 
     NativeHandle nativeHandle{};
     ObjectRef scriptOwner{};
     PersistentRoot pinnedOwnerRoot{};
-    bool hasScriptOwner = false;
     std::uint32_t callbackMask = VisualCallback_None;
-    bool drawDirty = false;
 
     VisualLayoutData layout{};
     VisualBoxStyle box{};
     VisualTransform2D transform2D{};
     std::unique_ptr<VisualNodeExtras> extras;
     std::array<float, 4> customScalars{0.0f, 1.0f, 1.0f, 0.0f};
+
+    VisualKind kind = VisualKind::Box;
+    std::uint8_t dirtyFlags = VisualDirty_All;
+    bool alive : 1;
+    bool hasScriptOwner : 1;
+    bool drawDirty : 1;
+    bool inCanvasDrawList : 1;
 
     [[nodiscard]] bool HasExtras() const noexcept { return extras != nullptr; }
     [[nodiscard]] bool HasSpatial3D() const noexcept { return extras && extras->spatial3D != nullptr; }
@@ -717,6 +743,11 @@ public:
         bool showCaret,
         std::uint32_t selRgba,
         std::uint32_t caretRgba) noexcept;
+    [[nodiscard]] const TextLayoutResult* GetOrComputeTextLayout(
+        const VisualNode& node,
+        float maxWidth,
+        float maxHeight = 1000000.0f,
+        TextLayoutResult* optScratchFallback = nullptr) const;
     [[nodiscard]] TextLayoutResult LayoutTextNode(const VisualNode& node, float maxWidth) const;
     [[nodiscard]] Size MeasureTextNode(const VisualNode& node, float maxWidth) const;
     [[nodiscard]] Size MeasureText(
@@ -773,6 +804,7 @@ public:
         std::int32_t startCap,
         std::int32_t endCap);
     bool InvalidateDraw(VisualNodeId id) noexcept;
+    [[nodiscard]] const std::vector<VisualNodeId>& CanvasDrawNodes() const noexcept { return canvasDrawNodes_; }
 
     // Layout & ECS Track B
     using CustomMeasureCallback = std::function<Size(VisualWorld&, VisualNodeId, Size)>;
@@ -817,6 +849,9 @@ public:
 private:
     void MarkAncestorsDirty(VisualNodeId id, VisualDirtyFlags flags) noexcept;
     void DetachFromParent(VisualNode& child) noexcept;
+    void DestroySubtreeDetached(VisualNodeId id) noexcept;
+    void SyncCanvasDrawRegistration(VisualNode& node) noexcept;
+    void ReleaseNodeMutableGradients(VisualNode& node) noexcept;
     void RefreshOwnerPin(VisualNode& node) noexcept;
     [[nodiscard]] bool WouldCreateCycle(VisualNodeId parentId, VisualNodeId childId) const noexcept;
     void RefreshSubtreeDepths(VisualNodeId id, std::uint16_t depth) noexcept;
@@ -827,8 +862,10 @@ private:
     UIResourceStore* resourceStore_ = nullptr;
     ManagedHeap* managedHeap_ = nullptr;
 
-    std::deque<VisualNode> nodes_;
+    ChunkedArena<VisualNode, 256> nodes_;
     std::vector<std::uint32_t> freeIndices_;
+    std::vector<VisualNodeId> canvasDrawNodes_;
+    mutable std::vector<std::pair<VisualNodeId, std::uint16_t>> depthRefreshStack_;
     VisualNodeId rootId_{};
     std::size_t liveCount_ = 0u;
     std::uint64_t destroyedCount_ = 0u;

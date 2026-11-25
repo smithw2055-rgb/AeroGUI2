@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <limits>
+#include <type_traits>
 #include <vector>
 
 #include "aero/asset/MtsdfPathBaker.hpp"
@@ -352,6 +353,113 @@ void ArrangeNode(
     float viewboxOx,
     float viewboxOy);
 
+template <typename T, std::size_t InlineCap>
+class SmallLayoutVec {
+    static_assert(std::is_trivially_copyable_v<T>, "SmallLayoutVec requires trivially copyable T.");
+
+public:
+    SmallLayoutVec() noexcept = default;
+    SmallLayoutVec(const SmallLayoutVec& other) {
+        *this = other;
+    }
+    SmallLayoutVec& operator=(const SmallLayoutVec& other) {
+        if (this == &other) {
+            return *this;
+        }
+        count_ = other.count_;
+        useHeap_ = other.useHeap_;
+        if (useHeap_) {
+            overflow_ = other.overflow_;
+        } else {
+            overflow_.clear();
+            for (std::size_t i = 0u; i < count_; ++i) {
+                inlineBuf_[i] = other.inlineBuf_[i];
+            }
+        }
+        return *this;
+    }
+
+    void clear() noexcept {
+        count_ = 0u;
+        overflow_.clear();
+    }
+
+    void reserve(std::size_t n) {
+        if (n > InlineCap) {
+            if (!useHeap_) {
+                overflow_.reserve(n);
+                overflow_.assign(inlineBuf_.data(), inlineBuf_.data() + count_);
+                useHeap_ = true;
+            } else {
+                overflow_.reserve(n);
+            }
+        }
+    }
+
+    void push_back(const T& v) {
+        if (useHeap_) {
+            overflow_.push_back(v);
+            ++count_;
+            return;
+        }
+        if (count_ < InlineCap) {
+            inlineBuf_[count_++] = v;
+            return;
+        }
+        overflow_.reserve(InlineCap * 2u);
+        overflow_.assign(inlineBuf_.data(), inlineBuf_.data() + count_);
+        overflow_.push_back(v);
+        useHeap_ = true;
+        ++count_;
+    }
+
+    [[nodiscard]] bool empty() const noexcept { return count_ == 0u; }
+    [[nodiscard]] std::size_t size() const noexcept { return count_; }
+    [[nodiscard]] T* data() noexcept { return useHeap_ ? overflow_.data() : inlineBuf_.data(); }
+    [[nodiscard]] const T* data() const noexcept { return useHeap_ ? overflow_.data() : inlineBuf_.data(); }
+    [[nodiscard]] T& operator[](std::size_t i) noexcept { return data()[i]; }
+    [[nodiscard]] const T& operator[](std::size_t i) const noexcept { return data()[i]; }
+    [[nodiscard]] T* begin() noexcept { return data(); }
+    [[nodiscard]] T* end() noexcept { return data() + count_; }
+    [[nodiscard]] const T* begin() const noexcept { return data(); }
+    [[nodiscard]] const T* end() const noexcept { return data() + count_; }
+
+private:
+    std::array<T, InlineCap> inlineBuf_{};
+    std::vector<T> overflow_;
+    std::size_t count_ = 0u;
+    bool useHeap_ = false;
+};
+
+class ChildSnapshotView {
+public:
+    ChildSnapshotView(const VisualWorld& world, const std::vector<VisualNodeId>& children) {
+        const bool mayMutate = static_cast<bool>(world.CustomMeasureHook()) ||
+                               static_cast<bool>(world.CustomArrangeHook());
+        ptr_ = children.data();
+        count_ = children.size();
+        if (mayMutate && count_ > 0u) {
+            if (count_ <= inlineCopy_.size()) {
+                std::copy_n(ptr_, count_, inlineCopy_.data());
+                ptr_ = inlineCopy_.data();
+            } else {
+                heapCopy_.assign(ptr_, ptr_ + count_);
+                ptr_ = heapCopy_.data();
+            }
+        }
+    }
+
+    [[nodiscard]] std::size_t size() const noexcept { return count_; }
+    [[nodiscard]] const VisualNodeId* begin() const noexcept { return ptr_; }
+    [[nodiscard]] const VisualNodeId* end() const noexcept { return ptr_ + count_; }
+
+private:
+    std::array<VisualNodeId, 32> inlineCopy_{};
+    std::vector<VisualNodeId> heapCopy_;
+    const VisualNodeId* ptr_ = nullptr;
+    std::size_t count_ = 0u;
+};
+
 struct GridTrackSolved {
     GridUnitType unit = GridUnitType::Star;
     float value = 1.0f;
@@ -359,9 +467,11 @@ struct GridTrackSolved {
     float offset = 0.0f;
 };
 
+using GridTrackVec = SmallLayoutVec<GridTrackSolved, 16>;
+
 void BuildGridTrackDefs(
     const std::vector<VisualGridLength>& defs,
-    std::vector<GridTrackSolved>& outTracks) {
+    GridTrackVec& outTracks) {
     outTracks.clear();
     if (defs.empty()) {
         outTracks.push_back(GridTrackSolved{GridUnitType::Star, 1.0f, 0.0f, 0.0f});
@@ -377,7 +487,7 @@ void BuildGridTrackDefs(
     }
 }
 
-void FinalizeGridTrackOffsets(std::vector<GridTrackSolved>& tracks, float origin) noexcept {
+void FinalizeGridTrackOffsets(GridTrackVec& tracks, float origin) noexcept {
     float cur = origin;
     for (GridTrackSolved& t : tracks) {
         t.offset = cur;
@@ -386,7 +496,7 @@ void FinalizeGridTrackOffsets(std::vector<GridTrackSolved>& tracks, float origin
 }
 
 [[nodiscard]] float SumTrackSpan(
-    const std::vector<GridTrackSolved>& tracks,
+    const GridTrackVec& tracks,
     std::size_t start,
     std::size_t span) noexcept {
     const std::size_t end = std::min(tracks.size(), start + span);
@@ -398,7 +508,7 @@ void FinalizeGridTrackOffsets(std::vector<GridTrackSolved>& tracks, float origin
 }
 
 [[nodiscard]] bool SpanHasStar(
-    const std::vector<GridTrackSolved>& tracks,
+    const GridTrackVec& tracks,
     std::size_t start,
     std::size_t span) noexcept {
     const std::size_t end = std::min(tracks.size(), start + span);
@@ -411,7 +521,7 @@ void FinalizeGridTrackOffsets(std::vector<GridTrackSolved>& tracks, float origin
 }
 
 [[nodiscard]] float SpanAvailExtent(
-    const std::vector<GridTrackSolved>& tracks,
+    const GridTrackVec& tracks,
     std::size_t start,
     std::size_t span) noexcept {
     const std::size_t end = std::min(tracks.size(), start + span);
@@ -426,7 +536,7 @@ void FinalizeGridTrackOffsets(std::vector<GridTrackSolved>& tracks, float origin
 }
 
 void DistributeGridSpanDemand(
-    std::vector<GridTrackSolved>& tracks,
+    GridTrackVec& tracks,
     std::size_t start,
     std::size_t span,
     GridUnitType targetUnit,
@@ -458,7 +568,7 @@ void DistributeGridSpanDemand(
 }
 
 void ResolveStarTracks(
-    std::vector<GridTrackSolved>& tracks,
+    GridTrackVec& tracks,
     float totalAvail) noexcept {
     float fixedSum = 0.0f;
     float totalStarWeight = 0.0f;
@@ -484,7 +594,7 @@ void ResolveStarTracks(
 }
 
 void ResolveStarTracksFromInfinite(
-    std::vector<GridTrackSolved>& tracks,
+    GridTrackVec& tracks,
     std::size_t start,
     std::size_t span,
     float childDesired) noexcept {
@@ -515,8 +625,8 @@ void ResolveStarTracksFromInfinite(
     const VisualNode& parent,
     float availW,
     float availH) {
-    std::vector<GridTrackSolved> rows;
-    std::vector<GridTrackSolved> cols;
+    GridTrackVec rows;
+    GridTrackVec cols;
     BuildGridTrackDefs(parent.RowDefs(), rows);
     BuildGridTrackDefs(parent.ColDefs(), cols);
 
@@ -546,7 +656,7 @@ void ResolveStarTracksFromInfinite(
         bool hasStarRow = false;
         bool hasStarCol = false;
     };
-    std::vector<GridChildCell> items;
+    SmallLayoutVec<GridChildCell, 32> items;
     items.reserve(parent.children.size());
 
     for (VisualNodeId cid : parent.children) {
@@ -648,8 +758,8 @@ void ResolveStarTracksFromInfinite(
         }
     }
 
-    std::vector<GridTrackSolved> desiredCols = cols;
-    std::vector<GridTrackSolved> desiredRows = rows;
+    GridTrackVec desiredCols = cols;
+    GridTrackVec desiredRows = rows;
     for (GridTrackSolved& c : desiredCols) {
         if (c.unit == GridUnitType::Star) {
             c.size = 0.0f;
@@ -702,12 +812,12 @@ void ArrangeGridPanel(
     VisualWorld& world,
     const VisualNode& parent,
     const Rect& innerRect) {
-    std::vector<GridTrackSolved> rows;
-    std::vector<GridTrackSolved> cols;
+    GridTrackVec rows;
+    GridTrackVec cols;
     BuildGridTrackDefs(parent.RowDefs(), rows);
     BuildGridTrackDefs(parent.ColDefs(), cols);
-    const std::vector<GridTrackSolved> origRows = rows;
-    const std::vector<GridTrackSolved> origCols = cols;
+    const GridTrackVec origRows = rows;
+    const GridTrackVec origCols = cols;
     const bool sizeToContentW = parent.layout.lastMeasureInnerInfW;
     const bool sizeToContentH = parent.layout.lastMeasureInnerInfH;
 
@@ -800,7 +910,7 @@ void ArrangeGridPanel(
     FinalizeGridTrackOffsets(cols, innerRect.x);
     FinalizeGridTrackOffsets(rows, innerRect.y);
 
-    const auto childrenCopy = parent.children;
+    ChildSnapshotView childrenCopy(world, parent.children);
     for (VisualNodeId cid : childrenCopy) {
         const VisualNode* child = world.GetNode(cid);
         if (!child) {
@@ -870,7 +980,7 @@ void ComputeUniformGridDims(
     VisualNode& parent,
     float availW,
     float availH) {
-    const auto childrenCopy = parent.children;
+    ChildSnapshotView childrenCopy(world, parent.children);
 
     switch (parent.layout.layoutMode) {
         case LayoutMode::Stack: {
@@ -1162,7 +1272,7 @@ void ArrangePanelChildren(
     VisualWorld& world,
     VisualNode& parent,
     const Rect& innerRect) {
-    const auto childrenCopy = parent.children;
+    ChildSnapshotView childrenCopy(world, parent.children);
 
     switch (parent.layout.layoutMode) {
         case LayoutMode::Stack: {
@@ -1268,7 +1378,7 @@ void ArrangePanelChildren(
                 float w = 0.0f;
                 float h = 0.0f;
             };
-            std::vector<WrapItem> line;
+            SmallLayoutVec<WrapItem, 32> line;
             line.reserve(childrenCopy.size());
 
             float linePrimary = 0.0f;
@@ -1729,7 +1839,7 @@ void ArrangeNode(
         return;
     }
 
-    const bool nextNodeRtl = ResolveNodeEffectiveRtl(world, *node);
+    const bool nextNodeRtl = curResolvedRtl;
     const bool rtlChanged = (node->layout.effectiveRtl != nextNodeRtl);
     node->layout.effectiveRtl = nextNodeRtl;
     const VisualNode* parentPtr = node->parent.IsValid() ? world.GetNode(node->parent) : nullptr;
@@ -2094,8 +2204,18 @@ void UpdateWorldTransformsRecursive(
     }
 
     if (transformChanged) {
-        node->dirtyFlags = static_cast<std::uint8_t>(node->dirtyFlags | VisualDirty_Visual);
-        world.MarkStructureDirty();
+        const bool structuralChange =
+            (prevHas3D != nextHas3D) ||
+            nextHas3D ||
+            node->layout.clipToBounds ||
+            node->layout.needsLayoutClip ||
+            (node->layout.layoutMode == LayoutMode::ScrollViewport);
+        if (structuralChange) {
+            node->dirtyFlags = static_cast<std::uint8_t>(node->dirtyFlags | VisualDirty_Visual);
+            world.MarkStructureDirty();
+        } else {
+            world.MarkDirty(id, VisualDirty_Visual);
+        }
     }
     node->dirtyFlags = static_cast<std::uint8_t>(node->dirtyFlags & ~VisualDirty_Transform);
 

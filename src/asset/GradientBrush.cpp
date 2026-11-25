@@ -100,7 +100,10 @@ void BakeGradientBrushRamp(GradientBrushDesc& ioBrush) noexcept {
     }
 }
 
-Color SampleGradientRampAtT(const GradientBrushDesc& brush, float rawT) noexcept {
+namespace detail_eval {
+
+template <typename BrushT>
+[[nodiscard]] Color SampleGradientRampImpl(const BrushT& brush, float rawT) noexcept {
     const float t01 = ApplySpreadMethod01(rawT, brush.spreadMethod);
     const float coord = t01 * static_cast<float>(GradientBrushDesc::kLutWidth - 1u);
     const auto idx0 = static_cast<std::uint32_t>(
@@ -128,8 +131,9 @@ Color SampleGradientRampAtT(const GradientBrushDesc& brush, float rawT) noexcept
         a0 + (a1 - a0) * frac};
 }
 
-Color EvaluateGradientBrushAtNormalizedUv(
-    const GradientBrushDesc& brush,
+template <typename BrushT>
+[[nodiscard]] Color EvaluateGradientAtNormalizedUvImpl(
+    const BrushT& brush,
     float normU,
     float normV,
     float quadWidthPx,
@@ -191,7 +195,50 @@ Color EvaluateGradientBrushAtNormalizedUv(
         }
     }
 
-    return SampleGradientRampAtT(brush, t);
+    return SampleGradientRampImpl(brush, t);
+}
+
+void FillGradientEvalPod(const GradientBrushDesc& src, GradientEvalPod& dst) noexcept {
+    dst.brushId = src.brushId;
+    dst.kind = src.kind;
+    dst.mappingMode = src.mappingMode;
+    dst.spreadMethod = src.spreadMethod;
+    dst.opacity = src.opacity;
+    dst.startPoint = src.startPoint;
+    dst.endPoint = src.endPoint;
+    dst.center = src.center;
+    dst.gradientOrigin = src.gradientOrigin;
+    dst.radiusX = src.radiusX;
+    dst.radiusY = src.radiusY;
+    dst.bakedRampRgba8 = src.bakedRampRgba8;
+}
+
+} // namespace detail_eval
+
+Color SampleGradientRampAtT(const GradientBrushDesc& brush, float rawT) noexcept {
+    return detail_eval::SampleGradientRampImpl(brush, rawT);
+}
+
+Color EvaluateGradientBrushAtNormalizedUv(
+    const GradientBrushDesc& brush,
+    float normU,
+    float normV,
+    float quadWidthPx,
+    float quadHeightPx) noexcept {
+    return detail_eval::EvaluateGradientAtNormalizedUvImpl(brush, normU, normV, quadWidthPx, quadHeightPx);
+}
+
+Color SampleGradientPodAtT(const GradientEvalPod& brush, float rawT) noexcept {
+    return detail_eval::SampleGradientRampImpl(brush, rawT);
+}
+
+Color EvaluateGradientPodAtNormalizedUv(
+    const GradientEvalPod& brush,
+    float normU,
+    float normV,
+    float quadWidthPx,
+    float quadHeightPx) noexcept {
+    return detail_eval::EvaluateGradientAtNormalizedUvImpl(brush, normU, normV, quadWidthPx, quadHeightPx);
 }
 
 bool IsGradientBrushSpec(std::string_view raw) noexcept {
@@ -339,9 +386,10 @@ std::uint32_t GradientBrushRegistry::RegisterBrush(GradientBrushDesc desc) {
     }
     const auto newId = static_cast<std::uint32_t>(brushes_.size() + 1u);
     desc.brushId = newId;
+    desc.isMutableClone = false;
     brushes_.push_back(std::move(desc));
     specToId_.emplace(canonicalSpec, newId);
-    ++revision_;
+    revision_.fetch_add(1u, std::memory_order_release);
     return newId;
 }
 
@@ -365,15 +413,44 @@ std::uint32_t GradientBrushRegistry::CloneMutableBrush(std::uint32_t sourceBrush
     if (sourceBrushId == 0u || sourceBrushId > brushes_.size()) {
         return 0u;
     }
-    if (brushes_.size() >= kMaxBrushId) {
+    if (brushes_[sourceBrushId - 1u].brushId == 0u) {
         return 0u;
     }
     GradientBrushDesc copy = brushes_[sourceBrushId - 1u];
+    copy.isMutableClone = true;
+    if (!freeMutableBrushIds_.empty()) {
+        const std::uint32_t reuseId = freeMutableBrushIds_.back();
+        freeMutableBrushIds_.pop_back();
+        copy.brushId = reuseId;
+        brushes_[reuseId - 1u] = std::move(copy);
+        revision_.fetch_add(1u, std::memory_order_release);
+        return reuseId;
+    }
+    if (brushes_.size() >= kMaxBrushId) {
+        return 0u;
+    }
     const auto newId = static_cast<std::uint32_t>(brushes_.size() + 1u);
     copy.brushId = newId;
     brushes_.push_back(std::move(copy));
-    ++revision_;
+    revision_.fetch_add(1u, std::memory_order_release);
     return newId;
+}
+
+bool GradientBrushRegistry::ReleaseMutableBrush(std::uint32_t brushId) noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (brushId == 0u || brushId > brushes_.size()) {
+        return false;
+    }
+    GradientBrushDesc& brush = brushes_[brushId - 1u];
+    if (brush.brushId == 0u || !brush.isMutableClone) {
+        return false;
+    }
+    std::vector<GradientStop>().swap(brush.stops);
+    brush.brushId = 0u;
+    brush.isMutableClone = false;
+    freeMutableBrushIds_.push_back(brushId);
+    revision_.fetch_add(1u, std::memory_order_release);
+    return true;
 }
 
 bool GradientBrushRegistry::UpdateBrushStopColor(
@@ -385,12 +462,12 @@ bool GradientBrushRegistry::UpdateBrushStopColor(
         return false;
     }
     GradientBrushDesc& brush = brushes_[brushId - 1u];
-    if (stopIndex >= brush.stops.size()) {
+    if (brush.brushId == 0u || stopIndex >= brush.stops.size()) {
         return false;
     }
     brush.stops[stopIndex].color = color;
     BakeGradientBrushRamp(brush);
-    ++revision_;
+    revision_.fetch_add(1u, std::memory_order_release);
     return true;
 }
 
@@ -403,18 +480,18 @@ bool GradientBrushRegistry::UpdateBrushStopOffset(
         return false;
     }
     GradientBrushDesc& brush = brushes_[brushId - 1u];
-    if (stopIndex >= brush.stops.size()) {
+    if (brush.brushId == 0u || stopIndex >= brush.stops.size()) {
         return false;
     }
     brush.stops[stopIndex].offset = std::clamp(offset, 0.0f, 1.0f);
     BakeGradientBrushRamp(brush);
-    ++revision_;
+    revision_.fetch_add(1u, std::memory_order_release);
     return true;
 }
 
 const GradientBrushDesc* GradientBrushRegistry::Find(std::uint32_t brushId) const noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (brushId == 0u || brushId > brushes_.size()) {
+    if (brushId == 0u || brushId > brushes_.size() || brushes_[brushId - 1u].brushId == 0u) {
         return nullptr;
     }
     return &brushes_[brushId - 1u];
@@ -422,10 +499,50 @@ const GradientBrushDesc* GradientBrushRegistry::Find(std::uint32_t brushId) cons
 
 bool GradientBrushRegistry::TryGetBrush(std::uint32_t brushId, GradientBrushDesc& outBrush) const noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (brushId == 0u || brushId > brushes_.size()) {
+    if (brushId == 0u || brushId > brushes_.size() || brushes_[brushId - 1u].brushId == 0u) {
         return false;
     }
     outBrush = brushes_[brushId - 1u];
+    return true;
+}
+
+bool GradientBrushRegistry::TryGetStopValue(
+    std::uint32_t brushId,
+    std::size_t stopIndex,
+    float& outOffset,
+    Color& outColor) const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (brushId == 0u || brushId > brushes_.size()) {
+        return false;
+    }
+    const GradientBrushDesc& brush = brushes_[brushId - 1u];
+    if (brush.brushId == 0u || stopIndex >= brush.stops.size()) {
+        return false;
+    }
+    outOffset = brush.stops[stopIndex].offset;
+    outColor = brush.stops[stopIndex].color;
+    return true;
+}
+
+bool GradientBrushRegistry::TryGetEvalPod(std::uint32_t brushId, GradientEvalPod& outPod) const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (brushId == 0u || brushId > brushes_.size() || brushes_[brushId - 1u].brushId == 0u) {
+        return false;
+    }
+    detail_eval::FillGradientEvalPod(brushes_[brushId - 1u], outPod);
+    return true;
+}
+
+bool GradientBrushRegistry::TryGetEvalPodWithRevision(
+    std::uint32_t brushId,
+    GradientEvalPod& outPod,
+    std::uint32_t& outRevision) const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (brushId == 0u || brushId > brushes_.size() || brushes_[brushId - 1u].brushId == 0u) {
+        return false;
+    }
+    detail_eval::FillGradientEvalPod(brushes_[brushId - 1u], outPod);
+    outRevision = revision_.load(std::memory_order_acquire);
     return true;
 }
 
@@ -434,16 +551,12 @@ std::size_t GradientBrushRegistry::BrushCount() const noexcept {
     return brushes_.size();
 }
 
-std::uint32_t GradientBrushRegistry::Revision() const noexcept {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return revision_;
-}
-
 void GradientBrushRegistry::Clear() noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
     brushes_.clear();
+    freeMutableBrushIds_.clear();
     specToId_.clear();
-    ++revision_;
+    revision_.fetch_add(1u, std::memory_order_release);
 }
 
 } // namespace aero

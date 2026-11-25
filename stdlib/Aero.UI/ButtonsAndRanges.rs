@@ -1531,23 +1531,29 @@ public class Slider : RangeBase {
         Value = val;
     }
 
+    private static int _lastSyncLayoutEpoch = -1;
+
     private static void RegisterDefaultSlider(Slider s) {
         if (_defaultSliders == null) {
             _defaultSliders = new Slider[0];
             BindingEngine.AddPreFlushHook(() => { Slider.SyncAllDefaultLayouts(); });
         }
+        _lastSyncLayoutEpoch = -1;
         if (!_defaultSliders.Contains(s)) { _defaultSliders.Push(s); }
     }
 
     public static void SyncAllDefaultLayouts() {
-        if (_defaultSliders == null) { return; }
+        if (_defaultSliders == null || _defaultSliders.Length == 0) { return; }
+        int curEp = BindingEngine._curLayoutSizeEpoch;
+        if (curEp == _lastSyncLayoutEpoch) { return; }
+        _lastSyncLayoutEpoch = curEp;
         for (int i = _defaultSliders.Length - 1; i >= 0; i -= 1) {
             Slider s = _defaultSliders[i];
             if (s == null || s._isDisposedTree) {
                 _defaultSliders.RemoveAt(i);
                 continue;
             }
-            if (s._thumb == null) { continue; }
+            if (s._thumb == null || s.IsInsideClosedPopup() || s.Visibility == Visibility.Collapsed) { continue; }
             float aw = s.ActualWidth;
             float ah = s.ActualHeight;
             if (Math.Absf(aw - s._lastSyncW) > 0.25f || Math.Absf(ah - s._lastSyncH) > 0.25f) {
@@ -1919,6 +1925,7 @@ public class ProgressBar : RangeBase {
     private float _lastSyncedTrackSpan = -1.0f;
     private static ProgressBar[] _liveBars;
     private static bool _barSyncInstalled = false;
+    private static int _lastSyncLayoutEpoch = -1;
 
     private static void RegisterProgressBar(ProgressBar bar) {
         if (bar == null) { return; }
@@ -1926,9 +1933,9 @@ public class ProgressBar : RangeBase {
             _barSyncInstalled = true;
             _liveBars = new ProgressBar[0];
             BindingEngine.AddPostFlushHook(() => { ProgressBar.SyncAllProgressBars(); });
-            BindingEngine.AddFrameTickHook((float dt) => { ProgressBar.SyncAllProgressBars(); });
             UIElement.RegisterDisposeHook(() => { ProgressBar.CleanupDisposedBars(); });
         }
+        _lastSyncLayoutEpoch = -1;
         for (int i = 0; i < _liveBars.Length; i += 1) {
             if (_liveBars[i] == bar) { return; }
         }
@@ -1945,10 +1952,13 @@ public class ProgressBar : RangeBase {
     }
 
     public static void SyncAllProgressBars() {
-        if (_liveBars == null) { return; }
+        if (_liveBars == null || _liveBars.Length == 0) { return; }
+        int curEp = BindingEngine._curLayoutSizeEpoch;
+        if (curEp == _lastSyncLayoutEpoch) { return; }
+        _lastSyncLayoutEpoch = curEp;
         for (int i = 0; i < _liveBars.Length; i += 1) {
             ProgressBar pb = _liveBars[i];
-            if (pb == null || pb._isDisposedTree) { continue; }
+            if (pb == null || pb._isDisposedTree || pb.IsInsideClosedPopup() || pb.Visibility == Visibility.Collapsed) { continue; }
             pb.SyncTrackResizeIfNeeded();
         }
     }
@@ -2003,6 +2013,7 @@ public class ProgressBar : RangeBase {
 
     public override void OnApplyTemplate() {
         base.OnApplyTemplate();
+        _lastSyncLayoutEpoch = -1;
         if (Template == null) { return; }
         _trackPart = GetTemplateChild("PART_Track");
         _indicatorPart = GetTemplateChild("PART_Indicator");
@@ -2102,23 +2113,29 @@ public class ScrollBar : RangeBase {
         LargeChange = 120.0f;
     }
 
+    private static int _lastSyncLayoutEpoch = -1;
+
     private static void RegisterDefaultBar(ScrollBar sb) {
         if (_defaultBars == null) {
             _defaultBars = new ScrollBar[0];
             BindingEngine.AddPreFlushHook(() => { ScrollBar.SyncAllDefaultLayouts(); });
         }
+        _lastSyncLayoutEpoch = -1;
         if (!_defaultBars.Contains(sb)) { _defaultBars.Push(sb); }
     }
 
     public static void SyncAllDefaultLayouts() {
-        if (_defaultBars == null) { return; }
+        if (_defaultBars == null || _defaultBars.Length == 0) { return; }
+        int curEp = BindingEngine._curLayoutSizeEpoch;
+        if (curEp == _lastSyncLayoutEpoch) { return; }
+        _lastSyncLayoutEpoch = curEp;
         for (int i = _defaultBars.Length - 1; i >= 0; i -= 1) {
             ScrollBar sb = _defaultBars[i];
             if (sb == null || sb._isDisposedTree) {
                 _defaultBars.RemoveAt(i);
                 continue;
             }
-            if (sb._thumb == null || sb.Template != null) { continue; }
+            if (sb._thumb == null || sb.Template != null || sb.IsInsideClosedPopup() || sb.Visibility == Visibility.Collapsed) { continue; }
             float aw = sb.ActualWidth;
             float ah = sb.ActualHeight;
             if (Math.Absf(aw - sb._lastSyncW) > 0.25f || Math.Absf(ah - sb._lastSyncH) > 0.25f) {
@@ -2421,11 +2438,14 @@ public class ScrollViewer : ContentControl {
         RegisterInstance(this);
     }
 
+    private static int _lastSyncLayoutEpoch = -1;
+
     private static void RegisterInstance(ScrollViewer sv) {
         if (_instances == null) {
             _instances = new ScrollViewer[0];
             BindingEngine.AddPreFlushHook(() => { ScrollViewer.SyncAllMetrics(); });
         }
+        _lastSyncLayoutEpoch = -1;
         for (int i = 0; i < _instances.Length; i += 1) {
             if (_instances[i] == sv) { return; }
         }
@@ -2433,13 +2453,17 @@ public class ScrollViewer : ContentControl {
     }
 
     public static void SyncAllMetrics() {
-        if (_instances == null) { return; }
+        if (_instances == null || _instances.Length == 0) { return; }
+        int curEp = BindingEngine._curLayoutSizeEpoch;
+        if (curEp == _lastSyncLayoutEpoch) { return; }
+        _lastSyncLayoutEpoch = curEp;
         for (int i = _instances.Length - 1; i >= 0; i -= 1) {
             ScrollViewer sv = _instances[i];
             if (sv == null || sv._isDisposedTree) {
                 _instances.RemoveAt(i);
                 continue;
             }
+            if (sv.IsInsideClosedPopup() || sv.Visibility == Visibility.Collapsed) { continue; }
             float ew = sv.ExtentWidth;
             float eh = sv.ExtentHeight;
             float vw = sv.ViewportWidth;
@@ -2542,6 +2566,7 @@ public class ScrollViewer : ContentControl {
         if (_viewport != null && ParseUtil.IsValidHandle(_viewport.__nativeHandle)) {
             Visual_SetScrollOffsets(_viewport.__nativeHandle, _offsetX, _offsetY);
         }
+        PopupService.InvalidatePositions();
         SyncScrollBarRanges();
         BindingEngine.NotifyTargetPropertyChanged(this, "VerticalOffset", DependencyObject.BoxFloat(_offsetY));
         BindingEngine.NotifyTargetPropertyChanged(this, "HorizontalOffset", DependencyObject.BoxFloat(_offsetX));
@@ -2646,6 +2671,7 @@ public class ScrollViewer : ContentControl {
     }
 
     public override void OnApplyTemplate() {
+        _lastSyncLayoutEpoch = -1;
         if (Template != null) {
             _presenter = null;
             _viewport = null;

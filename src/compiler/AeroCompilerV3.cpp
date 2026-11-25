@@ -82,7 +82,8 @@ struct StdlibCacheKeyHash final {
 struct ProcessStdlibCacheEntry final {
     std::shared_ptr<rs_comp::CompilerSession> session;
     rs_comp::BuildSnapshot snapshot;
-    std::unordered_map<std::string, rs_bc::Module> preloweredNonPrunableBc;
+    mutable std::mutex preloweredBcMutex;
+    mutable std::unordered_map<std::string, rs_bc::Module> preloweredNonPrunableBc;
 };
 
 struct ProcessStdlibCache final {
@@ -539,8 +540,8 @@ void PopulateStdlibDerivedCache(ProcessStdlibCacheEntry& entry) {
             if (snapMetaPath.empty() || std::filesystem::exists(snapMetaPath, ec)) {
                 if (callerSession == nullptr) {
                     outSession = it->second->session;
-                    outEntry = it->second;
                 }
+                outEntry = it->second;
                 outSnapshot = it->second->snapshot;
                 outCacheHit = true;
                 return true;
@@ -569,8 +570,8 @@ void PopulateStdlibDerivedCache(ProcessStdlibCacheEntry& entry) {
             }
             if (callerSession == nullptr) {
                 outSession = cachedEntry->session;
-                outEntry = cachedEntry;
             }
+            outEntry = cachedEntry;
             outSnapshot = cachedEntry->snapshot;
             outCacheHit = true;
             return true;
@@ -592,8 +593,8 @@ void PopulateStdlibDerivedCache(ProcessStdlibCacheEntry& entry) {
         }
         if (callerSession == nullptr) {
             outSession = freshEntry->session;
-            outEntry = freshEntry;
         }
+        outEntry = freshEntry;
         outSnapshot = std::move(loadedSnap);
         outCacheHit = true;
         return true;
@@ -771,128 +772,6 @@ void AppendUint32Le(std::vector<std::uint8_t>& out, std::uint32_t v) {
         }
     }
     return true;
-}
-
-[[nodiscard]] bool IsGenericScanIdentChar(char ch) noexcept {
-    const unsigned char uch = static_cast<unsigned char>(ch);
-    return (uch >= 'A' && uch <= 'Z') ||
-           (uch >= 'a' && uch <= 'z') ||
-           (uch >= '0' && uch <= '9') ||
-           uch == '_';
-}
-
-[[nodiscard]] bool TextInstantiatesStdlibGenerics(std::string_view text) noexcept {
-    static constexpr std::string_view kStems[] = {
-        "ObservableList",
-        "ObservableCollection",
-        "RelayCommand",
-        "DelegateCommand",
-        "TypedBox",
-        "RoutedPropertyChangedEventArgs",
-    };
-
-    const std::size_t n = text.size();
-    for (std::size_t i = 0; i < n;) {
-        const char ch = text[i];
-
-        // Skip single-line comments `// ...`
-        if (ch == '/' && i + 1 < n && text[i + 1] == '/') {
-            i += 2;
-            while (i < n && text[i] != '\n') {
-                ++i;
-            }
-            continue;
-        }
-
-        // Skip block comments `/* ... */`
-        if (ch == '/' && i + 1 < n && text[i + 1] == '*') {
-            i += 2;
-            while (i + 1 < n && !(text[i] == '*' && text[i + 1] == '/')) {
-                ++i;
-            }
-            i = (i + 1 < n) ? (i + 2) : n;
-            continue;
-        }
-
-        // Skip verbatim string literals `@"..."` (`""` escapes a quote)
-        if (ch == '@' && i + 1 < n && text[i + 1] == '"') {
-            i += 2;
-            while (i < n) {
-                if (text[i] == '"') {
-                    if (i + 1 < n && text[i + 1] == '"') {
-                        i += 2;
-                        continue;
-                    }
-                    ++i;
-                    break;
-                }
-                ++i;
-            }
-            continue;
-        }
-
-        // Skip regular string and char literals (`"..."`, `'...'`) with backslash escapes
-        if (ch == '"' || ch == '\'') {
-            const char quote = ch;
-            ++i;
-            while (i < n) {
-                if (text[i] == '\\' && i + 1 < n) {
-                    i += 2;
-                    continue;
-                }
-                if (text[i] == quote) {
-                    ++i;
-                    break;
-                }
-                ++i;
-            }
-            continue;
-        }
-
-        if (IsGenericScanIdentChar(ch) && (i == 0 || !IsGenericScanIdentChar(text[i - 1]))) {
-            for (std::string_view stem : kStems) {
-                if (i + stem.size() < n && text.substr(i, stem.size()) == stem) {
-                    std::size_t j = i + stem.size();
-                    while (j < n && (text[j] == ' ' || text[j] == '\t' ||
-                                     text[j] == '\r' || text[j] == '\n')) {
-                        ++j;
-                    }
-                    if (j < n && text[j] == '<' && (j + 1 >= n || text[j + 1] != '=')) {
-                        return true;
-                    }
-                }
-            }
-            // Skip past the remainder of this identifier so we don't re-check suffixes.
-            ++i;
-            while (i < n && IsGenericScanIdentChar(text[i])) {
-                ++i;
-            }
-            continue;
-        }
-
-        ++i;
-    }
-    return false;
-}
-
-[[nodiscard]] bool UserSourcesInstantiateStdlibGenerics(
-    const XamlEmitResult& primaryXaml,
-    const std::vector<XamlEmitResult>& additionalXamls,
-    const std::vector<SourceFile>& loweredScripts) noexcept {
-    if (TextInstantiatesStdlibGenerics(primaryXaml.generatedRsCode)) {
-        return true;
-    }
-    for (const auto& addRes : additionalXamls) {
-        if (TextInstantiatesStdlibGenerics(addRes.generatedRsCode)) {
-            return true;
-        }
-    }
-    for (const auto& sf : loweredScripts) {
-        if (TextInstantiatesStdlibGenerics(sf.content)) {
-            return true;
-        }
-    }
-    return false;
 }
 
 struct DualHash128 final {
@@ -1724,9 +1603,6 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
         loweredScripts.push_back(std::move(lowered));
     }
 
-    const bool usesStdlibGenerics =
-        UserSourcesInstantiateStdlibGenerics(xamlRes, additionalXamlResults, loweredScripts);
-
     std::vector<SourceFile> allSources;
     allSources.reserve(
         stdlibSources.size() + additionalXamlResults.size() + loweredScripts.size() + 1u);
@@ -1745,11 +1621,11 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
         pushUniqueSource(sf);
     }
     if (!xamlRes.generatedRsCode.empty()) {
-        pushUniqueSource(SourceFile{xamlRes.generatedFilePath, xamlRes.generatedRsCode});
+        pushUniqueSource(SourceFile{xamlRes.generatedFilePath, std::move(xamlRes.generatedRsCode)});
     }
-    for (const auto& addRes : additionalXamlResults) {
+    for (auto& addRes : additionalXamlResults) {
         if (!addRes.generatedRsCode.empty()) {
-            pushUniqueSource(SourceFile{addRes.generatedFilePath, addRes.generatedRsCode});
+            pushUniqueSource(SourceFile{addRes.generatedFilePath, std::move(addRes.generatedRsCode)});
         }
     }
     for (auto& lowered : loweredScripts) {
@@ -1811,13 +1687,6 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
             }
         }
     } else if (input.includeStdlib && input.allowStdlibCache) {
-        std::error_code snapEc;
-        const bool snapMetaExists = effectiveCacheDir.empty() ||
-            std::filesystem::exists(
-                effectiveCacheDir / ("aero_stdlib_" + Hex64(stdlibHash) + ".snapmeta"), snapEc);
-        (void)usesStdlibGenerics;
-        (void)snapMetaExists;
-        const bool skipIneffectiveDiskStdlibLoad = false;
         std::shared_ptr<rs_comp::CompilerSession> procSession;
         if (ResolveStdlibCacheForCompile(
                 resolvedStdlibRootKey,
@@ -1830,7 +1699,7 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
                 previousSnapshot,
                 procEntry,
                 stdlibCacheCandidate,
-                !skipIneffectiveDiskStdlibLoad)) {
+                true)) {
             compOpts.session = std::move(procSession);
             usePreviousSnapshot = true;
         }
@@ -1994,11 +1863,18 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
             reusedModuleNames.count(mirMod.name) > 0u &&
             (!input.treeShakeStdlib || mirMod.name != "Aero.UI");
         if (canReuseStdlibBc) {
-            if (const auto preIt = procEntry->preloweredNonPrunableBc.find(mirMod.name);
-                preIt != procEntry->preloweredNonPrunableBc.end() &&
-                preIt->second.functions.size() == mirMod.functions.size() &&
-                preIt->second.types.size() == mirMod.types.size()) {
-                result.bytecodeModules.push_back(preIt->second);
+            bool reused = false;
+            {
+                std::lock_guard<std::mutex> bcLock(procEntry->preloweredBcMutex);
+                if (const auto preIt = procEntry->preloweredNonPrunableBc.find(mirMod.name);
+                    preIt != procEntry->preloweredNonPrunableBc.end() &&
+                    preIt->second.functions.size() == mirMod.functions.size() &&
+                    preIt->second.types.size() == mirMod.types.size()) {
+                    result.bytecodeModules.push_back(preIt->second);
+                    reused = true;
+                }
+            }
+            if (reused) {
                 if (!input.emitAotCpp) {
                     mirMod = rs_mir::Module{};
                 }
@@ -2010,6 +1886,12 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
         if (!rs_bc::verifyModule(bcMod, bcDiag)) {
             AppendDiagnostics(bcDiag, result.diagnostics);
             return result;
+        }
+        if (canReuseStdlibBc && mirMod.name == "Aero.UI" && !input.treeShakeStdlib) {
+            std::lock_guard<std::mutex> bcLock(procEntry->preloweredBcMutex);
+            if (procEntry->preloweredNonPrunableBc.find("Aero.UI") == procEntry->preloweredNonPrunableBc.end()) {
+                procEntry->preloweredNonPrunableBc.emplace("Aero.UI", bcMod);
+            }
         }
         result.bytecodeModules.push_back(std::move(bcMod));
         if (!input.emitAotCpp) {
@@ -2031,9 +1913,6 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
     std::vector<std::uint8_t> encodedProgramBytes;
     if (needEncodedBundle) {
         encodedProgramBytes = EncodeProgramBundle(result.bytecodeModules);
-        if (!input.skipRawBytecodeOutput) {
-            result.programImageBytes = encodedProgramBytes;
-        }
     }
 
     // Link ProgramImage (modules above already passed rs_bc::verifyModule or cached verification)
@@ -2147,6 +2026,9 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
         PersistProgramBundleToDisk(
             progCacheFilePath, progH1, progH2, result, encodedProgramBytes, mergedExternalDeps);
     }
+    if (!input.skipRawBytecodeOutput && !encodedProgramBytes.empty()) {
+        result.programImageBytes = std::move(encodedProgramBytes);
+    }
     return result;
 }
 
@@ -2167,6 +2049,7 @@ void AeroCompilerV3::ClearProcessCaches() noexcept {
         std::lock_guard<std::mutex> lock(statCache.mutex);
         statCache.entries.clear();
     }
+    ClearStdlibDllCache();
     CompactProcessHeapAfterCompile();
 }
 

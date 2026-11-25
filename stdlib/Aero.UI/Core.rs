@@ -1046,9 +1046,15 @@ public static class ParseUtil {
     }
 
     public static uint ParseHexColor(string hex, uint fallback = 0u) {
-        if (hex == null) { return fallback; }
+        if (hex == null || hex.Length == 0) { return fallback; }
         string s = hex.Trim();
-        if (s.Length > 0 && s.Substring(0, 1) == "#") {
+        if (s.StartsWith("#")) {
+            if (IsNativeReady() && (s.Length == 4 || s.Length == 5 || s.Length == 7 || s.Length == 9)) {
+                uint nativeCol = Color_ParseRgba(s);
+                if (nativeCol != 4278190080u || s == "#000000" || s == "#FF000000" || s == "#ff000000" || s == "#000" || s == "#F000" || s == "#f000") {
+                    return nativeCol;
+                }
+            }
             s = s.Substring(1);
             if (s.Length == 3 || s.Length == 4) {
                 int idx = 0;
@@ -1091,8 +1097,12 @@ public static class ParseUtil {
     public static uint ParseColor(string color) {
         if (color == null || color.Length == 0) { return 0u; }
         string c = color.Trim();
-        if (c.Length > 0 && c.Substring(0, 1) == "#") {
+        if (c.Length == 0) { return 0u; }
+        if (c.StartsWith("#")) {
             return ParseHexColor(c, 0u);
+        }
+        if (IsNativeReady()) {
+            return Color_ParseRgba(c);
         }
         string low = c.ToLower();
         if (low == "transparent") { return 0u; }
@@ -1976,6 +1986,20 @@ public class TransformData : DependencyObject {
     public float SkewX = 0.0f;
     public float SkewY = 0.0f;
     public bool HasExplicitCenter = false;
+    private static TransformData _scratch;
+
+    internal static TransformData SharedScratch() {
+        if (_scratch == null) { _scratch = new TransformData(); }
+        _scratch.TX = 0.0f;
+        _scratch.TY = 0.0f;
+        _scratch.SX = 1.0f;
+        _scratch.SY = 1.0f;
+        _scratch.RotDeg = 0.0f;
+        _scratch.SkewX = 0.0f;
+        _scratch.SkewY = 0.0f;
+        _scratch.HasExplicitCenter = false;
+        return _scratch;
+    }
 }
 
 public class Transform : DependencyObject {
@@ -2946,6 +2970,18 @@ public partial class UIElement : DependencyObject {
             BindingEngine.NotifyTargetPropertyChanged(this, propName, boxedValue);
         }
     }
+    protected void NotifyBoundFloatChanged(string propName, float val) {
+        BumpPropEpoch();
+        if (_ownBindingsBox != null) {
+            BindingEngine.NotifyTargetPropertyChanged(this, propName, DependencyObject.BoxFloat(val));
+        }
+    }
+    protected void NotifyBoundIntChanged(string propName, int val) {
+        BumpPropEpoch();
+        if (_ownBindingsBox != null) {
+            BindingEngine.NotifyTargetPropertyChanged(this, propName, DependencyObject.BoxInt(val));
+        }
+    }
 
     public object Tag {
         get { return DependencyObject.Unbox(_tag); }
@@ -3028,6 +3064,11 @@ public partial class UIElement : DependencyObject {
         get { return _templatedParent; }
         set { _templatedParent = value; BumpSubtreeAncestorEpoch(); BumpPropEpoch(); }
     }
+    internal void SetTemplatedParentDirect(UIElement tp) {
+        _templatedParent = tp;
+        _ancestorChainEpoch = _ancestorChainEpoch >= 1000000000 ? 1 : (_ancestorChainEpoch + 1);
+        BumpPropEpoch();
+    }
 
     public object DataContext {
         get {
@@ -3060,6 +3101,7 @@ public partial class UIElement : DependencyObject {
 
     private static void PropagateDataContextQueue(UIElement startNode, DependencyObject dcBox, bool includeStart) {
         if (startNode == null) { return; }
+        if (!includeStart && (startNode._children == null || startNode._children.Length == 0)) { return; }
         var els = new UIElement[0];
         var dcs = new DependencyObject[0];
         if (includeStart) {
@@ -3085,7 +3127,7 @@ public partial class UIElement : DependencyObject {
             if (oldBox == parentDc) { continue; }
             cur._inheritedDataContext = parentDc;
             cur.BumpPropEpoch();
-            cur.RaiseDataContextChanged(DependencyObject.Unbox(oldBox), DependencyObject.Unbox(parentDc));
+            cur.RaiseDataContextChangedBoxes(oldBox, parentDc);
             if (cur._children == null) { continue; }
             DependencyObject eff = cur.EffectiveDataContextBox();
             for (int i = 0; i < cur._children.Length; i += 1) {
@@ -3111,8 +3153,13 @@ public partial class UIElement : DependencyObject {
 
     private void PropagateDataContextToSubtree(DependencyObject oldBox) {
         DependencyObject eff = EffectiveDataContextBox();
-        RaiseDataContextChanged(DependencyObject.Unbox(oldBox), DependencyObject.Unbox(eff));
+        RaiseDataContextChangedBoxes(oldBox, eff);
         PropagateDataContextQueue(this, eff, false);
+    }
+
+    private void RaiseDataContextChangedBoxes(DependencyObject oldBox, DependencyObject newBox) {
+        OnDataContextChanged(DependencyObject.Unbox(oldBox), DependencyObject.Unbox(newBox));
+        DataContextChanged(this, DependencyPropertyChangedEventArgs.FromBoxes("DataContext", oldBox, newBox));
     }
 
     private void RaiseDataContextChanged(object oldVal, object newVal) {
@@ -3214,6 +3261,14 @@ public partial class UIElement : DependencyObject {
     }
 
     public void RefreshDynamicResourcesRecursive() {
+        if (_children == null || _children.Length == 0) {
+            if (!_isDisposedTree && _dynResProps != null) {
+                for (int i = 0; i < _dynResProps.Length; i += 1) {
+                    ApplyDynamicResourceAt(i);
+                }
+            }
+            return;
+        }
         var q = new UIElement[0];
         q.Push(this);
         int idx = 0;
@@ -3259,6 +3314,10 @@ public partial class UIElement : DependencyObject {
     }
 
     public void ApplyStyleSubtree() {
+        if (!(this is Control) && (_children == null || _children.Length == 0)) {
+            if (!_isDisposedTree) { ApplyStyleInternal(); }
+            return;
+        }
         var q = new UIElement[0];
         q.Push(this);
         int idx = 0;
@@ -3283,6 +3342,12 @@ public partial class UIElement : DependencyObject {
     }
 
     public void ApplyTemplateSubtree() {
+        if (!(this is Control) && (_children == null || _children.Length == 0)) {
+            if (!_isDisposedTree && (_appliedStyle == null || (_style != null && _style != _appliedStyle))) {
+                ApplyStyleInternal();
+            }
+            return;
+        }
         var q = new UIElement[0];
         q.Push(this);
         int idx = 0;
@@ -3315,7 +3380,7 @@ public partial class UIElement : DependencyObject {
             if (_width == value || (!ParseUtil.IsFinite(_width) && !ParseUtil.IsFinite(value))) { return; }
             _width = value;
             SyncSize();
-            NotifyBoundPropertyChanged("Width", DependencyObject.BoxFloat(_width));
+            NotifyBoundFloatChanged("Width", _width);
         }
     }
     public float Height {
@@ -3324,7 +3389,7 @@ public partial class UIElement : DependencyObject {
             if (_height == value || (!ParseUtil.IsFinite(_height) && !ParseUtil.IsFinite(value))) { return; }
             _height = value;
             SyncSize();
-            NotifyBoundPropertyChanged("Height", DependencyObject.BoxFloat(_height));
+            NotifyBoundFloatChanged("Height", _height);
         }
     }
     public float MinWidth {
@@ -3333,7 +3398,7 @@ public partial class UIElement : DependencyObject {
             if (_minWidth == value) { return; }
             _minWidth = value;
             SyncMinMaxSize();
-            NotifyBoundPropertyChanged("MinWidth", DependencyObject.BoxFloat(_minWidth));
+            NotifyBoundFloatChanged("MinWidth", _minWidth);
         }
     }
     public float MinHeight {
@@ -3342,7 +3407,7 @@ public partial class UIElement : DependencyObject {
             if (_minHeight == value) { return; }
             _minHeight = value;
             SyncMinMaxSize();
-            NotifyBoundPropertyChanged("MinHeight", DependencyObject.BoxFloat(_minHeight));
+            NotifyBoundFloatChanged("MinHeight", _minHeight);
         }
     }
     public float MaxWidth {
@@ -3351,7 +3416,7 @@ public partial class UIElement : DependencyObject {
             if (_maxWidth == value || (!ParseUtil.IsFinite(_maxWidth) && !ParseUtil.IsFinite(value))) { return; }
             _maxWidth = value;
             SyncMinMaxSize();
-            NotifyBoundPropertyChanged("MaxWidth", DependencyObject.BoxFloat(_maxWidth));
+            NotifyBoundFloatChanged("MaxWidth", _maxWidth);
         }
     }
     public float MaxHeight {
@@ -3360,7 +3425,7 @@ public partial class UIElement : DependencyObject {
             if (_maxHeight == value || (!ParseUtil.IsFinite(_maxHeight) && !ParseUtil.IsFinite(value))) { return; }
             _maxHeight = value;
             SyncMinMaxSize();
-            NotifyBoundPropertyChanged("MaxHeight", DependencyObject.BoxFloat(_maxHeight));
+            NotifyBoundFloatChanged("MaxHeight", _maxHeight);
         }
     }
 
@@ -3387,7 +3452,7 @@ public partial class UIElement : DependencyObject {
             if (_hAlign == value) { return; }
             _hAlign = value;
             SyncAlignment();
-            NotifyBoundPropertyChanged("HorizontalAlignment", DependencyObject.BoxInt(EnumConvert.ToInt(_hAlign)));
+            NotifyBoundIntChanged("HorizontalAlignment", EnumConvert.ToInt(_hAlign));
         }
     }
     public VerticalAlignment VerticalAlignment {
@@ -3397,7 +3462,7 @@ public partial class UIElement : DependencyObject {
             if (_vAlign == value) { return; }
             _vAlign = value;
             SyncAlignment();
-            NotifyBoundPropertyChanged("VerticalAlignment", DependencyObject.BoxInt(EnumConvert.ToInt(_vAlign)));
+            NotifyBoundIntChanged("VerticalAlignment", EnumConvert.ToInt(_vAlign));
         }
     }
     public Visibility Visibility {
@@ -3664,6 +3729,7 @@ public partial class UIElement : DependencyObject {
     private static void PropagateTypographyQueue(
         UIElement startNode, float startFs, string startFf, string startFw, Brush startFg, bool includeStart) {
         if (startNode == null) { return; }
+        if (!includeStart && (startNode._children == null || startNode._children.Length == 0)) { return; }
         var els = new UIElement[0];
         var fss = new float[0];
         var ffs = new string[0];
@@ -3790,7 +3856,9 @@ public partial class UIElement : DependencyObject {
             _bgOpacity = value != null ? Math.Clampf(value.Opacity, 0.0f, 1.0f) : 1.0f;
             OnBoxAppearanceChanged();
             NotifyBoundPropertyChanged("Background", _background);
-            NotifyBoundPropertyChanged("Background.Color", DependencyObject.BoxString(_background != null ? ParseUtil.FormatArgbHex(_background.ResolveRgba()) : "#00000000"));
+            if (_ownBindingsBox != null) {
+                BindingEngine.NotifyTargetPropertyChanged(this, "Background.Color", DependencyObject.BoxString(_background != null ? ParseUtil.FormatArgbHex(_background.ResolveRgba()) : "#00000000"));
+            }
         }
     }
     public Brush BorderBrush {
@@ -3879,6 +3947,10 @@ public partial class UIElement : DependencyObject {
         }
     }
     public void SyncInteractiveFlagsSubtree() {
+        if (_children == null || _children.Length == 0) {
+            SyncInteractiveFlags();
+            return;
+        }
         var q = new UIElement[0];
         q.Push(this);
         int idx = 0;
@@ -3896,8 +3968,16 @@ public partial class UIElement : DependencyObject {
     }
     public void SyncTransform2D() {
         if (!_hasNative) { return; }
-        var td = new TransformData();
-        if (_renderTransform != null) { _renderTransform.Accumulate(td); }
+        if (_renderTransform == null) {
+            Visual_SetTransform2D(
+                __nativeHandle,
+                0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f,
+                _renderTransformOrigin.X,
+                _renderTransformOrigin.Y);
+            return;
+        }
+        TransformData td = TransformData.SharedScratch();
+        _renderTransform.Accumulate(td);
         bool useZeroOrig = (td.HasExplicitCenter && !HasUiFlag(512));
         Visual_SetTransform2D(
             __nativeHandle,
@@ -3913,7 +3993,7 @@ public partial class UIElement : DependencyObject {
             return;
         }
         SetUiFlag(1, true);
-        var td = new TransformData();
+        TransformData td = TransformData.SharedScratch();
         _layoutTransform.Accumulate(td);
         Visual_SetLayoutTransform(__nativeHandle, td.SX, td.SY, td.RotDeg, true);
     }
@@ -4246,15 +4326,21 @@ public partial class UIElement : DependencyObject {
     }
 
     public void EnsureLoadedSubtree() {
+        if (_isDisposedTree) { return; }
+        EnsureLoadedSelf();
+        if (_children == null || _children.Length == 0) { return; }
         var q = new UIElement[0];
-        q.Push(this);
+        int initialCount = _children.Length;
+        for (int i = 0; i < initialCount; i += 1) {
+            q.Push(_children[i]);
+        }
         int idx = 0;
         while (idx < q.Length) {
             UIElement cur = q[idx];
             idx += 1;
             if (cur == null || cur._isDisposedTree) { continue; }
             cur.EnsureLoadedSelf();
-            if (cur != this && cur.IsClosedPopupBoundary()) { continue; }
+            if (cur.IsClosedPopupBoundary()) { continue; }
             if (cur._children != null) {
                 int postCount = cur._children.Length;
                 for (int i = 0; i < postCount; i += 1) {
@@ -4265,6 +4351,10 @@ public partial class UIElement : DependencyObject {
     }
 
     protected void NotifyUnloadedSubtree() {
+        if (_children == null || _children.Length == 0) {
+            NotifyUnloadedSelf();
+            return;
+        }
         var q = new UIElement[0];
         q.Push(this);
         int idx = 0;
@@ -4742,7 +4832,7 @@ public partial class UIElement : DependencyObject {
         float sky = propId == 9 ? v : Anim_ReadCurrentFloat(__nativeHandle, 9);
         TransformData td = null;
         if (_renderTransform != null && !HasUiFlag(512)) {
-            td = new TransformData();
+            td = TransformData.SharedScratch();
             _renderTransform.Accumulate(td);
         }
         bool useZeroOrig = (td != null && td.HasExplicitCenter && !HasUiFlag(512));
@@ -4898,7 +4988,7 @@ public partial class UIElement : DependencyObject {
     protected float GetTransformScalar(string prop) {
         if (prop == "LayoutTransform.ScaleX" || prop == "LayoutTransform.ScaleY" ||
             prop == "LayoutTransform.Angle" || prop == "LayoutTransform.Rotation") {
-            var ltd = new TransformData();
+            TransformData ltd = TransformData.SharedScratch();
             if (_layoutTransform != null) { _layoutTransform.Accumulate(ltd); }
             if (prop == "LayoutTransform.ScaleX") { return ltd.SX; }
             if (prop == "LayoutTransform.ScaleY") { return ltd.SY; }
@@ -4914,7 +5004,7 @@ public partial class UIElement : DependencyObject {
         else if (prop == "SkewY" || prop == "RenderTransform.SkewY" || prop == "RenderTransform.AngleY") { pid = 9; }
         if (pid == 0) { return 0.0f; }
         if (_hasNative && ParseUtil.IsNativeReady()) { return Anim_ReadCurrentFloat(__nativeHandle, pid); }
-        var td = new TransformData();
+        TransformData td = TransformData.SharedScratch();
         if (_renderTransform != null) { _renderTransform.Accumulate(td); }
         if (pid == 3) { return td.TX; }
         if (pid == 4) { return td.TY; }
@@ -5016,7 +5106,7 @@ public partial class UIElement : DependencyObject {
             Background = CoerceBrush(value);
             return true;
         }
-        if (propName.Length > 11 && propName.Substring(0, 11) == "Background." && _background != null) {
+        if (propName.StartsWith("Background.") && propName.Length > 11 && _background != null) {
             string bgSub = propName.Substring(11);
             bool needClone = !HasUiFlag(8);
             Brush updatedBg = _background.ApplySubProperty(bgSub, value, needClone);
@@ -5028,9 +5118,9 @@ public partial class UIElement : DependencyObject {
             }
             if (bgSub == "ImageSource") { return false; }
         }
-        if ((propName.Length > 5 && propName.Substring(0, 5) == "Fill.") ||
-            (propName.Length > 11 && propName.Substring(0, 11) == "Background.")) {
-            string suffix = propName.Substring(0, 5) == "Fill." ? propName.Substring(5) : propName.Substring(11);
+        bool isFillPrefix = propName.StartsWith("Fill.") && propName.Length > 5;
+        if (isFillPrefix || (propName.StartsWith("Background.") && propName.Length > 11)) {
+            string suffix = isFillPrefix ? propName.Substring(5) : propName.Substring(11);
             if (_background is GradientBrush && GradientBrush.ParseStopSlotIndex(suffix) >= 0) {
                 GradientBrush gb = _background as GradientBrush;
                 if (!HasUiFlag(4)) {
@@ -5293,12 +5383,11 @@ public partial class UIElement : DependencyObject {
     }
 
     private static bool IsCustomAttachedPropKey(string cleanKey) {
-        if (cleanKey.Length >= 7 && cleanKey.Substring(0, 7) == "Custom.") { return true; }
-        if (cleanKey.Length >= 9 && cleanKey.Substring(0, 9) == "DragDrop.") { return true; }
-        if (cleanKey.Length >= 15 && cleanKey.Substring(0, 15) == "ToolTipService.") { return true; }
-        if (cleanKey.Length >= 13 && cleanKey.Substring(0, 13) == "ScrollViewer.") { return true; }
-        if (cleanKey.Length >= 5 && cleanKey.Substring(0, 5) == "Text.") { return true; }
-        return false;
+        return cleanKey.StartsWith("Custom.") ||
+               cleanKey.StartsWith("DragDrop.") ||
+               cleanKey.StartsWith("ToolTipService.") ||
+               cleanKey.StartsWith("ScrollViewer.") ||
+               cleanKey.StartsWith("Text.");
     }
 
     private void SetDynamicProp(string cleanKey, DependencyObject value) {
@@ -5377,13 +5466,13 @@ public partial class UIElement : DependencyObject {
         if (propName == "Background.Color") {
             return DependencyObject.BoxString(_background != null ? ParseUtil.FormatArgbHex(_background.ResolveRgba()) : "#00000000");
         }
-        if (propName.Length > 11 && propName.Substring(0, 11) == "Background." && _background != null) {
+        if (propName.StartsWith("Background.") && propName.Length > 11 && _background != null) {
             DependencyObject subVal = _background.ReadSubProperty(propName.Substring(11));
             if (subVal != null) { return subVal; }
         }
-        if ((propName.Length > 5 && propName.Substring(0, 5) == "Fill.") ||
-            (propName.Length > 11 && propName.Substring(0, 11) == "Background.")) {
-            string suffix = propName.Substring(0, 5) == "Fill." ? propName.Substring(5) : propName.Substring(11);
+        bool isGetFill = propName.StartsWith("Fill.") && propName.Length > 5;
+        if (isGetFill || (propName.StartsWith("Background.") && propName.Length > 11)) {
+            string suffix = isGetFill ? propName.Substring(5) : propName.Substring(11);
             if (_background is GradientBrush) {
                 DependencyObject stopBox = (_background as GradientBrush).TryReadStopProperty(suffix);
                 if (stopBox != null) { return stopBox; }

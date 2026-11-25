@@ -516,10 +516,11 @@ private:
     std::vector<GlImageSlotState> imageSlotTextures_;
     std::vector<std::uint8_t> ringSlotTailZeroed_;
     std::vector<std::uint8_t> ringSlotHasCustomClipW_;
+    std::vector<std::uint8_t> pageNeedsTailPad_;
     std::vector<std::uint8_t> uiAtlasScratchRgba8_;
     std::vector<std::uint8_t> imageUploadScratchRgba8_;
     std::vector<std::uint8_t> effectReadbackBottomUp_;
-    std::vector<std::uint8_t> effectReadbackTopDown_;
+    std::vector<std::uint8_t> effectRowScratch_;
     std::vector<std::uint8_t> effectPatchScratch_;
     std::vector<std::uint32_t> quadIndexMirror_;
     std::string diagnostics_;
@@ -594,9 +595,7 @@ public:
     [[nodiscard]] std::size_t QuadIndexCapacity() const noexcept override {
         return quadCapacity_;
     }
-    [[nodiscard]] const std::vector<std::uint32_t>& QuadIndexCpuMirror() const noexcept override {
-        return quadIndexMirror_;
-    }
+    [[nodiscard]] const std::vector<std::uint32_t>& QuadIndexCpuMirror() const noexcept override;
     [[nodiscard]] std::string_view LastDiagnostics() const noexcept override {
         return diagnostics_;
     }
@@ -618,8 +617,7 @@ private:
     std::size_t lastRenderedNodeCount_ = 0u;
     Color lastClearColor_{0.0f, 0.0f, 0.0f, 0.0f};
 
-    std::vector<std::uint8_t> ringMirrorBytes_;
-    std::vector<std::uint32_t> quadIndexMirror_;
+    mutable std::vector<std::uint32_t> quadIndexMirror_;
     std::vector<std::uint8_t> atlasRgba8_;
     std::vector<std::uint8_t> framebufferRgba8_;
     std::string diagnostics_;

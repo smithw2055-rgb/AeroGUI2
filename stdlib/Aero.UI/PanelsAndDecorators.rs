@@ -493,6 +493,14 @@ public class RowDefinitionCollection : DependencyObject {
         _items.Push(def);
         if (_owner != null) { _owner.SyncGridTracks(); }
     }
+    internal void AddNoSync(RowDefinition def) {
+        if (def == null) { return; }
+        def._ownerGrid = _owner;
+        _items.Push(def);
+    }
+    internal void ClearNoSync() {
+        _items.Clear();
+    }
     public void Clear() {
         _items.Clear();
         if (_owner != null) { _owner.SyncGridTracks(); }
@@ -518,6 +526,14 @@ public class ColumnDefinitionCollection : DependencyObject {
         _items.Push(def);
         if (_owner != null) { _owner.SyncGridTracks(); }
     }
+    internal void AddNoSync(ColumnDefinition def) {
+        if (def == null) { return; }
+        def._ownerGrid = _owner;
+        _items.Push(def);
+    }
+    internal void ClearNoSync() {
+        _items.Clear();
+    }
     public void Clear() {
         _items.Clear();
         if (_owner != null) { _owner.SyncGridTracks(); }
@@ -532,54 +548,72 @@ public class Grid : Panel {
     public bool ShowGridLines { get; set; } = false;
 
     public Grid() : base() {
-        _rowDefs = new RowDefinitionCollection(this);
-        _colDefs = new ColumnDefinitionCollection(this);
         SyncGridTracks();
     }
 
     public override string GetTypeName() { return "Grid"; }
 
-    public RowDefinitionCollection RowDefinitions { get { return _rowDefs; } }
-    public ColumnDefinitionCollection ColumnDefinitions { get { return _colDefs; } }
+    public RowDefinitionCollection RowDefinitions {
+        get {
+            if (_rowDefs == null) { _rowDefs = new RowDefinitionCollection(this); }
+            return _rowDefs;
+        }
+    }
+    public ColumnDefinitionCollection ColumnDefinitions {
+        get {
+            if (_colDefs == null) { _colDefs = new ColumnDefinitionCollection(this); }
+            return _colDefs;
+        }
+    }
 
     public float RowSpacing {
         get { return _rowSpacing; }
-        set { _rowSpacing = value >= 0.0f ? value : 0.0f; SyncGridTracks(); }
+        set { float nv = value >= 0.0f ? value : 0.0f; if (_rowSpacing == nv) { return; } _rowSpacing = nv; SyncGridTracks(); }
     }
     public float ColumnSpacing {
         get { return _colSpacing; }
-        set { _colSpacing = value >= 0.0f ? value : 0.0f; SyncGridTracks(); }
+        set { float nv = value >= 0.0f ? value : 0.0f; if (_colSpacing == nv) { return; } _colSpacing = nv; SyncGridTracks(); }
     }
 
     public void AddRowDefinition(GridUnitType unit, float value = 1.0f, string name = "") {
         var def = new RowDefinition(value, unit);
         if (name != null && name.Length > 0) { def.Name = name; }
-        _rowDefs.Add(def);
+        RowDefinitions.Add(def);
     }
     public void AddColumnDefinition(GridUnitType unit, float value = 1.0f, string name = "") {
         var def = new ColumnDefinition(value, unit);
         if (name != null && name.Length > 0) { def.Name = name; }
-        _colDefs.Add(def);
+        ColumnDefinitions.Add(def);
     }
-    public void ClearRowDefinitions() { _rowDefs.Clear(); }
-    public void ClearColumnDefinitions() { _colDefs.Clear(); }
+    public void ClearRowDefinitions() { if (_rowDefs != null) { _rowDefs.Clear(); } }
+    public void ClearColumnDefinitions() { if (_colDefs != null) { _colDefs.Clear(); } }
 
     public void SetRowDefinitions(string spec) {
-        _rowDefs.Clear();
-        if (spec == null || spec.Length == 0) { return; }
+        if (spec == null || spec.Length == 0) {
+            if (_rowDefs != null && _rowDefs.Count() > 0) { _rowDefs.Clear(); }
+            return;
+        }
+        RowDefinitionCollection defs = RowDefinitions;
+        defs.ClearNoSync();
         string[] parts = spec.Split(",");
         for (int i = 0; i < parts.Length; i += 1) {
-            _rowDefs.Add(new RowDefinition(GridLength.Parse(parts[i])));
+            defs.AddNoSync(new RowDefinition(GridLength.Parse(parts[i])));
         }
+        SyncGridTracks();
     }
 
     public void SetColumnDefinitions(string spec) {
-        _colDefs.Clear();
-        if (spec == null || spec.Length == 0) { return; }
+        if (spec == null || spec.Length == 0) {
+            if (_colDefs != null && _colDefs.Count() > 0) { _colDefs.Clear(); }
+            return;
+        }
+        ColumnDefinitionCollection defs = ColumnDefinitions;
+        defs.ClearNoSync();
         string[] parts = spec.Split(",");
         for (int i = 0; i < parts.Length; i += 1) {
-            _colDefs.Add(new ColumnDefinition(GridLength.Parse(parts[i])));
+            defs.AddNoSync(new ColumnDefinition(GridLength.Parse(parts[i])));
         }
+        SyncGridTracks();
     }
 
     private static GridLength CoerceDefinitionGridLength(DependencyObject val) {
@@ -599,18 +633,22 @@ public class Grid : Panel {
 
     public bool SetNamedDefinitionProperty(string defName, string propName, DependencyObject val) {
         if (defName == null || defName.Length == 0) { return false; }
-        RowDefinition[] rows = _rowDefs.Items();
-        for (int i = 0; i < rows.Length; i += 1) {
-            if (rows[i].Name == defName && propName == "Height") {
-                rows[i].Height = CoerceDefinitionGridLength(val);
-                return true;
+        if (_rowDefs != null) {
+            RowDefinition[] rows = _rowDefs.Items();
+            for (int i = 0; i < rows.Length; i += 1) {
+                if (rows[i].Name == defName && propName == "Height") {
+                    rows[i].Height = CoerceDefinitionGridLength(val);
+                    return true;
+                }
             }
         }
-        ColumnDefinition[] cols = _colDefs.Items();
-        for (int i = 0; i < cols.Length; i += 1) {
-            if (cols[i].Name == defName && propName == "Width") {
-                cols[i].Width = CoerceDefinitionGridLength(val);
-                return true;
+        if (_colDefs != null) {
+            ColumnDefinition[] cols = _colDefs.Items();
+            for (int i = 0; i < cols.Length; i += 1) {
+                if (cols[i].Name == defName && propName == "Width") {
+                    cols[i].Width = CoerceDefinitionGridLength(val);
+                    return true;
+                }
             }
         }
         return false;
@@ -618,13 +656,17 @@ public class Grid : Panel {
 
     public DependencyObject GetNamedDefinitionProperty(string defName, string propName) {
         if (defName == null || defName.Length == 0) { return null; }
-        RowDefinition[] rows = _rowDefs.Items();
-        for (int i = 0; i < rows.Length; i += 1) {
-            if (rows[i].Name == defName && propName == "Height") { return rows[i].Height; }
+        if (_rowDefs != null) {
+            RowDefinition[] rows = _rowDefs.Items();
+            for (int i = 0; i < rows.Length; i += 1) {
+                if (rows[i].Name == defName && propName == "Height") { return rows[i].Height; }
+            }
         }
-        ColumnDefinition[] cols = _colDefs.Items();
-        for (int i = 0; i < cols.Length; i += 1) {
-            if (cols[i].Name == defName && propName == "Width") { return cols[i].Width; }
+        if (_colDefs != null) {
+            ColumnDefinition[] cols = _colDefs.Items();
+            for (int i = 0; i < cols.Length; i += 1) {
+                if (cols[i].Name == defName && propName == "Width") { return cols[i].Width; }
+            }
         }
         return null;
     }
@@ -633,15 +675,19 @@ public class Grid : Panel {
         SetNativeLayoutMode(LayoutMode.Grid, _colSpacing, _rowSpacing, 0, 0);
         if (!ParseUtil.IsValidHandle(__nativeHandle)) { return; }
         Visual_GridClearDefs(__nativeHandle);
-        RowDefinition[] rows = _rowDefs.Items();
-        for (int i = 0; i < rows.Length; i += 1) {
-            GridLength gl = rows[i].Height;
-            Visual_GridAddRowDef(__nativeHandle, EnumConvert.ToInt(gl.GridUnitType), gl.Value);
+        if (_rowDefs != null) {
+            RowDefinition[] rows = _rowDefs.Items();
+            for (int i = 0; i < rows.Length; i += 1) {
+                GridLength gl = rows[i].Height;
+                Visual_GridAddRowDef(__nativeHandle, EnumConvert.ToInt(gl.GridUnitType), gl.Value);
+            }
         }
-        ColumnDefinition[] cols = _colDefs.Items();
-        for (int i = 0; i < cols.Length; i += 1) {
-            GridLength gl = cols[i].Width;
-            Visual_GridAddColDef(__nativeHandle, EnumConvert.ToInt(gl.GridUnitType), gl.Value);
+        if (_colDefs != null) {
+            ColumnDefinition[] cols = _colDefs.Items();
+            for (int i = 0; i < cols.Length; i += 1) {
+                GridLength gl = cols[i].Width;
+                Visual_GridAddColDef(__nativeHandle, EnumConvert.ToInt(gl.GridUnitType), gl.Value);
+            }
         }
     }
 }

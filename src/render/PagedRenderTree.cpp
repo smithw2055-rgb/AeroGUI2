@@ -983,10 +983,6 @@ void PagedRenderTree::RegisterMtsdfInTreeAtlas(const AxbMtsdfPathEntry& entry) {
     constexpr std::uint32_t kMtsdfBaseY = 512u;
     constexpr std::uint32_t kMtsdfMaxRows = 448u; // y in [512 .. 959], leaving [960 .. 1023] for gradients
     constexpr std::uint32_t kGutter = 1u;
-    const std::size_t totalBytes = static_cast<std::size_t>(kAtlasWidth) * kMtsdfMaxRows * 4u;
-    if (mtsdfAtlasRgba8_.size() != totalBytes) {
-        mtsdfAtlasRgba8_.assign(totalBytes, 0u);
-    }
 
     const std::uint32_t cw = entry.cellWidth;
     const std::uint32_t ch = entry.cellHeight;
@@ -1007,6 +1003,12 @@ void PagedRenderTree::RegisterMtsdfInTreeAtlas(const AxbMtsdfPathEntry& entry) {
 
     const std::uint32_t dstX = mtsdfShelfX_;
     const std::uint32_t dstY = mtsdfShelfY_;
+    const std::uint32_t endLocalRow = std::min(kMtsdfMaxRows, (dstY - kMtsdfBaseY) + ch);
+    const std::size_t neededBytes = static_cast<std::size_t>(kAtlasWidth) * endLocalRow * 4u;
+    if (mtsdfAtlasRgba8_.size() < neededBytes) {
+        mtsdfAtlasRgba8_.resize(neededBytes, 0u);
+    }
+
     for (std::uint32_t cy = 0u; cy < ch; ++cy) {
         const std::size_t localRow = static_cast<std::size_t>((dstY - kMtsdfBaseY) + cy);
         std::uint8_t* dstRow = mtsdfAtlasRgba8_.data() +
@@ -1028,11 +1030,9 @@ void PagedRenderTree::RegisterMtsdfInTreeAtlas(const AxbMtsdfPathEntry& entry) {
     packed.u1 = (static_cast<float>(dstX + cw) - 0.5f) * kInvAtlas;
     packed.v1 = (static_cast<float>(dstY + ch) - 0.5f) * kInvAtlas;
 
-    mtsdfRegisteredHashes_.insert(entry.pathHash);
     mtsdfEntries_[entry.pathHash] = packed;
     (resourceStore_ ? resourceStore_ : &UIResourceStore::Default())->RegisterMtsdfPath(entry);
-    const std::uint32_t endLocalRow = (dstY - kMtsdfBaseY) + ch;
-    mtsdfPopulatedRows_ = std::max(mtsdfPopulatedRows_, std::min(kMtsdfMaxRows, endLocalRow));
+    mtsdfPopulatedRows_ = std::max(mtsdfPopulatedRows_, endLocalRow);
     ++mtsdfAtlasRevision_;
 }
 
@@ -1130,12 +1130,46 @@ void PagedRenderTree::ReserveCapacity(std::size_t expectedNodes) {
     if (pages_.capacity() < estPages) {
         pages_.reserve(estPages);
     }
-    if (pageClipW_.capacity() < estPages) {
-        pageClipW_.reserve(estPages);
+    if (pageClipWPoolIndices_.capacity() < estPages) {
+        pageClipWPoolIndices_.reserve(estPages);
     }
     if (dirtyPageList_.capacity() < estPages) {
         dirtyPageList_.reserve(estPages);
     }
+}
+
+const float* PagedRenderTree::PageVertexClipW(std::size_t pageIndex) const noexcept {
+    static const std::array<float, kVerticesPerCommandPage> kDefaultOnesClipW = []() {
+        std::array<float, kVerticesPerCommandPage> a{};
+        a.fill(1.0f);
+        return a;
+    }();
+    if (pageIndex >= pages_.size()) {
+        return nullptr;
+    }
+    if (pageIndex < pageClipWPoolIndices_.size()) {
+        const std::uint32_t poolIdx = pageClipWPoolIndices_[pageIndex];
+        if (poolIdx < pageClipWPool_.size()) {
+            return pageClipWPool_[poolIdx].data();
+        }
+    }
+    return kDefaultOnesClipW.data();
+}
+
+float* PagedRenderTree::EnsureWritablePageClipW(std::size_t pageIndex) {
+    if (pageIndex >= pages_.size()) {
+        return nullptr;
+    }
+    if (pageClipWPoolIndices_.size() < pages_.size()) {
+        pageClipWPoolIndices_.resize(pages_.size(), 0xFFFFFFFFu);
+    }
+    std::uint32_t& poolIdx = pageClipWPoolIndices_[pageIndex];
+    if (poolIdx >= pageClipWPool_.size()) {
+        poolIdx = static_cast<std::uint32_t>(pageClipWPool_.size());
+        pageClipWPool_.emplace_back();
+        pageClipWPool_.back().fill(1.0f);
+    }
+    return pageClipWPool_[poolIdx].data();
 }
 
 const Matrix4x4& PagedRenderTree::GetNodeWorldMatrix3D(const RenderNodeDescriptor& node) const noexcept {
@@ -1162,6 +1196,7 @@ void PagedRenderTree::SetNodeWorldMatrix3D(RenderNodeDescriptor& node, const Mat
 void PagedRenderTree::Clear() noexcept {
     syncedWorldId_ = 0u;
     syncedStructureVersion_ = 0u;
+    syncedDrawBufferVersion_ = 0u;
     activeClipRect_ = Rect{0.0f, 0.0f, 16384.0f, 16384.0f};
     activeClipEnabled_ = false;
     activeBlendMode_ = BlendingMode::Normal;
@@ -1172,7 +1207,9 @@ void PagedRenderTree::Clear() noexcept {
     activeBlurSpanDepth_ = 0u;
     hasOutOfOrderCoalesce_ = false;
     hasHintNextBounds_ = false;
-    pageClipW_.clear();
+    pageClipWPoolIndices_.clear();
+    pageClipWPool_.clear();
+    hasAnyPerspective3D_ = false;
     nodes_.clear();
     worldMatrices3D_.clear();
     pageDirtyFlags_.clear();
@@ -1295,8 +1332,7 @@ std::uint32_t PagedRenderTree::EnsurePageForAllocation(
     pages_.push_back(newPage);
     pageScreenBounds_.push_back(Rect{});
     pageBoundsState_.push_back(0u);
-    pageClipW_.emplace_back();
-    pageClipW_.back().fill(1.0f);
+    pageClipWPoolIndices_.push_back(0xFFFFFFFFu);
     pageDirtyFlags_.push_back(0u);
     dirtyPageList_.reserve(pages_.size());
     return newPageIdx;
@@ -1330,9 +1366,11 @@ void PagedRenderTree::ZeroOutNodeVertices(RenderNodeDescriptor& node) noexcept {
         node.vertexCount,
         kVerticesPerCommandPage - std::min<std::size_t>(vOffset, kVerticesPerCommandPage));
     AeroVertex* __restrict v = page.vertices.data() + vOffset;
-    float* __restrict clipW = (node.pageIndex < pageClipW_.size())
-        ? (pageClipW_[node.pageIndex].data() + vOffset)
-        : nullptr;
+    float* __restrict clipW =
+        (node.pageIndex < pageClipWPoolIndices_.size() &&
+         pageClipWPoolIndices_[node.pageIndex] < pageClipWPool_.size())
+            ? (pageClipWPool_[pageClipWPoolIndices_[node.pageIndex]].data() + vOffset)
+            : nullptr;
     for (std::size_t i = 0; i < count; ++i) {
         v[i] = AeroVertex{};
         v[i].rgba = 0u;
@@ -1434,16 +1472,21 @@ void PagedRenderTree::WriteQuadVertices(RenderNodeDescriptor& node) noexcept {
     v[3] = AeroVertex{x3, y3, uMin, vMax, packedColor, prim, flags};
     if (node.hasPerspective3D) {
         page.header.flags |= CommandPageFlag_HasPerspective3D;
+        hasAnyPerspective3D_ = true;
     }
     if (node.pageIndex < pageBoundsState_.size()) {
         pageBoundsState_[node.pageIndex] = 2u;
     }
-    if (node.pageIndex < pageClipW_.size()) {
-        float* __restrict clipW = pageClipW_[node.pageIndex].data() + vOffset;
-        clipW[0] = w0;
-        clipW[1] = w1;
-        clipW[2] = w2;
-        clipW[3] = w3;
+    if (node.hasPerspective3D ||
+        (node.pageIndex < pageClipWPoolIndices_.size() &&
+         pageClipWPoolIndices_[node.pageIndex] < pageClipWPool_.size())) {
+        if (float* __restrict pageW = EnsureWritablePageClipW(node.pageIndex); pageW != nullptr) {
+            float* __restrict clipW = pageW + vOffset;
+            clipW[0] = w0;
+            clipW[1] = w1;
+            clipW[2] = w2;
+            clipW[3] = w3;
+        }
     }
 }
 
@@ -2060,7 +2103,7 @@ std::uint32_t PagedRenderTree::AllocateHudBarBatch(
     pages_.reserve(pages_.size() + estimatedPages);
     pageScreenBounds_.reserve(pageScreenBounds_.size() + estimatedPages);
     pageBoundsState_.reserve(pageBoundsState_.size() + estimatedPages);
-    pageClipW_.reserve(pageClipW_.size() + estimatedPages);
+    pageClipWPoolIndices_.reserve(pageClipWPoolIndices_.size() + estimatedPages);
     pageDirtyFlags_.reserve(pageDirtyFlags_.size() + estimatedPages);
     dirtyPageList_.reserve(pages_.size() + estimatedPages);
 
@@ -2211,9 +2254,11 @@ bool PagedRenderTree::UpdateHudDigitsText(
     CommandPage& page = pages_[node.pageIndex];
     const std::size_t maxSlots = node.vertexCount / 4u;
     AeroVertex* __restrict vBase = page.vertices.data() + node.vertexOffsetInPage;
-    float* __restrict clipWBase = (node.pageIndex < pageClipW_.size())
-        ? (pageClipW_[node.pageIndex].data() + node.vertexOffsetInPage)
-        : nullptr;
+    float* __restrict clipWBase =
+        (node.pageIndex < pageClipWPoolIndices_.size() &&
+         pageClipWPoolIndices_[node.pageIndex] < pageClipWPool_.size())
+            ? (pageClipWPool_[pageClipWPoolIndices_[node.pageIndex]].data() + node.vertexOffsetInPage)
+            : nullptr;
     const std::uint32_t packedColor = ScalePackedRgbaAlpha(node.baseRgba, node.opacity);
     const auto prim = static_cast<std::uint16_t>(AeroPrimType::SdfTextGlyph);
     const std::uint16_t flags = node.encodedSdfParams;
@@ -2302,9 +2347,17 @@ bool PagedRenderTree::WriteLayoutGlyphSlice(
 
     CommandPage& page = pages_[node.pageIndex];
     AeroVertex* __restrict vBase = page.vertices.data() + node.vertexOffsetInPage;
-    float* __restrict clipWBase = (node.pageIndex < pageClipW_.size())
-        ? (pageClipW_[node.pageIndex].data() + node.vertexOffsetInPage)
-        : nullptr;
+    if (node.hasPerspective3D) {
+        hasAnyPerspective3D_ = true;
+    }
+    float* __restrict clipWBase = nullptr;
+    if (node.hasPerspective3D ||
+        (node.pageIndex < pageClipWPoolIndices_.size() &&
+         pageClipWPoolIndices_[node.pageIndex] < pageClipWPool_.size())) {
+        if (float* __restrict pageW = EnsureWritablePageClipW(node.pageIndex); pageW != nullptr) {
+            clipWBase = pageW + node.vertexOffsetInPage;
+        }
+    }
     const std::uint32_t packedColor = ScalePackedRgbaAlpha(node.baseRgba, node.opacity);
     const auto prim = static_cast<std::uint16_t>(AeroPrimType::SdfTextGlyph);
     const std::uint16_t flags = node.encodedSdfParams;
@@ -2766,6 +2819,26 @@ bool PagedRenderTree::IsPageDirty(std::size_t pageIndex) const noexcept {
 
 std::size_t PagedRenderTree::DirtyPageCount() const noexcept {
     return dirtyPageList_.size();
+}
+
+void PagedRenderTree::MarkAllPagesDirty() noexcept {
+    const std::size_t count = pages_.size();
+    if (dirtyPageList_.size() >= count) {
+        return;
+    }
+    if (pageDirtyFlags_.size() < count) {
+        pageDirtyFlags_.resize(count, 0u);
+    }
+    dirtyPageList_.reserve(count);
+    for (std::size_t p = 0u; p < count; ++p) {
+        CommandPage& page = pages_[p];
+        page.header.dirtyRevision += 1u;
+        page.header.dirtyQuadMask = ~0ULL;
+        if (pageDirtyFlags_[p] == 0u) {
+            pageDirtyFlags_[p] = 1u;
+            dirtyPageList_.push_back(static_cast<std::uint32_t>(p));
+        }
+    }
 }
 
 void PagedRenderTree::ClearDirtyPages() noexcept {

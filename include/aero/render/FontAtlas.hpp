@@ -55,10 +55,12 @@ public:
     TrueTypeFontFace() = default;
 
     bool LoadFromMemory(const std::uint8_t* data, std::size_t size, std::string* outError = nullptr);
+    bool LoadFromMemory(std::vector<std::uint8_t>&& ownedData, std::string* outError = nullptr);
     bool LoadFromFile(std::string_view filePath, std::string* outError = nullptr);
 
     [[nodiscard]] bool IsValid() const noexcept { return valid_; }
     [[nodiscard]] std::uint64_t ContentHash() const noexcept { return contentHash_; }
+    [[nodiscard]] std::size_t RawByteSize() const noexcept { return data_.size(); }
     [[nodiscard]] const std::string& FamilyName() const noexcept { return familyName_; }
     [[nodiscard]] const std::string& FullName() const noexcept { return fullName_; }
 
@@ -132,6 +134,7 @@ private:
         std::uint32_t endOffset = 0u;
     };
 
+    bool ParseLoadedBuffer(std::string* outError);
     bool ParseTables(std::string* outError);
     bool ParseCffTable(std::uint32_t offset, std::uint32_t length, std::string* outError);
     bool ParseNameTable(std::uint32_t offset, std::uint32_t length);
@@ -419,6 +422,19 @@ public:
         std::uint32_t& outWidth,
         std::uint32_t& outRows,
         std::uint64_t* outRevision = nullptr) const;
+    void CopyGlyphDirtyBandRgba8(
+        std::uint32_t maxRows,
+        std::uint64_t& ioKnownRevision,
+        std::vector<std::uint8_t>& outRgba8,
+        std::uint32_t& outWidth,
+        std::uint32_t& outYOffset,
+        std::uint32_t& outRows,
+        bool& outFullBand) const;
+    [[nodiscard]] bool AcquireSdfView(
+        const std::uint8_t*& outData,
+        std::uint16_t& outAtlasW,
+        std::uint16_t& outAtlasH,
+        std::uint16_t& outGlyphH) const noexcept;
 
     [[nodiscard]] static std::string NormalizeFamilyKey(std::string_view rawFamily);
 
@@ -480,12 +496,38 @@ private:
         const RegisteredFontEntry* fontEntry,
         std::uint32_t codePoint);
 
+    bool LoadTrueTypeFontFromMemoryImpl(
+        const std::uint8_t* data,
+        std::size_t size,
+        std::vector<std::uint8_t>* optOwnedBytes,
+        std::string_view familyAlias,
+        bool setAsDefault,
+        std::string* outError);
+    [[nodiscard]] TextLayoutResult MeasureRichLayoutSpan(
+        const RichTextRunInput* runs,
+        std::size_t runCount,
+        std::string_view defaultFontFamily,
+        float defaultFontSize,
+        int defaultFontWeight,
+        bool defaultItalic,
+        float maxWidth,
+        TextWrapping wrapMode,
+        float charSpacing,
+        float explicitLineHeight,
+        bool baseRtl,
+        TextTrimming trimMode,
+        float maxHeight);
+
     mutable std::mutex mutex_;
     std::uint16_t atlasWidth_ = kDefaultAtlasSize;
     std::uint16_t atlasHeight_ = kDefaultAtlasSize;
     std::uint16_t glyphRegionHeight_ = kDefaultAtlasSize / 2u; // Top half v in [0.0..0.5)
     mutable SkylinePacker skyline_;
     mutable std::vector<std::uint8_t> sdfPixels_;
+    mutable bool hasDirtyRowSpan_ = false;
+    mutable std::uint32_t dirtyRowMin_ = 0xFFFFFFFFu;
+    mutable std::uint32_t dirtyRowMax_ = 0u;
+    mutable std::uint64_t dirtyBaseRevision_ = 0u;
     std::uint64_t instanceId_ = 0u;
     mutable std::atomic<std::uint64_t> revision_{1u};
 

@@ -13,6 +13,7 @@ public static class PopupService {
     private static UIElement _overlayHost;
     private static UIElement[] _overlayRoots;
     private static Canvas[] _overlayCanvases;
+    private static int _lastPopupSyncEpoch = -1;
 
     private static void EnsureDisposeHook() {
         if (!_disposeHookInstalled) {
@@ -112,8 +113,17 @@ public static class PopupService {
         });
     }
 
+    internal static void InvalidatePositions() {
+        if (_openPopups != null && _openPopups.Length > 0) {
+            _lastPopupSyncEpoch = -1;
+        }
+    }
+
     public static void RefreshOpenPositions() {
         if (_openPopups == null || _openPopups.Length == 0) { return; }
+        int curEp = BindingEngine._curLayoutSizeEpoch;
+        if (curEp == _lastPopupSyncEpoch) { return; }
+        _lastPopupSyncEpoch = curEp;
         for (int i = _openPopups.Length - 1; i >= 0; i -= 1) {
             Popup p = _openPopups[i];
             if (p == null || p._isDisposedTree || !p.IsOpen) {
@@ -127,6 +137,7 @@ public static class PopupService {
     public static void RegisterOpen(Popup p) {
         if (p == null) { return; }
         EnsureHooked();
+        _lastPopupSyncEpoch = -1;
         if (_openPopups == null) { _openPopups = new Popup[0]; }
         if (!_openPopups.Contains(p)) { _openPopups.Push(p); }
     }

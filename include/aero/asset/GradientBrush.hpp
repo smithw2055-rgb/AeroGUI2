@@ -1,9 +1,9 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "aero/drawing/Geometry.hpp"
+#include "aero/foundation/ChunkedArena.hpp"
 
 namespace aero {
 
@@ -59,14 +60,42 @@ struct GradientBrushDesc {
     std::vector<GradientStop> stops;
     // Pre-baked 256-texel RGBA8 1D ramp for O(1) GPU LUT row upload & CPU bilinear evaluation
     std::array<std::uint8_t, kLutWidth * 4u> bakedRampRgba8{};
+    bool isMutableClone = false;
 };
 
 void BakeGradientBrushRamp(GradientBrushDesc& ioBrush) noexcept;
+
+struct GradientEvalPod {
+    static constexpr std::uint32_t kLutWidth = GradientBrushDesc::kLutWidth;
+
+    std::uint32_t brushId = 0u;
+    GradientBrushKind kind = GradientBrushKind::Linear;
+    BrushMappingMode mappingMode = BrushMappingMode::RelativeToBoundingBox;
+    GradientSpreadMethod spreadMethod = GradientSpreadMethod::Pad;
+    float opacity = 1.0f;
+    Point startPoint{0.0f, 0.0f};
+    Point endPoint{1.0f, 1.0f};
+    Point center{0.5f, 0.5f};
+    Point gradientOrigin{0.5f, 0.5f};
+    float radiusX = 0.5f;
+    float radiusY = 0.5f;
+    std::array<std::uint8_t, kLutWidth * 4u> bakedRampRgba8{};
+};
+
 [[nodiscard]] Color SampleGradientRampAtT(
     const GradientBrushDesc& brush,
     float rawT) noexcept;
 [[nodiscard]] Color EvaluateGradientBrushAtNormalizedUv(
     const GradientBrushDesc& brush,
+    float normU,
+    float normV,
+    float quadWidthPx = 1.0f,
+    float quadHeightPx = 1.0f) noexcept;
+[[nodiscard]] Color SampleGradientPodAtT(
+    const GradientEvalPod& brush,
+    float rawT) noexcept;
+[[nodiscard]] Color EvaluateGradientPodAtNormalizedUv(
+    const GradientEvalPod& brush,
     float normU,
     float normV,
     float quadWidthPx = 1.0f,
@@ -92,19 +121,33 @@ public:
     std::uint32_t RegisterBrush(GradientBrushDesc desc);
     std::uint32_t RegisterOrResolveSpec(std::string_view serializedSpec);
     std::uint32_t CloneMutableBrush(std::uint32_t sourceBrushId);
+    bool ReleaseMutableBrush(std::uint32_t brushId) noexcept;
     bool UpdateBrushStopColor(std::uint32_t brushId, std::size_t stopIndex, const Color& color);
     bool UpdateBrushStopOffset(std::uint32_t brushId, std::size_t stopIndex, float offset);
     [[nodiscard]] const GradientBrushDesc* Find(std::uint32_t brushId) const noexcept;
     [[nodiscard]] bool TryGetBrush(std::uint32_t brushId, GradientBrushDesc& outBrush) const noexcept;
+    [[nodiscard]] bool TryGetStopValue(
+        std::uint32_t brushId,
+        std::size_t stopIndex,
+        float& outOffset,
+        Color& outColor) const noexcept;
+    [[nodiscard]] bool TryGetEvalPod(std::uint32_t brushId, GradientEvalPod& outPod) const noexcept;
+    [[nodiscard]] bool TryGetEvalPodWithRevision(
+        std::uint32_t brushId,
+        GradientEvalPod& outPod,
+        std::uint32_t& outRevision) const noexcept;
     [[nodiscard]] std::size_t BrushCount() const noexcept;
-    [[nodiscard]] std::uint32_t Revision() const noexcept;
+    [[nodiscard]] std::uint32_t Revision() const noexcept {
+        return revision_.load(std::memory_order_acquire);
+    }
     void Clear() noexcept;
 
 private:
     mutable std::mutex mutex_;
-    std::deque<GradientBrushDesc> brushes_;
+    ChunkedArena<GradientBrushDesc, 64> brushes_;
+    std::vector<std::uint32_t> freeMutableBrushIds_;
     std::unordered_map<std::string, std::uint32_t> specToId_;
-    std::uint32_t revision_ = 1u;
+    std::atomic<std::uint32_t> revision_{1u};
 };
 
 } // namespace aero

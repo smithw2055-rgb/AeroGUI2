@@ -126,7 +126,6 @@ public class ResourceDictionary : DependencyObject {
     }
 
     public ResourceDictionary() {
-        _keyIndex = new Dictionary<string, int>();
         _keys = new string[0];
         _vals = new DependencyObject[0];
     }
@@ -135,6 +134,16 @@ public class ResourceDictionary : DependencyObject {
     private DependencyObject[] _vals;
 
     public int Count() { return _keys.Length; }
+
+    private int FindKeyIndex(string key) {
+        if (_keyIndex != null) {
+            return _keyIndex.GetOrDefault(key, -1);
+        }
+        for (int i = 0; i < _keys.Length; i += 1) {
+            if (_keys[i] == key) { return i; }
+        }
+        return -1;
+    }
 
     public static ResourceDictionary GlobalApplicationResources() {
         if (_appResources == null) {
@@ -150,11 +159,19 @@ public class ResourceDictionary : DependencyObject {
 
     public void SetBox(string key, DependencyObject box) {
         if (key == null || key.Length == 0) { return; }
-        int fbIdx = _keyIndex.GetOrDefault(key, -1);
+        int fbIdx = FindKeyIndex(key);
         if (fbIdx < 0) {
-            _keyIndex[key] = _keys.Length;
+            int newIdx = _keys.Length;
             _keys.Push(key);
             _vals.Push(box);
+            if (_keyIndex != null) {
+                _keyIndex[key] = newIdx;
+            } else if (_keys.Length >= 8) {
+                _keyIndex = new Dictionary<string, int>();
+                for (int i = 0; i < _keys.Length; i += 1) {
+                    _keyIndex[_keys[i]] = i;
+                }
+            }
         } else {
             _vals[fbIdx] = box;
         }
@@ -174,7 +191,7 @@ public class ResourceDictionary : DependencyObject {
 
     public DependencyObject TryGetLocalBox(string key) {
         if (key == null || _keys.Length == 0) { return null; }
-        int idx = _keyIndex.GetOrDefault(key, -1);
+        int idx = FindKeyIndex(key);
         return (idx >= 0 && idx < _vals.Length) ? _vals[idx] : null;
     }
 
@@ -195,24 +212,26 @@ public class ResourceDictionary : DependencyObject {
 
     public bool Contains(string key) {
         if (key == null || _keys.Length == 0) { return false; }
-        return _keyIndex.ContainsKey(key);
+        return FindKeyIndex(key) >= 0;
     }
 
     public bool Remove(string key) {
         if (key == null || _keys.Length == 0) { return false; }
-        int idx = _keyIndex.GetOrDefault(key, -1);
+        int idx = FindKeyIndex(key);
         if (idx < 0) { return false; }
-        _keyIndex.Remove(key);
+        if (_keyIndex != null) { _keyIndex.Remove(key); }
         _keys.RemoveAt(idx);
         _vals.RemoveAt(idx);
-        for (int i = idx; i < _keys.Length; i += 1) {
-            _keyIndex[_keys[i]] = i;
+        if (_keyIndex != null) {
+            for (int i = idx; i < _keys.Length; i += 1) {
+                _keyIndex[_keys[i]] = i;
+            }
         }
         return true;
     }
 
     public void Clear() {
-        _keyIndex.Clear();
+        if (_keyIndex != null) { _keyIndex.Clear(); }
         _keys.Clear();
         _vals.Clear();
     }
@@ -367,7 +386,10 @@ public class Setter : DependencyObject {
     }
 
     public void ApplyTo(UIElement rootTarget) {
-        UIElement dest = ResolveTarget(rootTarget);
+        ApplyToResolved(ResolveTarget(rootTarget), rootTarget);
+    }
+
+    internal void ApplyToResolved(UIElement dest, UIElement rootTarget) {
         if (dest != null) {
             if (!dest.HasUiFlag(256) && TargetName.Length == 0 && dest.HasLocalProperty(Property)) {
                 return;
@@ -423,6 +445,7 @@ public class TriggerBase : DependencyObject {
     private static int[] _baseRefs;
     protected static int _sharedPropClobberedEpoch = 0;
     private static TriggerBase[] _triggersWithTargets;
+    private static Setter[] _emptySetters;
     private static bool _disposeHookInstalled = false;
     internal static bool _pendingTriggerCleanup = false;
 
@@ -442,17 +465,7 @@ public class TriggerBase : DependencyObject {
         }
     }
 
-    public TriggerBase() {
-        _setters = new Setter[0];
-        _enterActions = new Storyboard[0];
-        _exitActions = new Storyboard[0];
-        _enterActionKeys = new string[0];
-        _exitActionKeys = new string[0];
-        _activeTargets = new UIElement[0];
-        _savedOwners = new UIElement[0];
-        _savedDests = new UIElement[0];
-        _savedProps = new string[0];
-    }
+    public TriggerBase() {}
 
     internal virtual bool HasLiveHookedTargets() { return false; }
     internal virtual void CleanupHookedTargets() {}
@@ -496,7 +509,7 @@ public class TriggerBase : DependencyObject {
             for (int i = 0; i < _triggersWithTargets.Length; i += 1) {
                 TriggerBase tr = _triggersWithTargets[i];
                 if (tr == null) { continue; }
-                if (tr._activeTargets.Length > 0) {
+                if (tr._activeTargets != null && tr._activeTargets.Length > 0) {
                     int aw = 0;
                     for (int j = 0; j < tr._activeTargets.Length; j += 1) {
                         if (tr._activeTargets[j] != null && !tr._activeTargets[j]._isDisposedTree) {
@@ -506,7 +519,7 @@ public class TriggerBase : DependencyObject {
                     }
                     while (tr._activeTargets.Length > aw) { tr._activeTargets.RemoveAt(tr._activeTargets.Length - 1); }
                 }
-                if (tr._savedOwners.Length > 0) {
+                if (tr._savedOwners != null && tr._savedOwners.Length > 0) {
                     int sw = 0;
                     for (int j = 0; j < tr._savedOwners.Length; j += 1) {
                         if (tr._savedOwners[j] != null && !tr._savedOwners[j]._isDisposedTree &&
@@ -527,7 +540,9 @@ public class TriggerBase : DependencyObject {
                     }
                 }
                 tr.CleanupHookedTargets();
-                if (tr._activeTargets.Length > 0 || tr._savedOwners.Length > 0 || tr.HasLiveHookedTargets()) {
+                bool hasAct = tr._activeTargets != null && tr._activeTargets.Length > 0;
+                bool hasSaved = tr._savedOwners != null && tr._savedOwners.Length > 0;
+                if (hasAct || hasSaved || tr.HasLiveHookedTargets()) {
                     if (tw != i) { _triggersWithTargets[tw] = tr; }
                     tw += 1;
                 }
@@ -638,28 +653,33 @@ public class TriggerBase : DependencyObject {
         }
     }
 
-    public Setter[] Setters() { return _setters; }
+    public Setter[] Setters() {
+        if (_setters != null) { return _setters; }
+        if (_emptySetters == null) { _emptySetters = new Setter[0]; }
+        return _emptySetters;
+    }
 
-    public void AddSetter(Setter s) { if (s != null) { _setters.Push(s); } }
-    public void AddSetter(string prop, object val) { _setters.Push(new Setter(prop, val)); }
-    public void AddSetter(string prop, string val) { _setters.Push(new Setter(prop, val)); }
-    public void AddSetter(string prop, float val) { _setters.Push(new Setter(prop, val)); }
-    public void AddSetter(string prop, int val) { _setters.Push(new Setter(prop, val)); }
-    public void AddSetter(string prop, bool val) { _setters.Push(new Setter(prop, val)); }
+    public void AddSetter(Setter s) { if (s != null) { if (_setters == null) { _setters = new Setter[0]; } _setters.Push(s); } }
+    public void AddSetter(string prop, object val) { if (_setters == null) { _setters = new Setter[0]; } _setters.Push(new Setter(prop, val)); }
+    public void AddSetter(string prop, string val) { if (_setters == null) { _setters = new Setter[0]; } _setters.Push(new Setter(prop, val)); }
+    public void AddSetter(string prop, float val) { if (_setters == null) { _setters = new Setter[0]; } _setters.Push(new Setter(prop, val)); }
+    public void AddSetter(string prop, int val) { if (_setters == null) { _setters = new Setter[0]; } _setters.Push(new Setter(prop, val)); }
+    public void AddSetter(string prop, bool val) { if (_setters == null) { _setters = new Setter[0]; } _setters.Push(new Setter(prop, val)); }
     public void AddSetterBox(string prop, DependencyObject box, string targetName = "") {
+        if (_setters == null) { _setters = new Setter[0]; }
         _setters.Push(Setter.FromBox(prop, box, targetName));
     }
-    public void AddEnterAction(Storyboard sb) { if (sb != null) { _enterActions.Push(sb); } }
-    public void AddExitAction(Storyboard sb) { if (sb != null) { _exitActions.Push(sb); } }
-    public void AddEnterActionKey(string key) { if (key != null && key.Length > 0) { _enterActionKeys.Push(key); } }
-    public void AddExitActionKey(string key) { if (key != null && key.Length > 0) { _exitActionKeys.Push(key); } }
+    public void AddEnterAction(Storyboard sb) { if (sb != null) { if (_enterActions == null) { _enterActions = new Storyboard[0]; } _enterActions.Push(sb); } }
+    public void AddExitAction(Storyboard sb) { if (sb != null) { if (_exitActions == null) { _exitActions = new Storyboard[0]; } _exitActions.Push(sb); } }
+    public void AddEnterActionKey(string key) { if (key != null && key.Length > 0) { if (_enterActionKeys == null) { _enterActionKeys = new string[0]; } _enterActionKeys.Push(key); } }
+    public void AddExitActionKey(string key) { if (key != null && key.Length > 0) { if (_exitActionKeys == null) { _exitActionKeys = new string[0]; } _exitActionKeys.Push(key); } }
 
     public virtual void Attach(UIElement target) {}
 
     public virtual bool IsMatched(UIElement target) { return false; }
 
     internal bool WasActiveFor(UIElement target) {
-        if (target == null) { return false; }
+        if (target == null || _activeTargets == null) { return false; }
         for (int i = 0; i < _activeTargets.Length; i += 1) {
             if (_activeTargets[i] == target) { return true; }
         }
@@ -668,13 +688,16 @@ public class TriggerBase : DependencyObject {
 
     private void SetActiveFor(UIElement target, bool active) {
         if (target == null) { return; }
-        for (int i = _activeTargets.Length - 1; i >= 0; i -= 1) {
-            if (_activeTargets[i] == target) {
-                if (!active) { _activeTargets.RemoveAt(i); }
-                return;
+        if (_activeTargets != null) {
+            for (int i = _activeTargets.Length - 1; i >= 0; i -= 1) {
+                if (_activeTargets[i] == target) {
+                    if (!active) { _activeTargets.RemoveAt(i); }
+                    return;
+                }
             }
         }
         if (active) {
+            if (_activeTargets == null) { _activeTargets = new UIElement[0]; }
             _activeTargets.Push(target);
             RegisterTriggerWithTargets(this);
         }
@@ -683,37 +706,41 @@ public class TriggerBase : DependencyObject {
     internal void DeactivateTarget(UIElement target, Style owningStyle, bool runExitActions) {
         if (target == null || !WasActiveFor(target)) { return; }
         SetActiveFor(target, false);
-        for (int i = _savedOwners.Length - 1; i >= 0; i -= 1) {
-            if (_savedOwners[i] == target) {
-                UIElement dest = _savedDests[i];
-                string prop = _savedProps[i];
-                _savedOwners.RemoveAt(i);
-                _savedDests.RemoveAt(i);
-                _savedProps.RemoveAt(i);
-                if (dest != null && prop.Length > 0) {
-                    if (dest is Grid && prop.StartsWith("__GridDef:")) {
-                        string rest = prop.Substring(10);
-                        int sep = rest.IndexOf(":");
-                        if (sep > 0) {
-                            DependencyObject baseGl = PopDirectBaseBox(dest, prop);
-                            if (baseGl != null) {
-                                (dest as Grid).SetNamedDefinitionProperty(rest.Substring(0, sep), rest.Substring(sep + 1), baseGl);
+        if (_savedOwners != null) {
+            for (int i = _savedOwners.Length - 1; i >= 0; i -= 1) {
+                if (_savedOwners[i] == target) {
+                    UIElement dest = _savedDests[i];
+                    string prop = _savedProps[i];
+                    _savedOwners.RemoveAt(i);
+                    _savedDests.RemoveAt(i);
+                    _savedProps.RemoveAt(i);
+                    if (dest != null && prop.Length > 0) {
+                        if (dest is Grid && prop.StartsWith("__GridDef:")) {
+                            string rest = prop.Substring(10);
+                            int sep = rest.IndexOf(":");
+                            if (sep > 0) {
+                                DependencyObject baseGl = PopDirectBaseBox(dest, prop);
+                                if (baseGl != null) {
+                                    (dest as Grid).SetNamedDefinitionProperty(rest.Substring(0, sep), rest.Substring(sep + 1), baseGl);
+                                }
                             }
+                        } else {
+                            BindingEngine.UnbindTriggerProperty(dest, prop);
+                            bool hadTrigFlag = dest.HasUiFlag(256);
+                            if (!hadTrigFlag) { dest.SetUiFlag(256, true); }
+                            ReleaseBaseValue(dest, prop);
+                            if (!hadTrigFlag) { dest.SetUiFlag(256, false); }
+                            BindingEngine.MarkFlushDirty();
                         }
-                    } else {
-                        BindingEngine.UnbindTriggerProperty(dest, prop);
-                        bool hadTrigFlag = dest.HasUiFlag(256);
-                        if (!hadTrigFlag) { dest.SetUiFlag(256, true); }
-                        ReleaseBaseValue(dest, prop);
-                        if (!hadTrigFlag) { dest.SetUiFlag(256, false); }
-                        BindingEngine.MarkFlushDirty();
                     }
                 }
             }
         }
         if (runExitActions) {
-            for (int i = 0; i < _exitActions.Length; i += 1) {
-                _exitActions[i].Begin(target);
+            if (_exitActions != null) {
+                for (int i = 0; i < _exitActions.Length; i += 1) {
+                    _exitActions[i].Begin(target);
+                }
             }
             if (_exitActionKeys != null) {
                 for (int i = 0; i < _exitActionKeys.Length; i += 1) {
@@ -740,40 +767,52 @@ public class TriggerBase : DependencyObject {
         if (!wasActive) {
             SetActiveFor(target, true);
         }
-        for (int i = 0; i < _setters.Length; i += 1) {
-            Setter s = _setters[i];
-            UIElement dest = s.ResolveTarget(target);
-            if (savePrev) {
-                string prop = s.PropertyName();
-                if (dest != null && prop.Length > 0) {
-                    AcquireBaseValue(dest, prop);
-                    _savedOwners.Push(target);
-                    _savedDests.Push(dest);
-                    _savedProps.Push(prop);
-                } else if (s.TargetName.Length > 0 && prop.Length > 0) {
-                    Grid defGrid = Setter.FindGridWithNamedDefinition(target, s.TargetName);
-                    if (defGrid != null) {
-                        DependencyObject curGl = defGrid.GetNamedDefinitionProperty(s.TargetName, prop);
-                        string defKey = "__GridDef:" + s.TargetName + ":" + prop;
-                        AcquireDirectBaseBox(defGrid, defKey, curGl);
+        if (_setters != null) {
+            for (int i = 0; i < _setters.Length; i += 1) {
+                Setter s = _setters[i];
+                UIElement dest = s.ResolveTarget(target);
+                if (savePrev) {
+                    string prop = s.PropertyName();
+                    if (dest != null && prop.Length > 0) {
+                        AcquireBaseValue(dest, prop);
+                        if (_savedOwners == null) {
+                            _savedOwners = new UIElement[0];
+                            _savedDests = new UIElement[0];
+                            _savedProps = new string[0];
+                        }
                         _savedOwners.Push(target);
-                        _savedDests.Push(defGrid);
-                        _savedProps.Push(defKey);
+                        _savedDests.Push(dest);
+                        _savedProps.Push(prop);
+                    } else if (s.TargetName.Length > 0 && prop.Length > 0) {
+                        Grid defGrid = Setter.FindGridWithNamedDefinition(target, s.TargetName);
+                        if (defGrid != null) {
+                            DependencyObject curGl = defGrid.GetNamedDefinitionProperty(s.TargetName, prop);
+                            string defKey = "__GridDef:" + s.TargetName + ":" + prop;
+                            AcquireDirectBaseBox(defGrid, defKey, curGl);
+                            if (_savedOwners == null) {
+                                _savedOwners = new UIElement[0];
+                                _savedDests = new UIElement[0];
+                                _savedProps = new string[0];
+                            }
+                            _savedOwners.Push(target);
+                            _savedDests.Push(defGrid);
+                            _savedProps.Push(defKey);
+                        }
                     }
                 }
-            }
-            if (wasActive && dest != null &&
-                (s.BindingElementName.Length > 0 || s.BindingPath.Length > 0) &&
-                BindingEngine.HasTriggerBinding(dest, s.PropertyName())) {
-                continue;
-            }
-            if (dest != null) {
-                bool hadTrigFlag = dest.HasUiFlag(256);
-                if (!hadTrigFlag) { dest.SetUiFlag(256, true); }
-                s.ApplyTo(target);
-                if (!hadTrigFlag) { dest.SetUiFlag(256, false); }
-            } else {
-                s.ApplyTo(target);
+                if (wasActive && dest != null &&
+                    (s.BindingElementName.Length > 0 || s.BindingPath.Length > 0) &&
+                    BindingEngine.HasTriggerBinding(dest, s.PropertyName())) {
+                    continue;
+                }
+                if (dest != null) {
+                    bool hadTrigFlag = dest.HasUiFlag(256);
+                    if (!hadTrigFlag) { dest.SetUiFlag(256, true); }
+                    s.ApplyToResolved(dest, target);
+                    if (!hadTrigFlag) { dest.SetUiFlag(256, false); }
+                } else {
+                    s.ApplyToResolved(null, target);
+                }
             }
         }
         if (!wasActive) {
@@ -783,8 +822,10 @@ public class TriggerBase : DependencyObject {
 
     protected void RunEnterActions(UIElement target) {
         if (target == null) { return; }
-        for (int i = 0; i < _enterActions.Length; i += 1) {
-            _enterActions[i].Begin(target);
+        if (_enterActions != null) {
+            for (int i = 0; i < _enterActions.Length; i += 1) {
+                _enterActions[i].Begin(target);
+            }
         }
         if (_enterActionKeys != null) {
             for (int i = 0; i < _enterActionKeys.Length; i += 1) {
@@ -1105,6 +1146,7 @@ public class DataTrigger : TriggerBase {
     private static int[] _reactiveSrcTreeEpoch;
     private static int[] _reactiveSrcChainEpoch;
     private static int _lastSeenClobberEpoch = 0;
+    private static int _reactiveCompactDisposeEpoch = -1;
     private static bool _reactiveHookInstalled = false;
     public string BindingPath { get; set; } = "";
     public string ElementName { get; set; } = "";
@@ -1331,6 +1373,7 @@ public class DataTrigger : TriggerBase {
     }
 
     internal bool HasDynamicSetterBindings() {
+        if (_setters == null) { return false; }
         for (int i = 0; i < _setters.Length; i += 1) {
             Setter s = _setters[i];
             if (s.BindingElementName.Length > 0 || s.BindingPath.Length > 0) {
@@ -1372,33 +1415,37 @@ public class DataTrigger : TriggerBase {
         while (_reactiveSrcEl.Length < _reactiveTriggers.Length) { _reactiveSrcEl.Push(null); }
         while (_reactiveSrcTreeEpoch.Length < _reactiveTriggers.Length) { _reactiveSrcTreeEpoch.Push(0); }
         while (_reactiveSrcChainEpoch.Length < _reactiveTriggers.Length) { _reactiveSrcChainEpoch.Push(0); }
-        int write = 0;
-        for (int i = 0; i < _reactiveTriggers.Length; i += 1) {
-            UIElement t = _reactiveTargets[i];
-            if (t == null || t._isDisposedTree) { continue; }
-            if (write != i) {
-                _reactiveTriggers[write] = _reactiveTriggers[i];
-                _reactiveTargets[write] = t;
-                _reactiveLastDc[write] = _reactiveLastDc[i];
-                _reactiveLastVer[write] = _reactiveLastVer[i];
-                _reactiveLastMatch[write] = _reactiveLastMatch[i];
-                _reactiveSrcEl[write] = _reactiveSrcEl[i];
-                _reactiveSrcTreeEpoch[write] = _reactiveSrcTreeEpoch[i];
-                _reactiveSrcChainEpoch[write] = _reactiveSrcChainEpoch[i];
+        if (_reactiveCompactDisposeEpoch != UIElement._disposeEpoch) {
+            _reactiveCompactDisposeEpoch = UIElement._disposeEpoch;
+            int write = 0;
+            for (int i = 0; i < _reactiveTriggers.Length; i += 1) {
+                UIElement t = _reactiveTargets[i];
+                if (t == null || t._isDisposedTree) { continue; }
+                if (write != i) {
+                    _reactiveTriggers[write] = _reactiveTriggers[i];
+                    _reactiveTargets[write] = t;
+                    _reactiveLastDc[write] = _reactiveLastDc[i];
+                    _reactiveLastVer[write] = _reactiveLastVer[i];
+                    _reactiveLastMatch[write] = _reactiveLastMatch[i];
+                    _reactiveSrcEl[write] = _reactiveSrcEl[i];
+                    _reactiveSrcTreeEpoch[write] = _reactiveSrcTreeEpoch[i];
+                    _reactiveSrcChainEpoch[write] = _reactiveSrcChainEpoch[i];
+                }
+                write += 1;
             }
-            write += 1;
+            while (_reactiveTriggers.Length > write) {
+                _reactiveTriggers.RemoveAt(_reactiveTriggers.Length - 1);
+                _reactiveTargets.RemoveAt(_reactiveTargets.Length - 1);
+                _reactiveLastDc.RemoveAt(_reactiveLastDc.Length - 1);
+                _reactiveLastVer.RemoveAt(_reactiveLastVer.Length - 1);
+                _reactiveLastMatch.RemoveAt(_reactiveLastMatch.Length - 1);
+            }
+            while (_reactiveSrcEl.Length > write) { _reactiveSrcEl.RemoveAt(_reactiveSrcEl.Length - 1); }
+            while (_reactiveSrcTreeEpoch.Length > write) { _reactiveSrcTreeEpoch.RemoveAt(_reactiveSrcTreeEpoch.Length - 1); }
+            while (_reactiveSrcChainEpoch.Length > write) { _reactiveSrcChainEpoch.RemoveAt(_reactiveSrcChainEpoch.Length - 1); }
         }
-        while (_reactiveTriggers.Length > write) {
-            _reactiveTriggers.RemoveAt(_reactiveTriggers.Length - 1);
-            _reactiveTargets.RemoveAt(_reactiveTargets.Length - 1);
-            _reactiveLastDc.RemoveAt(_reactiveLastDc.Length - 1);
-            _reactiveLastVer.RemoveAt(_reactiveLastVer.Length - 1);
-            _reactiveLastMatch.RemoveAt(_reactiveLastMatch.Length - 1);
-        }
-        while (_reactiveSrcEl.Length > write) { _reactiveSrcEl.RemoveAt(_reactiveSrcEl.Length - 1); }
-        while (_reactiveSrcTreeEpoch.Length > write) { _reactiveSrcTreeEpoch.RemoveAt(_reactiveSrcTreeEpoch.Length - 1); }
-        while (_reactiveSrcChainEpoch.Length > write) { _reactiveSrcChainEpoch.RemoveAt(_reactiveSrcChainEpoch.Length - 1); }
         int n = _reactiveTriggers.Length;
+        if (n == 0) { return; }
         int prevClobber = _lastSeenClobberEpoch;
         bool anyTransition = false;
         for (int i = 0; i < n; i += 1) {
@@ -1468,7 +1515,7 @@ public class DataTrigger : TriggerBase {
             DataTrigger dt = _reactiveTriggers[i];
             UIElement t = _reactiveTargets[i];
             if (t.IsInsideClosedPopup()) { continue; }
-            if ((dt.CanUseFastDcCache() || dt.CanUseFastElemCache()) && _reactiveLastVer[i] >= 0) {
+            if (_reactiveLastVer[i] >= 0) {
                 if (_reactiveLastMatch[i]) {
                     if (!dt.WasActiveFor(t)) {
                         anyTransition = true;
@@ -1782,13 +1829,10 @@ public class Style : DependencyObject {
     private TriggerBase[] _triggers;
     private BehaviorTriggerBase[] _behaviorTriggers;
     private UIElement[] _evaluatingTargets;
+    private static Setter[] _emptySetters;
+    private static TriggerBase[] _emptyTriggers;
 
-    public Style() {
-        _setters = new Setter[0];
-        _triggers = new TriggerBase[0];
-        _behaviorTriggers = new BehaviorTriggerBase[0];
-        _evaluatingTargets = new UIElement[0];
-    }
+    public Style() {}
     public Style(string targetType) : this() {
         TargetType = targetType == null ? "" : targetType;
     }
@@ -1796,24 +1840,36 @@ public class Style : DependencyObject {
         BasedOn = basedOn;
     }
 
-    public Setter[] Setters() { return _setters; }
-    public TriggerBase[] Triggers() { return _triggers; }
+    public Setter[] Setters() {
+        if (_setters != null) { return _setters; }
+        if (_emptySetters == null) { _emptySetters = new Setter[0]; }
+        return _emptySetters;
+    }
+    public TriggerBase[] Triggers() {
+        if (_triggers != null) { return _triggers; }
+        if (_emptyTriggers == null) { _emptyTriggers = new TriggerBase[0]; }
+        return _emptyTriggers;
+    }
 
-    public void AddSetter(Setter setter) { if (setter != null) { _setters.Push(setter); } }
-    public void AddSetter(string propName, object value) { _setters.Push(new Setter(propName, value)); }
-    public void AddSetter(string propName, string value) { _setters.Push(new Setter(propName, value)); }
-    public void AddSetter(string propName, float value) { _setters.Push(new Setter(propName, value)); }
-    public void AddSetter(string propName, int value) { _setters.Push(new Setter(propName, value)); }
-    public void AddSetter(string propName, bool value) { _setters.Push(new Setter(propName, value)); }
+    public void AddSetter(Setter setter) { if (setter != null) { if (_setters == null) { _setters = new Setter[0]; } _setters.Push(setter); } }
+    public void AddSetter(string propName, object value) { if (_setters == null) { _setters = new Setter[0]; } _setters.Push(new Setter(propName, value)); }
+    public void AddSetter(string propName, string value) { if (_setters == null) { _setters = new Setter[0]; } _setters.Push(new Setter(propName, value)); }
+    public void AddSetter(string propName, float value) { if (_setters == null) { _setters = new Setter[0]; } _setters.Push(new Setter(propName, value)); }
+    public void AddSetter(string propName, int value) { if (_setters == null) { _setters = new Setter[0]; } _setters.Push(new Setter(propName, value)); }
+    public void AddSetter(string propName, bool value) { if (_setters == null) { _setters = new Setter[0]; } _setters.Push(new Setter(propName, value)); }
     public void AddSetterBox(string propName, DependencyObject valueBox, string targetName = "") {
+        if (_setters == null) { _setters = new Setter[0]; }
         _setters.Push(Setter.FromBox(propName, valueBox, targetName));
     }
 
-    public void AddTrigger(TriggerBase trigger) { if (trigger != null) { _triggers.Push(trigger); } }
+    public void AddTrigger(TriggerBase trigger) { if (trigger != null) { if (_triggers == null) { _triggers = new TriggerBase[0]; } _triggers.Push(trigger); } }
     public void AddDataTrigger(DataTrigger trigger) { AddTrigger(trigger); }
     public void AddEventTrigger(EventTrigger trigger) { AddTrigger(trigger); }
     public void AddBehaviorTrigger(BehaviorTriggerBase trigger) {
-        if (trigger != null) { _behaviorTriggers.Push(trigger); }
+        if (trigger != null) {
+            if (_behaviorTriggers == null) { _behaviorTriggers = new BehaviorTriggerBase[0]; }
+            _behaviorTriggers.Push(trigger);
+        }
     }
 
     private static Style[] CollectChain(Style leaf) {
@@ -1857,8 +1913,10 @@ public class Style : DependencyObject {
         Style[] chain = Style.CollectChain(this);
         for (int c = chain.Length - 1; c >= 0; c -= 1) {
             Setter[] ss = chain[c]._setters;
-            for (int i = 0; i < ss.Length; i += 1) {
-                ss[i].ApplyTo(target);
+            if (ss != null) {
+                for (int i = 0; i < ss.Length; i += 1) {
+                    ss[i].ApplyTo(target);
+                }
             }
         }
     }
@@ -1869,12 +1927,14 @@ public class Style : DependencyObject {
         Setter templateSetter = null;
         for (int c = chain.Length - 1; c >= 0; c -= 1) {
             Style st = chain[c];
-            for (int i = 0; i < st._setters.Length; i += 1) {
-                Setter stItem = st._setters[i];
-                if (stItem.Property == "Template" && stItem.TargetName.Length == 0) {
-                    templateSetter = stItem;
-                } else {
-                    stItem.ApplyTo(target);
+            if (st._setters != null) {
+                for (int i = 0; i < st._setters.Length; i += 1) {
+                    Setter stItem = st._setters[i];
+                    if (stItem.Property == "Template" && stItem.TargetName.Length == 0) {
+                        templateSetter = stItem;
+                    } else {
+                        stItem.ApplyTo(target);
+                    }
                 }
             }
         }
@@ -1883,11 +1943,15 @@ public class Style : DependencyObject {
         }
         for (int c = chain.Length - 1; c >= 0; c -= 1) {
             Style st = chain[c];
-            for (int i = 0; i < st._triggers.Length; i += 1) {
-                st._triggers[i].Attach(target);
+            if (st._triggers != null) {
+                for (int i = 0; i < st._triggers.Length; i += 1) {
+                    st._triggers[i].Attach(target);
+                }
             }
-            for (int i = 0; i < st._behaviorTriggers.Length; i += 1) {
-                st._behaviorTriggers[i].Attach(target);
+            if (st._behaviorTriggers != null) {
+                for (int i = 0; i < st._behaviorTriggers.Length; i += 1) {
+                    st._behaviorTriggers[i].Attach(target);
+                }
             }
         }
         EvaluateTriggers(target);
@@ -1914,11 +1978,12 @@ public class Style : DependencyObject {
         Style[] chain = Style.CollectChain(this);
         for (int c = chain.Length - 1; c >= 0; c -= 1) {
             Style st = chain[c];
+            if (st._triggers == null || st._triggers.Length == 0) { continue; }
             bool anyReverted = false;
             for (int i = 0; i < st._triggers.Length; i += 1) {
                 if (st._triggers[i].WasActiveFor(target) && !st._triggers[i].IsMatched(target)) { anyReverted = true; break; }
             }
-            if (anyReverted) {
+            if (anyReverted && st._setters != null) {
                 for (int i = 0; i < st._setters.Length; i += 1) {
                     st._setters[i].ApplyTo(target);
                 }
@@ -1951,10 +2016,9 @@ public class ControlTemplate : DependencyObject {
     public ResourceDictionary RawResourcesOrNull() { return _resources; }
     public ResourceDictionary AmbientResources { get; set; }
 
-    public ControlTemplate() {
-        _triggers = new TriggerBase[0];
-        _evaluatingOwners = new UIElement[0];
-    }
+    private static TriggerBase[] _emptyTplTriggers;
+
+    public ControlTemplate() {}
     public ControlTemplate(Func<Control, UIElement> factory) : this() {
         _factory = factory;
     }
@@ -1967,8 +2031,12 @@ public class ControlTemplate : DependencyObject {
         get { return _factory; }
         set { _factory = value; }
     }
-    public void AddTrigger(TriggerBase trigger) { if (trigger != null) { _triggers.Push(trigger); } }
-    public TriggerBase[] Triggers() { return _triggers; }
+    public void AddTrigger(TriggerBase trigger) { if (trigger != null) { if (_triggers == null) { _triggers = new TriggerBase[0]; } _triggers.Push(trigger); } }
+    public TriggerBase[] Triggers() {
+        if (_triggers != null) { return _triggers; }
+        if (_emptyTplTriggers == null) { _emptyTplTriggers = new TriggerBase[0]; }
+        return _emptyTplTriggers;
+    }
 
     public UIElement Instantiate(Control owner) {
         if (_factory == null) { return null; }
@@ -2053,7 +2121,7 @@ public class ControlTemplate : DependencyObject {
             UIElement node = q[idx];
             idx += 1;
             if (node == null) { continue; }
-            if (node.TemplatedParent == null) { node.TemplatedParent = owner; }
+            if (node.TemplatedParent == null) { node.SetTemplatedParentDirect(owner); }
             if (node is ContentPresenter || node.TemplatedParent != owner) { continue; }
             for (int i = 0; i < node.ChildCount(); i += 1) {
                 q.Push(node.ChildAt(i));
@@ -2249,12 +2317,9 @@ public class VisualState : DependencyObject {
     private string[] _savedProps;
     private DependencyObject[] _savedBoxes;
 
-    public VisualState() {
-        _setters = new Setter[0];
-        _savedTargets = new UIElement[0];
-        _savedProps = new string[0];
-        _savedBoxes = new DependencyObject[0];
-    }
+    private static Setter[] _emptySetters;
+
+    public VisualState() {}
     public VisualState(string name) : this() { Name = name == null ? "" : name; }
 
     public Storyboard Storyboard {
@@ -2262,16 +2327,21 @@ public class VisualState : DependencyObject {
         set { _storyboard = value; }
     }
 
-    public void AddSetter(Setter s) { if (s != null) { _setters.Push(s); } }
-    public void AddSetter(string prop, object val) { _setters.Push(new Setter(prop, val)); }
-    public void AddSetter(string prop, string val) { _setters.Push(new Setter(prop, val)); }
-    public void AddSetter(string prop, float val) { _setters.Push(new Setter(prop, val)); }
-    public void AddSetter(string prop, bool val) { _setters.Push(new Setter(prop, val)); }
+    public void AddSetter(Setter s) { if (s != null) { if (_setters == null) { _setters = new Setter[0]; } _setters.Push(s); } }
+    public void AddSetter(string prop, object val) { if (_setters == null) { _setters = new Setter[0]; } _setters.Push(new Setter(prop, val)); }
+    public void AddSetter(string prop, string val) { if (_setters == null) { _setters = new Setter[0]; } _setters.Push(new Setter(prop, val)); }
+    public void AddSetter(string prop, float val) { if (_setters == null) { _setters = new Setter[0]; } _setters.Push(new Setter(prop, val)); }
+    public void AddSetter(string prop, bool val) { if (_setters == null) { _setters = new Setter[0]; } _setters.Push(new Setter(prop, val)); }
     public void AddSetterBox(string propName, DependencyObject valueBox, string targetName = "") {
+        if (_setters == null) { _setters = new Setter[0]; }
         _setters.Push(Setter.FromBox(propName, valueBox, targetName));
     }
 
-    public Setter[] Setters() { return _setters; }
+    public Setter[] Setters() {
+        if (_setters != null) { return _setters; }
+        if (_emptySetters == null) { _emptySetters = new Setter[0]; }
+        return _emptySetters;
+    }
 
     internal void EnsureResolvedStoryboard(UIElement target) {
         if (_storyboard == null && StoryboardKey.Length > 0 && target != null) {
@@ -2322,31 +2392,40 @@ public class VisualState : DependencyObject {
     public void Enter(UIElement target) {
         if (target == null) { return; }
         Exit(target);
-        for (int i = 0; i < _setters.Length; i += 1) {
-            Setter s = _setters[i];
-            if (s.BindingPath.Length == 0) {
-                UIElement dest = s.ResolveTarget(target);
-                string prop = s.PropertyName();
-                if (dest != null && prop.Length > 0) {
-                    _savedTargets.Push(dest);
-                    _savedProps.Push(prop);
-                    _savedBoxes.Push(dest.GetPropertyValue(prop));
+        if (_setters != null) {
+            for (int i = 0; i < _setters.Length; i += 1) {
+                Setter s = _setters[i];
+                if (s.BindingPath.Length == 0) {
+                    UIElement dest = s.ResolveTarget(target);
+                    string prop = s.PropertyName();
+                    if (dest != null && prop.Length > 0) {
+                        if (_savedTargets == null) {
+                            _savedTargets = new UIElement[0];
+                            _savedProps = new string[0];
+                            _savedBoxes = new DependencyObject[0];
+                        }
+                        _savedTargets.Push(dest);
+                        _savedProps.Push(prop);
+                        _savedBoxes.Push(dest.GetPropertyValue(prop));
+                    }
                 }
+                s.ApplyTo(target);
             }
-            s.ApplyTo(target);
         }
         StartStoryboardOnly(target);
     }
 
     public void Exit(UIElement target) {
-        for (int i = _savedTargets.Length - 1; i >= 0; i -= 1) {
-            if (_savedTargets[i] != null) {
-                _savedTargets[i].SetPropertyValue(_savedProps[i], _savedBoxes[i]);
+        if (_savedTargets != null && _savedTargets.Length > 0) {
+            for (int i = _savedTargets.Length - 1; i >= 0; i -= 1) {
+                if (_savedTargets[i] != null) {
+                    _savedTargets[i].SetPropertyValue(_savedProps[i], _savedBoxes[i]);
+                }
             }
+            _savedTargets.Clear();
+            _savedProps.Clear();
+            _savedBoxes.Clear();
         }
-        _savedTargets.Clear();
-        _savedProps.Clear();
-        _savedBoxes.Clear();
         StopStoryboardOnly(target);
     }
 }
@@ -2390,25 +2469,14 @@ public class VisualStateGroup : DependencyObject {
     private uint[] _baseAnimColors;
     private int[] _transitionTrackIds;
 
-    public VisualStateGroup() {
-        _states = new VisualState[0];
-        _transitions = new VisualTransition[0];
-        _baseTargets = new UIElement[0];
-        _baseProps = new string[0];
-        _baseBoxes = new DependencyObject[0];
-        _baseAnimTargets = new UIElement[0];
-        _baseAnimPropIds = new int[0];
-        _baseAnimIsColor = new bool[0];
-        _baseAnimFloats = new float[0];
-        _baseAnimColors = new uint[0];
-        _transitionTrackIds = new int[0];
-    }
+    public VisualStateGroup() {}
     public VisualStateGroup(string name) : this() { Name = name == null ? "" : name; }
 
-    public void AddState(VisualState st) { if (st != null) { _states.Push(st); } }
-    public void AddTransition(VisualTransition tr) { if (tr != null) { _transitions.Push(tr); } }
+    public void AddState(VisualState st) { if (st != null) { if (_states == null) { _states = new VisualState[0]; } _states.Push(st); } }
+    public void AddTransition(VisualTransition tr) { if (tr != null) { if (_transitions == null) { _transitions = new VisualTransition[0]; } _transitions.Push(tr); } }
 
     public VisualState FindState(string name) {
+        if (_states == null) { return null; }
         for (int i = 0; i < _states.Length; i += 1) {
             if (_states[i].Name == name) { return _states[i]; }
         }
@@ -2416,6 +2484,7 @@ public class VisualStateGroup : DependencyObject {
     }
 
     private VisualTransition FindBestTransition(string fromName, string toName) {
+        if (_transitions == null) { return null; }
         VisualTransition best = null;
         int bestScore = -1;
         for (int i = 0; i < _transitions.Length; i += 1) {
@@ -2435,6 +2504,11 @@ public class VisualStateGroup : DependencyObject {
 
     private void RecordBaseSnapshot(UIElement dest, string prop) {
         if (dest == null || prop == null || prop.Length == 0) { return; }
+        if (_baseTargets == null) {
+            _baseTargets = new UIElement[0];
+            _baseProps = new string[0];
+            _baseBoxes = new DependencyObject[0];
+        }
         for (int i = 0; i < _baseTargets.Length; i += 1) {
             if (_baseTargets[i] == dest && _baseProps[i] == prop) {
                 return;
@@ -2447,6 +2521,13 @@ public class VisualStateGroup : DependencyObject {
 
     private void RecordBaseAnimSnapshot(UIElement dest, int propId, bool isColor) {
         if (dest == null || propId < 0 || !ParseUtil.IsValidHandle(dest.__nativeHandle)) { return; }
+        if (_baseAnimTargets == null) {
+            _baseAnimTargets = new UIElement[0];
+            _baseAnimPropIds = new int[0];
+            _baseAnimIsColor = new bool[0];
+            _baseAnimFloats = new float[0];
+            _baseAnimColors = new uint[0];
+        }
         for (int i = 0; i < _baseAnimTargets.Length; i += 1) {
             if (_baseAnimTargets[i] == dest && _baseAnimPropIds[i] == propId) {
                 return;
@@ -2557,14 +2638,18 @@ public class VisualStateGroup : DependencyObject {
         var startColors = new uint[0];
 
         if (scope != null && dur > 0.001f) {
-            for (int i = 0; i < _baseTargets.Length; i += 1) {
-                int pid = EnumConvert.ParseAnimPropOrInvalid(_baseProps[i]);
-                TryCaptureAnimStart(_baseTargets[i], pid, IsColorAnimPropId(pid), next.Storyboard, scope,
-                    animTargets, animPropIds, animIsColor, startFloats, startColors);
+            if (_baseTargets != null) {
+                for (int i = 0; i < _baseTargets.Length; i += 1) {
+                    int pid = EnumConvert.ParseAnimPropOrInvalid(_baseProps[i]);
+                    TryCaptureAnimStart(_baseTargets[i], pid, IsColorAnimPropId(pid), next.Storyboard, scope,
+                        animTargets, animPropIds, animIsColor, startFloats, startColors);
+                }
             }
-            for (int i = 0; i < _baseAnimTargets.Length; i += 1) {
-                TryCaptureAnimStart(_baseAnimTargets[i], _baseAnimPropIds[i], _baseAnimIsColor[i], next.Storyboard, scope,
-                    animTargets, animPropIds, animIsColor, startFloats, startColors);
+            if (_baseAnimTargets != null) {
+                for (int i = 0; i < _baseAnimTargets.Length; i += 1) {
+                    TryCaptureAnimStart(_baseAnimTargets[i], _baseAnimPropIds[i], _baseAnimIsColor[i], next.Storyboard, scope,
+                        animTargets, animPropIds, animIsColor, startFloats, startColors);
+                }
             }
         }
 
@@ -2579,24 +2664,28 @@ public class VisualStateGroup : DependencyObject {
             _transitionTrackIds.Clear();
         }
 
-        for (int i = _baseTargets.Length - 1; i >= 0; i -= 1) {
-            if (_baseTargets[i] != null && !_baseTargets[i]._isDisposedTree) {
-                _baseTargets[i].SetPropertyValue(_baseProps[i], _baseBoxes[i]);
+        if (_baseTargets != null) {
+            for (int i = _baseTargets.Length - 1; i >= 0; i -= 1) {
+                if (_baseTargets[i] != null && !_baseTargets[i]._isDisposedTree) {
+                    _baseTargets[i].SetPropertyValue(_baseProps[i], _baseBoxes[i]);
+                }
             }
         }
 
-        for (int i = _baseAnimTargets.Length - 1; i >= 0; i -= 1) {
-            UIElement dest = _baseAnimTargets[i];
-            if (dest != null && !dest._isDisposedTree && ParseUtil.IsValidHandle(dest.__nativeHandle)) {
-                if (_baseAnimIsColor[i]) {
-                    Anim_ApplyColor(dest.__nativeHandle, _baseAnimPropIds[i], _baseAnimColors[i]);
-                } else {
-                    int bpid = _baseAnimPropIds[i];
-                    float bfval = _baseAnimFloats[i];
-                    Anim_ApplyFloat(dest.__nativeHandle, bpid, bfval);
-                    if (bpid == 24) { dest.SetPropertyValue("LayoutTransform.ScaleX", DependencyObject.BoxFloat(bfval)); }
-                    else if (bpid == 25) { dest.SetPropertyValue("LayoutTransform.ScaleY", DependencyObject.BoxFloat(bfval)); }
-                    else if (bpid == 26) { dest.SetPropertyValue("LayoutTransform.Angle", DependencyObject.BoxFloat(bfval)); }
+        if (_baseAnimTargets != null) {
+            for (int i = _baseAnimTargets.Length - 1; i >= 0; i -= 1) {
+                UIElement dest = _baseAnimTargets[i];
+                if (dest != null && !dest._isDisposedTree && ParseUtil.IsValidHandle(dest.__nativeHandle)) {
+                    if (_baseAnimIsColor[i]) {
+                        Anim_ApplyColor(dest.__nativeHandle, _baseAnimPropIds[i], _baseAnimColors[i]);
+                    } else {
+                        int bpid = _baseAnimPropIds[i];
+                        float bfval = _baseAnimFloats[i];
+                        Anim_ApplyFloat(dest.__nativeHandle, bpid, bfval);
+                        if (bpid == 24) { dest.SetPropertyValue("LayoutTransform.ScaleX", DependencyObject.BoxFloat(bfval)); }
+                        else if (bpid == 25) { dest.SetPropertyValue("LayoutTransform.ScaleY", DependencyObject.BoxFloat(bfval)); }
+                        else if (bpid == 26) { dest.SetPropertyValue("LayoutTransform.Angle", DependencyObject.BoxFloat(bfval)); }
+                    }
                 }
             }
         }
@@ -2625,6 +2714,7 @@ public class VisualStateGroup : DependencyObject {
                         int ctid = Anim_StartColorDelayed(dest.__nativeHandle, propId, startCol, endCol, dur, ek, em, 0.0f);
                         if (ctid > 0) {
                             if (tr != null) { TimelineAnimation.ApplyTrackEasing(ctid, tr.EaseParam0, tr.EaseParam1, tr.EaseParamMask); }
+                            if (_transitionTrackIds == null) { _transitionTrackIds = new int[0]; }
                             _transitionTrackIds.Push(ctid);
                         }
                     }
@@ -2636,6 +2726,7 @@ public class VisualStateGroup : DependencyObject {
                         int ftid = Anim_StartFloat(dest.__nativeHandle, propId, startVal, endVal, dur, ek, em, 0.0f, false, 1);
                         if (ftid > 0) {
                             if (tr != null) { TimelineAnimation.ApplyTrackEasing(ftid, tr.EaseParam0, tr.EaseParam1, tr.EaseParamMask); }
+                            if (_transitionTrackIds == null) { _transitionTrackIds = new int[0]; }
                             _transitionTrackIds.Push(ftid);
                         }
                     }
@@ -2689,10 +2780,14 @@ public class VisualStateGroupList : DependencyObject {
 
 public static class VisualStateManager {
     private static VisualStateGroup[] _emptyGroups;
+    internal static bool _anyNonControlVsg = false;
 
     public static void SetVisualStateGroups(UIElement control, VisualStateGroup[] groups) {
         if (control == null || groups == null) { return; }
         control._vsgBox = new VisualStateGroupList(groups);
+        if (!(control is Control) && groups.Length > 0) {
+            _anyNonControlVsg = true;
+        }
     }
 
     public static VisualStateGroup[] GetVisualStateGroups(UIElement control) {
@@ -2863,6 +2958,8 @@ internal class ManagedAnimBinding {
     public bool SnapEndOnFinish = false;
     public bool HasLastFloat = false;
     public float LastFloat = 0.0f;
+    public bool HasLastColor = false;
+    public uint LastColor = 0u;
 }
 
 public class TimelineAnimation : DependencyObject {
@@ -3360,14 +3457,20 @@ public class Storyboard : DependencyObject {
     private static bool _completionHookInstalled = false;
     public event EventHandler Completed;
 
-    public Storyboard() {
-        _children = new TimelineAnimation[0];
-        _runningTrackIds = new int[0];
-        _runningTrackScopes = new UIElement[0];
+    private static TimelineAnimation[] _emptyChildren;
+
+    public Storyboard() {}
+
+    private void EnsureChildren() {
+        if (_children == null) { _children = new TimelineAnimation[0]; }
     }
 
-    public TimelineAnimation[] Children() { return _children; }
-    public void Add(TimelineAnimation anim) { if (anim != null) { _children.Push(anim); } }
+    public TimelineAnimation[] Children() {
+        if (_children != null) { return _children; }
+        if (_emptyChildren == null) { _emptyChildren = new TimelineAnimation[0]; }
+        return _emptyChildren;
+    }
+    public void Add(TimelineAnimation anim) { if (anim != null) { EnsureChildren(); _children.Push(anim); } }
     public void SetLastEasingParams(float p0, float p1, int mask = 3) {
         if (_children != null && _children.Length > 0) {
             TimelineAnimation last = _children[_children.Length - 1];
@@ -3388,7 +3491,8 @@ public class Storyboard : DependencyObject {
     public void MergeFrom(Storyboard other) {
         if (other == null || other == this) { return; }
         TimelineAnimation[] kids = other.Children();
-        if (kids != null) {
+        if (kids != null && kids.Length > 0) {
+            EnsureChildren();
             for (int i = 0; i < kids.Length; i += 1) {
                 if (kids[i] != null) { _children.Push(kids[i]); }
             }
@@ -3435,6 +3539,7 @@ public class Storyboard : DependencyObject {
         da.TargetProperty = targetProp == null ? "Opacity" : targetProp;
         da.EasingKind = ease;
         da.EasingMode = mode;
+        EnsureChildren();
         _children.Push(da);
     }
 
@@ -3447,6 +3552,7 @@ public class Storyboard : DependencyObject {
         da.EasingKind = IntToEasingKind(easeKind);
         da.EasingMode = IntToEasingMode(easeMode);
         da.DelaySec = delaySec;
+        EnsureChildren();
         _children.Push(da);
     }
 
@@ -3459,6 +3565,7 @@ public class Storyboard : DependencyObject {
         da.EasingKind = IntToEasingKind(easeKind);
         da.EasingMode = IntToEasingMode(easeMode);
         da.DelaySec = delaySec;
+        EnsureChildren();
         _children.Push(da);
     }
 
@@ -3473,6 +3580,7 @@ public class Storyboard : DependencyObject {
         da.DelaySec = delaySec;
         da.AutoReverse = autoReverse;
         da.RepeatCount = repeatCount;
+        EnsureChildren();
         _children.Push(da);
     }
 
@@ -3487,6 +3595,7 @@ public class Storyboard : DependencyObject {
         da.DelaySec = delaySec;
         da.AutoReverse = autoReverse;
         da.RepeatCount = repeatCount;
+        EnsureChildren();
         _children.Push(da);
     }
 
@@ -3504,6 +3613,7 @@ public class Storyboard : DependencyObject {
         ca.TargetProperty = targetProp == null ? "Background" : targetProp;
         ca.EasingKind = ease;
         ca.EasingMode = mode;
+        EnsureChildren();
         _children.Push(ca);
     }
 
@@ -3516,6 +3626,7 @@ public class Storyboard : DependencyObject {
         ca.EasingKind = IntToEasingKind(easeKind);
         ca.EasingMode = IntToEasingMode(easeMode);
         ca.DelaySec = delaySec;
+        EnsureChildren();
         _children.Push(ca);
     }
 
@@ -3535,6 +3646,7 @@ public class Storyboard : DependencyObject {
         ca.DelaySec = delaySec;
         ca.AutoReverse = autoReverse;
         ca.RepeatCount = repeatCount;
+        EnsureChildren();
         _children.Push(ca);
     }
 
@@ -3551,6 +3663,7 @@ public class Storyboard : DependencyObject {
         ca.EasingKind = IntToEasingKind(easeKind);
         ca.EasingMode = IntToEasingMode(easeMode);
         ca.DelaySec = delaySec;
+        EnsureChildren();
         _children.Push(ca);
     }
 
@@ -3562,6 +3675,7 @@ public class Storyboard : DependencyObject {
         sa.ToFloat = targetVal;
         sa.Stiffness = stiffness;
         sa.Damping = damping;
+        EnsureChildren();
         _children.Push(sa);
     }
 
@@ -3640,7 +3754,11 @@ public class Storyboard : DependencyObject {
             if (Anim_IsTrackStarted(mb.TrackId)) {
                 if (mb.IsColor) {
                     uint col = Anim_ReadTrackColor(mb.TrackId, mb.EndColor);
-                    TimelineAnimation.ApplyManagedColor(mb.Dest, mb.TargetProp, mb.BuiltinColorPropId, col);
+                    if (!mb.HasLastColor || col != mb.LastColor) {
+                        mb.HasLastColor = true;
+                        mb.LastColor = col;
+                        TimelineAnimation.ApplyManagedColor(mb.Dest, mb.TargetProp, mb.BuiltinColorPropId, col);
+                    }
                 } else {
                     float val = Anim_ReadTrackFloat(mb.TrackId, mb.EndFloat);
                     if (!mb.HasLastFloat || Math.Absf(val - mb.LastFloat) > 0.00001f) {
@@ -3894,30 +4012,32 @@ public class Storyboard : DependencyObject {
         if (_runningTrackScopes == null) { _runningTrackScopes = new UIElement[0]; }
         int startedThisCall = 0;
         bool hasInfinite = RepeatForever;
-        for (int i = 0; i < _children.Length; i += 1) {
-            TimelineAnimation anim = _children[i];
-            if (animatedOnly && !anim.HasAnimatedDuration()) { continue; }
-            string savedTName = anim.TargetName;
-            if (anim.TargetName.Length == 0 && TargetName.Length > 0) {
-                anim.TargetName = TargetName;
-            }
-            if (anim.RepeatCount < 0) { hasInfinite = true; }
-            int[] tids = anim.StartOnTracked(root, SpeedRatio, RepeatForever, BeginTimeSec, ExplicitDurationSec);
-            anim.TargetName = savedTName;
-            for (int j = 0; j < tids.Length; j += 1) {
-                _runningTrackIds.Push(tids[j]);
-                _runningTrackScopes.Push(root);
-                startedThisCall += 1;
-            }
-            if (anim._lastManagedBindings != null) {
-                if (_managedTracks == null) { _managedTracks = new ManagedAnimBinding[0]; }
-                for (int j = 0; j < anim._lastManagedBindings.Length; j += 1) {
-                    if (anim._lastManagedBindings[j] != null) {
-                        anim._lastManagedBindings[j].Scope = root;
-                        _managedTracks.Push(anim._lastManagedBindings[j]);
-                    }
+        if (_children != null) {
+            for (int i = 0; i < _children.Length; i += 1) {
+                TimelineAnimation anim = _children[i];
+                if (animatedOnly && !anim.HasAnimatedDuration()) { continue; }
+                string savedTName = anim.TargetName;
+                if (anim.TargetName.Length == 0 && TargetName.Length > 0) {
+                    anim.TargetName = TargetName;
                 }
-                anim._lastManagedBindings = null;
+                if (anim.RepeatCount < 0) { hasInfinite = true; }
+                int[] tids = anim.StartOnTracked(root, SpeedRatio, RepeatForever, BeginTimeSec, ExplicitDurationSec);
+                anim.TargetName = savedTName;
+                for (int j = 0; j < tids.Length; j += 1) {
+                    _runningTrackIds.Push(tids[j]);
+                    _runningTrackScopes.Push(root);
+                    startedThisCall += 1;
+                }
+                if (anim._lastManagedBindings != null) {
+                    if (_managedTracks == null) { _managedTracks = new ManagedAnimBinding[0]; }
+                    for (int j = 0; j < anim._lastManagedBindings.Length; j += 1) {
+                        if (anim._lastManagedBindings[j] != null) {
+                            anim._lastManagedBindings[j].Scope = root;
+                            _managedTracks.Push(anim._lastManagedBindings[j]);
+                        }
+                    }
+                    anim._lastManagedBindings = null;
+                }
             }
         }
         if (_discreteKeyFrames != null && _discreteKeyFrames.Length > 0) {
@@ -3994,8 +4114,10 @@ public class Storyboard : DependencyObject {
         if (_lastScope == root || (_lastScope != null && _lastScope._isDisposedTree)) {
             _lastScope = null;
         }
-        for (int i = 0; i < _children.Length; i += 1) {
-            _children[i].StopOn(root);
+        if (_children != null) {
+            for (int i = 0; i < _children.Length; i += 1) {
+                _children[i].StopOn(root);
+            }
         }
         if (_runningTrackIds == null || _runningTrackIds.Length == 0) {
             _awaitingCompletion = false;
@@ -4145,6 +4267,10 @@ internal class BindingEntry : DependencyObject {
     private DependencyObject _lastSrcBox;
     private UIElement[] _multiElementSources;
     private UIElement[] _multiFindRoots;
+    private int _fastPropCatCache = -1;
+    private int _fastPropKindCache = 0;
+    private DependencyObject _lastMidBox;
+    private int _lastMidDirtyMask = -1;
 
     internal static bool CanUseFastElementPropEpoch(UIElement el, string prop) {
         if (el == null || prop == null || prop.Length == 0) {
@@ -4213,8 +4339,33 @@ internal class BindingEntry : DependencyObject {
         return el._propEpoch;
     }
 
+    private int TryGetCachedFastElementEpoch(UIElement el) {
+        if (el == null) { return -1; }
+        int cat = el.FastPropEpochCategory();
+        if (cat == 0) { return -1; }
+        if (_fastPropCatCache != cat) {
+            _fastPropCatCache = cat;
+            if (CanUseFastElementPropEpoch(el, SourcePath)) {
+                _fastPropKindCache = (SourcePath == "ActualWidth" || SourcePath == "ActualHeight") ? 2 : 1;
+            } else {
+                _fastPropKindCache = -1;
+            }
+        }
+        if (_fastPropKindCache <= 0) { return -1; }
+        if (_fastPropKindCache == 2) {
+            int ep = (el._propEpoch % 100000) * 4099 + (BindingEngine._curLayoutSizeEpoch % 4099) + 1;
+            return ep <= 0 ? 1 : ep;
+        }
+        return el._propEpoch;
+    }
+
     internal void InitPathSegments() {
         if (SourcePath != null && SourcePath.Length > 0 && SourcePath != ".") {
+            if (!SourcePath.Contains(".")) {
+                PathSegments = null;
+                IsSingleHopPath = true;
+                return;
+            }
             if (UIElement.IsAttachedElementPropPath(SourcePath)) {
                 PathSegments = new string[1];
                 PathSegments[0] = SourcePath;
@@ -4416,7 +4567,10 @@ internal class BindingEntry : DependencyObject {
         UIElement host = Target != null ? Target : (ContextHost != null ? ContextHost : (TargetInline != null ? TargetInline.OwnerTextBlock : null));
         if (ConverterKey.Length > 0 && host != null) {
             DependencyObject box = host.FindResourceBox(ConverterKey);
-            if (box is IValueConverter) { return box as IValueConverter; }
+            if (box is IValueConverter) {
+                Converter = box as IValueConverter;
+                return Converter;
+            }
         }
         return null;
     }
@@ -4797,8 +4951,8 @@ internal class BindingEntry : DependencyObject {
                 }
             }
             if (SourceElement != null) {
-                bool canFastElem = IsSingleHopPath && CanUseFastElementPropEpoch(SourceElement, SourcePath);
-                int elemDm = canFastElem ? GetFastElementEpoch(SourceElement, SourcePath) : -1;
+                int elemDm = IsSingleHopPath ? TryGetCachedFastElementEpoch(SourceElement) : -1;
+                bool canFastElem = elemDm >= 0;
                 if (OneTimeDone && _elemPropResolvedOnSelf && elemDm >= 0 && elemDm == LastDirtyMask) {
                     return;
                 }
@@ -4828,8 +4982,8 @@ internal class BindingEntry : DependencyObject {
         }
 
         if (Kind == 3 && SourceElement != null) {
-            bool canFastTp = CanUseFastElementPropEpoch(SourceElement, SourcePath);
-            int tpEpoch = GetFastElementEpoch(SourceElement, SourcePath);
+            int tpEpoch = TryGetCachedFastElementEpoch(SourceElement);
+            bool canFastTp = tpEpoch >= 0;
             if (OneTimeDone && canFastTp && tpEpoch == LastDirtyMask) {
                 return;
             }
@@ -4964,21 +5118,35 @@ internal class BindingEntry : DependencyObject {
             DependencyObject srcBox = ResolveSourceBox();
             object srcObj = DependencyObject.Unbox(srcBox);
             if (srcObj == null) {
+                _lastMidBox = null;
+                _lastMidDirtyMask = -1;
                 if (HasFallback) { ApplyRawBox(FallbackBox); }
                 return;
             }
             int dm = -1;
             if (srcObj is UIElement) {
-                UIElement srcElFast = srcObj as UIElement;
-                if (CanUseFastElementPropEpoch(srcElFast, SourcePath)) {
-                    dm = GetFastElementEpoch(srcElFast, SourcePath);
-                }
+                dm = TryGetCachedFastElementEpoch(srcObj as UIElement);
             } else if (ParseUtil.IsNativeReady()) {
                 dm = Reflect_GetDirtyMask(srcObj);
             }
             bool sameSrc = DependencyObject.SameValueBox(srcBox, _lastSrcBox);
-            if (OneTimeDone && sameSrc && IsSingleHopPath && dm >= 0 && dm == LastDirtyMask) {
-                return;
+            if (OneTimeDone && sameSrc && dm >= 0 && dm == LastDirtyMask) {
+                if (IsSingleHopPath) { return; }
+                if (_lastMidDirtyMask >= 0 && _lastMidBox != null && PathSegments != null && PathSegments.Length == 2) {
+                    object cachedMid = DependencyObject.Unbox(_lastMidBox);
+                    int midDm = -1;
+                    if (cachedMid is UIElement) {
+                        UIElement midEl = cachedMid as UIElement;
+                        if (CanUseFastElementPropEpoch(midEl, PathSegments[1])) {
+                            midDm = GetFastElementEpoch(midEl, PathSegments[1]);
+                        }
+                    } else if (cachedMid != null && !(cachedMid is DependencyObject) && ParseUtil.IsNativeReady()) {
+                        midDm = Reflect_GetDirtyMask(cachedMid);
+                    }
+                    if (midDm >= 0 && midDm == _lastMidDirtyMask) {
+                        return;
+                    }
+                }
             }
             DependencyObject valBox = null;
             bool explicitNull = false;
@@ -4992,13 +5160,46 @@ internal class BindingEntry : DependencyObject {
             }
             if (valBox == null && !explicitNull && HasFallback) { valBox = FallbackBox; }
             bool boxDiff = (valBox != _lastPathValBox) && !DependencyObject.SameValueBox(valBox, _lastPathValBox);
+            _lastMidBox = null;
+            _lastMidDirtyMask = -1;
+            if (!IsSingleHopPath && PathSegments != null && PathSegments.Length == 2 && dm >= 0 &&
+                !(srcObj is Transform) && !PathSegments[0].Contains("[") && !PathSegments[1].Contains("[")) {
+                DependencyObject midBox = null;
+                object midObj = null;
+                if (srcObj is UIElement) {
+                    UIElement srcEl0 = srcObj as UIElement;
+                    midBox = srcEl0.GetPropertyValue(PathSegments[0]);
+                    if (midBox != null) {
+                        midObj = DependencyObject.Unbox(midBox);
+                    } else if (!srcEl0.IsExplicitNullProperty(PathSegments[0])) {
+                        midObj = Reflect_GetPropObject(srcObj, PathSegments[0]);
+                        if (midObj != null) { midBox = DependencyObject.BoxObject(midObj); }
+                    }
+                } else {
+                    midObj = Reflect_GetPropObject(srcObj, PathSegments[0]);
+                    if (midObj != null) { midBox = DependencyObject.BoxObject(midObj); }
+                }
+                if (midObj is UIElement) {
+                    UIElement midEl = midObj as UIElement;
+                    if (CanUseFastElementPropEpoch(midEl, PathSegments[1])) {
+                        _lastMidBox = midBox;
+                        _lastMidDirtyMask = GetFastElementEpoch(midEl, PathSegments[1]);
+                    }
+                } else if (midObj != null && !(midObj is DependencyObject) && ParseUtil.IsNativeReady()) {
+                    _lastMidBox = midBox;
+                    _lastMidDirtyMask = Reflect_GetDirtyMask(midObj);
+                }
+            }
             if (!boxDiff && OneTimeDone && sameSrc &&
                 (valBox == _lastPathValBox || valBox is BoxedInt || valBox is BoxedFloat || valBox is BoxedBool || valBox is BoxedString)) {
+                _lastSrcBox = srcBox;
                 LastDirtyMask = dm;
                 return;
             }
             string sig = valBox != null ? DependencyObject.UnboxString(valBox, "") : "<null>";
             if (!boxDiff && sig == LastHash && OneTimeDone && sameSrc) {
+                _lastSrcBox = srcBox;
+                LastDirtyMask = dm;
                 return;
             }
             _lastSrcBox = srcBox;
@@ -5123,6 +5324,7 @@ public static class BindingEngine {
     private static bool _inPostFlush = false;
     internal static int _curLayoutSizeEpoch = 1;
     internal static bool _inSubtreeFlush = false;
+    private static int _lastCompactDisposeEpoch = -1;
 
     private static void RefreshLayoutEpoch() {
         if (ParseUtil.IsNativeReady()) {
@@ -5686,20 +5888,23 @@ public static class BindingEngine {
 
     private static void FlushBodyAndPostHooks() {
         if (_entries != null) {
-            int write = 0;
-            for (int i = 0; i < _entries.Length; i += 1) {
-                BindingEntry e = _entries[i];
-                if (e.Target != null && e.Target._isDisposedTree) { continue; }
-                if (e.ContextHost != null && e.ContextHost._isDisposedTree) { continue; }
-                if (e.Target == null && e.TargetEffect == null && e.TargetInline != null &&
-                    (e.TargetInline.OwnerTextBlock == null || e.TargetInline.OwnerTextBlock._isDisposedTree)) {
-                    continue;
+            if (_lastCompactDisposeEpoch != UIElement._disposeEpoch) {
+                _lastCompactDisposeEpoch = UIElement._disposeEpoch;
+                int write = 0;
+                for (int i = 0; i < _entries.Length; i += 1) {
+                    BindingEntry e = _entries[i];
+                    if (e.Target != null && e.Target._isDisposedTree) { continue; }
+                    if (e.ContextHost != null && e.ContextHost._isDisposedTree) { continue; }
+                    if (e.Target == null && e.TargetEffect == null && e.TargetInline != null &&
+                        (e.TargetInline.OwnerTextBlock == null || e.TargetInline.OwnerTextBlock._isDisposedTree)) {
+                        continue;
+                    }
+                    if (write != i) { _entries[write] = e; }
+                    write += 1;
                 }
-                if (write != i) { _entries[write] = e; }
-                write += 1;
-            }
-            while (_entries.Length > write) {
-                _entries.RemoveAt(_entries.Length - 1);
+                while (_entries.Length > write) {
+                    _entries.RemoveAt(_entries.Length - 1);
+                }
             }
             for (int pass = 0; pass < 3; pass += 1) {
                 _flushPassDirty = false;

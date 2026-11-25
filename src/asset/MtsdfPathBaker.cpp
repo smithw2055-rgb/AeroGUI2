@@ -741,6 +741,7 @@ struct MtsdfProcessCache {
     std::unordered_map<std::uint64_t, std::shared_ptr<const CachedSvgSummary>> geomByHash;
     std::unordered_map<std::uint64_t, CachedFineSvgEntry> fineGeomByHash;
     std::unordered_map<std::uint64_t, CachedBakedMtsdfCell> bakedCells;
+    std::size_t bakedCellBytes = 0u;
 };
 
 MtsdfProcessCache& GetMtsdfProcessCache() {
@@ -1301,19 +1302,26 @@ AxbMtsdfPathEntry BakeSvgPathToMtsdfEntry(
     }
 
     if (pathHash != 0u) {
+        constexpr std::size_t kMaxBakedMtsdfBytes = 24u * 1024u * 1024u;
+        const std::size_t cellBytes = entry.mtsdfRgbaPixels.size();
         auto& cache = GetMtsdfProcessCache();
         std::lock_guard<std::mutex> lock(cache.mutex);
-        if (cache.bakedCells.size() > 4096u) {
+        if (cache.bakedCells.size() > 4096u ||
+            cache.bakedCellBytes + cellBytes > kMaxBakedMtsdfBytes) {
             cache.bakedCells.clear();
+            cache.bakedCellBytes = 0u;
         }
-        cache.bakedCells.emplace(
-            cacheKey,
-            CachedBakedMtsdfCell{
-                entry.boundsX,
-                entry.boundsY,
-                entry.boundsW,
-                entry.boundsH,
-                entry.mtsdfRgbaPixels});
+        if (cellBytes <= kMaxBakedMtsdfBytes) {
+            cache.bakedCellBytes += cellBytes;
+            cache.bakedCells.emplace(
+                cacheKey,
+                CachedBakedMtsdfCell{
+                    entry.boundsX,
+                    entry.boundsY,
+                    entry.boundsW,
+                    entry.boundsH,
+                    entry.mtsdfRgbaPixels});
+        }
     }
 
     entry.ComputeRowBounds();
@@ -1544,10 +1552,10 @@ bool RasterizeSvgPathStrokeAlphaMask(
     if (strokeWidthPx <= 0.0f) {
         return false;
     }
-    constexpr float kPi = 3.14159265358979323846f;
-    const ParsedSvgGeometry geom = ParseSvgPathGeometry(
-        pathData,
-        SvgPathTessellationOptions{24, 16, kPi / 24.0f, 6, 64});
+    const std::uint64_t pathHash = ComputeSvgPathHash(pathData);
+    const std::shared_ptr<const ParsedSvgGeometry> fineGeom =
+        GetOrParseFineSvgGeometryCached(pathData, pathHash);
+    const ParsedSvgGeometry& geom = *fineGeom;
     if (geom.contours.empty()) {
         return false;
     }

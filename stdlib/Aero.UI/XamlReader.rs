@@ -3271,7 +3271,7 @@ public static class XamlReader {
             UIElement cur = q[idx];
             idx += 1;
             if (cur == null) { continue; }
-            if (cur.TemplatedParent == null) { cur.TemplatedParent = tp; }
+            if (cur.TemplatedParent == null) { cur.SetTemplatedParentDirect(tp); }
             for (int i = 0; i < cur.ChildCount(); i += 1) {
                 q.Push(cur.ChildAt(i));
             }

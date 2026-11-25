@@ -937,8 +937,10 @@ ZeroCopySubmissionStats ZeroCopyGpuStream::SubmitDirtyPages(PagedRenderTree& tre
         const bool usingOwnedClipWRing =
             (mappedClipWRingBase_ == nullptr) ||
             (!ownedClipWRingStorage_.empty() && mappedClipWRingBase_ == ownedClipWRingStorage_.data());
+        const bool needOwnedClipW =
+            tree.HasAnyPerspective3D() || !ownedClipWRingStorage_.empty();
         const std::size_t requiredClipWFloats = std::max<std::size_t>(16u, maxPagesInRing_) * kVerticesPerCommandPage;
-        if (usingOwnedClipWRing && totalTreePages > 0u &&
+        if (usingOwnedClipWRing && needOwnedClipW && totalTreePages > 0u &&
             (ownedClipWRingStorage_.empty() || ownedClipWRingStorage_.size() < requiredClipWFloats)) {
             ownedClipWRingStorage_.assign(requiredClipWFloats, 1.0f);
             mappedClipWRingBase_ = ownedClipWRingStorage_.data();
@@ -1124,8 +1126,16 @@ const AeroVertex* ZeroCopyGpuStream::MappedPageVertices(std::size_t pageIndex) c
 }
 
 const float* ZeroCopyGpuStream::MappedPageClipW(std::size_t pageIndex) const noexcept {
-    if (!mappedClipWRingBase_ || maxPagesInRing_ == 0) {
+    static const std::array<float, kVerticesPerCommandPage> kDefaultOnesClipW = []() {
+        std::array<float, kVerticesPerCommandPage> a{};
+        a.fill(1.0f);
+        return a;
+    }();
+    if (maxPagesInRing_ == 0u) {
         return nullptr;
+    }
+    if (!mappedClipWRingBase_) {
+        return (pageIndex < maxPagesInRing_) ? kDefaultOnesClipW.data() : nullptr;
     }
     constexpr std::size_t kPageClipWBytes = kVerticesPerCommandPage * sizeof(float);
     const std::size_t slotIdx = pageIndex % maxPagesInRing_;

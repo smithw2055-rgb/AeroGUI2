@@ -210,6 +210,8 @@ private:
         SymbolId bindingFlushPostLayout = 0u;
         SymbolId bindingStepFrameTicks = 0u;
         SymbolId stepGame = 0u;
+        SymbolId simAdvanceTick = 0u;
+        SymbolId rootSyncHudFromSim = 0u;
         SymbolId windowShow = 0u;
         SymbolId applyTemplate = 0u;
         SymbolId controlApplyTemplate = 0u;
@@ -236,7 +238,7 @@ private:
     bool DispatchPendingCanvasDraws();
     [[nodiscard]] bool InvokeSymbol(
         SymbolId fnId,
-        const std::vector<UnifiedValue>& args,
+        rs_rt::ValueSpan args,
         UnifiedValue* outResult,
         DomainKind domain) const;
 

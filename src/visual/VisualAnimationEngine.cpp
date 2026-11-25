@@ -252,15 +252,34 @@ struct MutableGradSlot {
     return nullptr;
 }
 
-[[nodiscard]] bool TryReadGradientBrush(
+[[nodiscard]] bool TryReadGradientStop(
     const VisualWorld& world,
     std::int32_t gradId,
-    GradientBrushDesc& outDesc) noexcept {
+    std::size_t stopIndex,
+    float& outOffset,
+    Color& outColor) noexcept {
     if (gradId <= 0) return false;
     const auto brushId = static_cast<std::uint32_t>(gradId);
     const UIResourceStore* store = world.ResourceStore();
-    return (store != nullptr && store->GradientBrushes().TryGetBrush(brushId, outDesc)) ||
-           GradientBrushRegistry::Instance().TryGetBrush(brushId, outDesc);
+    return (store != nullptr && store->GradientBrushes().TryGetStopValue(brushId, stopIndex, outOffset, outColor)) ||
+           GradientBrushRegistry::Instance().TryGetStopValue(brushId, stopIndex, outOffset, outColor);
+}
+
+void RemoveTracksByNodeAndProp(
+    std::vector<VisualAnimTrack>& tracks,
+    VisualNodeId node,
+    VisualAnimProp prop) noexcept {
+    std::size_t writeIdx = 0u;
+    for (std::size_t i = 0u; i < tracks.size(); ++i) {
+        if (tracks[i].targetNode == node && tracks[i].prop == prop) {
+            continue;
+        }
+        if (writeIdx != i) {
+            tracks[writeIdx] = std::move(tracks[i]);
+        }
+        ++writeIdx;
+    }
+    tracks.resize(writeIdx);
 }
 
 [[nodiscard]] GradientBrushRegistry* EnsureMutableNodeGradient(
@@ -506,10 +525,10 @@ bool ApplyScalarProp(VisualWorld& world, VisualNodeId id, VisualAnimProp prop, f
     default: {
         const auto target = ParseGradientStopTarget(prop);
         if (target.isStopOffset) {
-            GradientBrushDesc desc{};
-            if (TryReadGradientBrush(world, ReadGradId(node, target.isStroke), desc) &&
-                target.stopIndex < desc.stops.size() &&
-                scalarSame(desc.stops[target.stopIndex].offset, value)) {
+            float curOffset = 0.0f;
+            Color curColor{};
+            if (TryReadGradientStop(world, ReadGradId(node, target.isStroke), target.stopIndex, curOffset, curColor) &&
+                scalarSame(curOffset, value)) {
                 return false;
             }
             std::uint32_t brushId = 0u;
@@ -534,10 +553,10 @@ bool ApplyColorProp(VisualWorld& world, VisualNodeId id, VisualAnimProp prop, st
     VisualNode* node = world.GetNode(id);
     if (!node) return false;
     if (const auto target = ParseGradientStopTarget(prop); target.isStopColor) {
-        GradientBrushDesc desc{};
-        if (TryReadGradientBrush(world, ReadGradId(node, target.isStroke), desc) &&
-            target.stopIndex < desc.stops.size() &&
-            PackColor(desc.stops[target.stopIndex].color) == rgba) {
+        float curOffset = 0.0f;
+        Color curColor{};
+        if (TryReadGradientStop(world, ReadGradId(node, target.isStroke), target.stopIndex, curOffset, curColor) &&
+            PackColor(curColor) == rgba) {
             return false;
         }
         std::uint32_t brushId = 0u;
@@ -766,14 +785,7 @@ std::int32_t VisualAnimationEngine::StartFloat(
     if (!node.IsValid()) return 0;
     const float clampedDelay = std::max(0.0f, delaySec);
     if (clampedDelay <= 0.0f && prop != VisualAnimProp::ManagedCustom) {
-        tracks_.erase(
-            std::remove_if(
-                tracks_.begin(),
-                tracks_.end(),
-                [node, prop](const VisualAnimTrack& existing) noexcept {
-                    return existing.targetNode == node && existing.prop == prop;
-                }),
-            tracks_.end());
+        RemoveTracksByNodeAndProp(tracks_, node, prop);
     }
     VisualAnimTrack track{};
     track.trackId = nextTrackId_++;
@@ -811,14 +823,7 @@ std::int32_t VisualAnimationEngine::StartColor(
     if (!node.IsValid()) return 0;
     const float clampedDelay = std::max(0.0f, delaySec);
     if (clampedDelay <= 0.0f && prop != VisualAnimProp::ManagedCustom) {
-        tracks_.erase(
-            std::remove_if(
-                tracks_.begin(),
-                tracks_.end(),
-                [node, prop](const VisualAnimTrack& existing) noexcept {
-                    return existing.targetNode == node && existing.prop == prop;
-                }),
-            tracks_.end());
+        RemoveTracksByNodeAndProp(tracks_, node, prop);
     }
     VisualAnimTrack track{};
     track.trackId = nextTrackId_++;
@@ -900,19 +905,20 @@ float VisualAnimationEngine::ReadCurrentScalarProp(
             std::isfinite(node->OpacityMask().stopOffsets[stopIdx])) {
             return node->OpacityMask().stopOffsets[stopIdx];
         }
-        GradientBrushDesc desc{};
-        if (TryReadGradientBrush(world, node->OpacityMask().gradId, desc) && stopIdx < desc.stops.size()) {
-            return desc.stops[stopIdx].offset;
+        float off = 0.0f;
+        Color col{};
+        if (TryReadGradientStop(world, node->OpacityMask().gradId, stopIdx, off, col)) {
+            return off;
         }
         return 0.0f;
     }
     default: {
         const auto target = ParseGradientStopTarget(prop);
         if (target.isStopOffset) {
-            GradientBrushDesc desc{};
-            if (TryReadGradientBrush(world, ReadGradId(node, target.isStroke), desc) &&
-                target.stopIndex < desc.stops.size()) {
-                return desc.stops[target.stopIndex].offset;
+            float off = 0.0f;
+            Color col{};
+            if (TryReadGradientStop(world, ReadGradId(node, target.isStroke), target.stopIndex, off, col)) {
+                return off;
             }
         }
         return 0.0f;
@@ -927,10 +933,10 @@ std::uint32_t VisualAnimationEngine::ReadCurrentColorProp(
     const VisualNode* node = world.GetNode(id);
     if (!node) return 0u;
     if (const auto target = ParseGradientStopTarget(prop); target.isStopColor) {
-        GradientBrushDesc desc{};
-        if (TryReadGradientBrush(world, ReadGradId(node, target.isStroke), desc) &&
-            target.stopIndex < desc.stops.size()) {
-            return PackColor(desc.stops[target.stopIndex].color);
+        float off = 0.0f;
+        Color col{};
+        if (TryReadGradientStop(world, ReadGradId(node, target.isStroke), target.stopIndex, off, col)) {
+            return PackColor(col);
         }
         return 0u;
     }
@@ -1006,14 +1012,7 @@ std::int32_t VisualAnimationEngine::StartKeyFrames(
     if (!node.IsValid() || keyFrames.empty()) return 0;
     const float clampedDelay = std::max(0.0f, delaySec);
     if (clampedDelay <= 0.0f && prop != VisualAnimProp::ManagedCustom) {
-        tracks_.erase(
-            std::remove_if(
-                tracks_.begin(),
-                tracks_.end(),
-                [node, prop](const VisualAnimTrack& existing) noexcept {
-                    return existing.targetNode == node && existing.prop == prop;
-                }),
-            tracks_.end());
+        RemoveTracksByNodeAndProp(tracks_, node, prop);
     }
     for (VisualKeyFrame& kf : keyFrames) {
         kf.timeSec = std::max(0.0f, kf.timeSec);
@@ -1053,14 +1052,7 @@ std::int32_t VisualAnimationEngine::BeginKeyFramesTrack(
     if (!node.IsValid()) return 0;
     const float clampedDelay = std::max(0.0f, delaySec);
     if (clampedDelay <= 0.0f && prop != VisualAnimProp::ManagedCustom) {
-        tracks_.erase(
-            std::remove_if(
-                tracks_.begin(),
-                tracks_.end(),
-                [node, prop](const VisualAnimTrack& existing) noexcept {
-                    return existing.targetNode == node && existing.prop == prop;
-                }),
-            tracks_.end());
+        RemoveTracksByNodeAndProp(tracks_, node, prop);
     }
     VisualAnimTrack track{};
     track.trackId = nextTrackId_++;
@@ -1171,13 +1163,14 @@ bool VisualAnimationEngine::Tick(float dtSeconds, VisualWorld& world) {
         return false;
     }
     bool anyVisualMutated = false;
-    for (std::size_t i = 0u; i < tracks_.size(); ) {
+    std::size_t writeIdx = 0u;
+    const std::size_t initialCount = tracks_.size();
+    for (std::size_t i = 0u; i < initialCount; ++i) {
         VisualAnimTrack& track = tracks_[i];
         if (!world.IsAlive(track.targetNode)) {
             if (track.needsScriptSync) {
                 lastTickNeededScriptSync_ = true;
             }
-            tracks_.erase(tracks_.begin() + static_cast<std::ptrdiff_t>(i));
             continue;
         }
         float activeDt = dtSeconds;
@@ -1186,7 +1179,10 @@ bool VisualAnimationEngine::Tick(float dtSeconds, VisualWorld& world) {
             track.delaySec -= step;
             activeDt -= step;
             if (track.delaySec > 0.0f) {
-                ++i;
+                if (writeIdx != i) {
+                    tracks_[writeIdx] = std::move(track);
+                }
+                ++writeIdx;
                 continue;
             }
         }
@@ -1270,11 +1266,14 @@ bool VisualAnimationEngine::Tick(float dtSeconds, VisualWorld& world) {
 
         if (finished) {
             lastTickNeededScriptSync_ = true;
-            tracks_.erase(tracks_.begin() + static_cast<std::ptrdiff_t>(i));
         } else {
-            ++i;
+            if (writeIdx != i) {
+                tracks_[writeIdx] = std::move(track);
+            }
+            ++writeIdx;
         }
     }
+    tracks_.resize(writeIdx);
     return anyVisualMutated;
 }
 

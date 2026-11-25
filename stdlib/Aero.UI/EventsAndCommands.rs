@@ -263,6 +263,15 @@ public class DependencyPropertyChangedEventArgs : EventArgs {
         _newBox = DependencyObject.BoxObject(newVal);
     }
 
+    internal static DependencyPropertyChangedEventArgs FromBoxes(
+        string prop, DependencyObject oldBox, DependencyObject newBox) {
+        var args = new DependencyPropertyChangedEventArgs();
+        args.Property = prop == null ? "" : prop;
+        args._oldBox = oldBox;
+        args._newBox = newBox;
+        return args;
+    }
+
     public object OldValue { get { return DependencyObject.Unbox(_oldBox); } }
     public object NewValue { get { return DependencyObject.Unbox(_newBox); } }
 }

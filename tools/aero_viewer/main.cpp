@@ -533,6 +533,7 @@ int main(int argc, char** argv) {
         std::cerr << compileErr << "\n";
         return 1;
     }
+    compileInput = {};
 
     auto printStartupProfile = [&](double firstFrameMs) {
         if (!profileStartup) {

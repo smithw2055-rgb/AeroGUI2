@@ -78,6 +78,7 @@ struct TextureSlotBuffer {
     mutable std::uint32_t dirtyBaseRevision = 0u;
     std::vector<std::uint8_t> rgbaPixels;
     mutable std::shared_ptr<const std::vector<std::uint8_t>> pixelSnapshot;
+    std::shared_ptr<std::vector<std::uint8_t>> cowAtlasPixels;
 };
 
 // Pure C++17 zero-dependency RFC1951 DEFLATE & RFC1950 zlib decompression (100% Wasm-ready)
@@ -272,6 +273,9 @@ public:
 
 private:
     void EnsureSharedAtlasAllocatedLocked();
+    static void EnsureWritableAtlasPixelsLocked(
+        TextureSlotBuffer& atlasBuf,
+        std::uint32_t atlasSize);
     bool TryAllocateSkylineRectLocked(
         std::uint32_t paddedW,
         std::uint32_t paddedH,
@@ -292,6 +296,12 @@ private:
     const ImageAtlasEntry* InsertDecodedLocked(
         std::string canonicalKey,
         DecodedImage&& image,
+        bool forceStandalone);
+    const ImageAtlasEntry* InsertDecodedSharedLocked(
+        std::string canonicalKey,
+        std::uint32_t width,
+        std::uint32_t height,
+        std::shared_ptr<const std::vector<std::uint8_t>> pixels,
         bool forceStandalone);
     [[nodiscard]] std::string ResolveExistingFileLocked(
         std::string_view cleanRelOrAbs,

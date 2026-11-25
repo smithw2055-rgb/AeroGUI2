@@ -43,6 +43,7 @@ struct LoadedStdlibDll final {
     std::string_view explicitPath = {},
     std::string* outError = nullptr);
 
+void ClearStdlibDllCache() noexcept;
 void ClearStdlibDllCacheForTesting() noexcept;
 
 } // namespace aero

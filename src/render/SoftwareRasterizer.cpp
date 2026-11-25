@@ -1,14 +1,15 @@
 #include "aero/render/ZeroCopyGpuStream.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
 #include <cstring>
-#include <functional>
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <type_traits>
 
 #include "aero/asset/GradientBrush.hpp"
 #include "aero/asset/MtsdfPathBaker.hpp"
@@ -55,16 +56,21 @@ public:
             return;
         }
         const int step = (totalHeight + 3) / 4;
-        std::function<void(int)> taskFn = [&](int bandIdx) {
-            const int y0 = bandIdx * step;
-            const int y1 = std::min(totalHeight, y0 + step);
+        using FnT = std::remove_reference_t<Fn>;
+        auto invokeBand = +[](void* rawCtx, int bandIdx, int totalH, int stepH) {
+            const int y0 = bandIdx * stepH;
+            const int y1 = std::min(totalH, y0 + stepH);
             if (y0 < y1) {
-                bandFn(y0, y1);
+                (*static_cast<FnT*>(rawCtx))(y0, y1);
             }
         };
+        void* const ctxPtr = const_cast<void*>(static_cast<const void*>(&bandFn));
         {
             std::lock_guard<std::mutex> lk(mtx_);
-            currentTask_ = &taskFn;
+            currentCtx_ = ctxPtr;
+            currentFn_ = invokeBand;
+            currentTotalH_ = totalHeight;
+            currentStep_ = step;
             remaining_.store(static_cast<int>(kNumWorkers), std::memory_order_release);
             ++epoch_;
         }
@@ -73,12 +79,13 @@ public:
         // Band 0 on calling thread
         gInScanlineBand = true;
         try {
-            taskFn(0);
+            invokeBand(ctxPtr, 0, totalHeight, step);
         } catch (...) {
             gInScanlineBand = false;
             std::unique_lock<std::mutex> lk(mtx_);
             cvDone_.wait(lk, [&]() { return remaining_.load(std::memory_order_acquire) == 0; });
-            currentTask_ = nullptr;
+            currentFn_ = nullptr;
+            currentCtx_ = nullptr;
             throw;
         }
         gInScanlineBand = false;
@@ -87,7 +94,8 @@ public:
         {
             std::unique_lock<std::mutex> lk(mtx_);
             cvDone_.wait(lk, [&]() { return remaining_.load(std::memory_order_acquire) == 0; });
-            currentTask_ = nullptr;
+            currentFn_ = nullptr;
+            currentCtx_ = nullptr;
         }
     }
 
@@ -98,18 +106,24 @@ private:
             workers_[i] = std::thread([this, bandIdx]() {
                 std::uint64_t seenEpoch = 0u;
                 for (;;) {
-                    const std::function<void(int)>* fn = nullptr;
+                    void (*fn)(void*, int, int, int) = nullptr;
+                    void* ctx = nullptr;
+                    int totalH = 0;
+                    int stepH = 0;
                     {
                         std::unique_lock<std::mutex> lk(mtx_);
                         cvStart_.wait(lk, [&]() { return stop_ || epoch_ != seenEpoch; });
                         if (stop_) return;
                         seenEpoch = epoch_;
-                        fn = currentTask_;
+                        fn = currentFn_;
+                        ctx = currentCtx_;
+                        totalH = currentTotalH_;
+                        stepH = currentStep_;
                     }
                     if (fn) {
                         gInScanlineBand = true;
                         try {
-                            (*fn)(bandIdx);
+                            fn(ctx, bandIdx, totalH, stepH);
                         } catch (...) {
                         }
                         gInScanlineBand = false;
@@ -141,7 +155,10 @@ private:
     std::mutex mtx_;
     std::condition_variable cvStart_;
     std::condition_variable cvDone_;
-    const std::function<void(int)>* currentTask_ = nullptr;
+    void* currentCtx_ = nullptr;
+    void (*currentFn_)(void*, int, int, int) = nullptr;
+    int currentTotalH_ = 0;
+    int currentStep_ = 0;
     std::uint64_t epoch_ = 0u;
     std::atomic<int> remaining_{0};
     bool stop_ = false;
@@ -203,12 +220,30 @@ struct PremulOffscreenLayer {
 };
 
 struct PremulLayerBufferPool {
+    static constexpr std::size_t kMaxSingleBufferBytes = 8u * 1024u * 1024u;
+    static constexpr std::size_t kMaxTotalPooledBytes = 24u * 1024u * 1024u;
+
     std::vector<std::vector<float>> freeBuffers;
+    std::size_t totalPooledBytes = 0u;
 
     void Acquire(std::vector<float>& target, std::size_t floatCount, bool zeroInit) {
         if (!freeBuffers.empty()) {
-            target = std::move(freeBuffers.back());
+            std::size_t bestIdx = freeBuffers.size() - 1u;
+            std::size_t bestCap = static_cast<std::size_t>(-1);
+            for (std::size_t i = 0u; i < freeBuffers.size(); ++i) {
+                const std::size_t cap = freeBuffers[i].capacity();
+                if (cap >= floatCount && cap < bestCap) {
+                    bestCap = cap;
+                    bestIdx = i;
+                }
+            }
+            target = std::move(freeBuffers[bestIdx]);
+            if (bestIdx + 1u < freeBuffers.size()) {
+                freeBuffers[bestIdx] = std::move(freeBuffers.back());
+            }
             freeBuffers.pop_back();
+            const std::size_t capBytes = target.capacity() * sizeof(float);
+            totalPooledBytes = (totalPooledBytes >= capBytes) ? (totalPooledBytes - capBytes) : 0u;
         }
         if (target.size() < floatCount) {
             target.resize(floatCount, 0.0f);
@@ -224,7 +259,12 @@ struct PremulLayerBufferPool {
     }
 
     void Release(std::vector<float>& target) {
-        if (target.capacity() > 0u && freeBuffers.size() < 8u) {
+        const std::size_t capBytes = target.capacity() * sizeof(float);
+        if (capBytes > 0u &&
+            capBytes <= kMaxSingleBufferBytes &&
+            freeBuffers.size() < 8u &&
+            (totalPooledBytes + capBytes) <= kMaxTotalPooledBytes) {
+            totalPooledBytes += capBytes;
             freeBuffers.push_back(std::move(target));
         } else {
             std::vector<float>().swap(target);
@@ -240,6 +280,78 @@ struct ScopedPremulLayerGuard {
         gTlPremulLayerPool.Release(layer.premulRgba);
     }
 };
+
+struct ScopedFloatBufferGuard {
+    std::vector<float>& buf;
+    ~ScopedFloatBufferGuard() {
+        gTlPremulLayerPool.Release(buf);
+    }
+};
+
+struct CachedTexSlotEntry {
+    const ImageAtlas* atlas = nullptr;
+    std::uint32_t textureId = 0u;
+    std::uint32_t width = 0u;
+    std::uint32_t height = 0u;
+    bool found = false;
+    std::shared_ptr<const std::vector<std::uint8_t>> pixels;
+};
+
+struct ThreadTexSlotCache {
+    static constexpr std::size_t kSlots = 8u;
+    std::array<CachedTexSlotEntry, kSlots> entries{};
+    int activeDepth = 0;
+
+    void Clear() noexcept {
+        for (auto& e : entries) {
+            e.atlas = nullptr;
+            e.textureId = 0u;
+            e.width = 0u;
+            e.height = 0u;
+            e.found = false;
+            e.pixels.reset();
+        }
+    }
+};
+
+thread_local ThreadTexSlotCache gTlTexSlotCache;
+
+struct ScopedBandTexCacheGuard {
+    ScopedBandTexCacheGuard() noexcept {
+        ++gTlTexSlotCache.activeDepth;
+    }
+    ~ScopedBandTexCacheGuard() noexcept {
+        if (--gTlTexSlotCache.activeDepth <= 0) {
+            gTlTexSlotCache.activeDepth = 0;
+            gTlTexSlotCache.Clear();
+        }
+    }
+};
+
+[[nodiscard]] bool TryGetTextureSlotCached(
+    const ImageAtlas& atlas,
+    std::uint32_t textureId,
+    std::uint32_t& outWidth,
+    std::uint32_t& outHeight,
+    std::shared_ptr<const std::vector<std::uint8_t>>& outPixels) noexcept {
+    if (gTlTexSlotCache.activeDepth <= 0) {
+        return atlas.TryGetTextureSlotSnapshot(textureId, outWidth, outHeight, outPixels);
+    }
+    CachedTexSlotEntry& entry = gTlTexSlotCache.entries[textureId & (ThreadTexSlotCache::kSlots - 1u)];
+    if (entry.atlas == &atlas && entry.textureId == textureId) {
+        outWidth = entry.width;
+        outHeight = entry.height;
+        outPixels = entry.pixels;
+        return entry.found;
+    }
+    entry.atlas = &atlas;
+    entry.textureId = textureId;
+    entry.found = atlas.TryGetTextureSlotSnapshot(textureId, entry.width, entry.height, entry.pixels);
+    outWidth = entry.width;
+    outHeight = entry.height;
+    outPixels = entry.pixels;
+    return entry.found;
+}
 
 void BlendPremulOver(
     PremulOffscreenLayer& layer,
@@ -401,14 +513,13 @@ void SeparableBoxBlurPremul3PassFloat(PremulOffscreenLayer& layer, float boxRadi
     const int h = layer.height;
     const float invKernel = 1.0f / (static_cast<float>(coreR * 2 + 1) + 2.0f * frac);
     const std::size_t rowFloats = static_cast<std::size_t>(w) * 4u;
-    thread_local std::vector<float> tlScratch;
+    std::vector<float> scratchBuf;
+    ScopedFloatBufferGuard scratchGuard{scratchBuf};
     const std::size_t totalFloats = rowFloats * static_cast<std::size_t>(h);
-    if (tlScratch.size() < totalFloats) {
-        tlScratch.resize(totalFloats);
-    }
+    gTlPremulLayerPool.Acquire(scratchBuf, totalFloats, false);
 
     for (int pass = 0; pass < 3; ++pass) {
-        float* const scratchBase = tlScratch.data();
+        float* const scratchBase = scratchBuf.data();
         const float* const srcBase = layer.premulRgba.data();
         auto blurRowsFn = [&](int yStart, int yEnd) {
             for (int y = yStart; y < yEnd; ++y) {
@@ -498,19 +609,14 @@ void SeparableBoxBlurPremul3Pass(PremulOffscreenLayer& layer, int boxRadius) {
     const int h = layer.height;
     const float invKernel = 1.0f / static_cast<float>(boxRadius * 2 + 1);
     const std::size_t rowFloats = static_cast<std::size_t>(w) * 4u;
-    thread_local std::vector<float> tlScratch;
-    thread_local std::vector<float> tlColSums;
+    std::vector<float> scratchBuf;
+    ScopedFloatBufferGuard scratchGuard{scratchBuf};
     const std::size_t totalFloats = rowFloats * static_cast<std::size_t>(h);
-    if (tlScratch.size() < totalFloats) {
-        tlScratch.resize(totalFloats);
-    }
-    if (tlColSums.size() < rowFloats) {
-        tlColSums.resize(rowFloats);
-    }
+    gTlPremulLayerPool.Acquire(scratchBuf, totalFloats, false);
 
     for (int pass = 0; pass < 3; ++pass) {
-        // Horizontal 1D sliding-window box blur: premulRgba -> tlScratch
-        float* const scratchBase = tlScratch.data();
+        // Horizontal 1D sliding-window box blur: premulRgba -> scratchBuf
+        float* const scratchBase = scratchBuf.data();
         const float* const srcBase = layer.premulRgba.data();
         auto blurRowsFn = [&](int yStart, int yEnd) {
             for (int y = yStart; y < yEnd; ++y) {
@@ -551,7 +657,7 @@ void SeparableBoxBlurPremul3Pass(PremulOffscreenLayer& layer, int boxRadius) {
             blurRowsFn(0, h);
         }
 
-        // Cache-friendly parallel column-striped vertical 1D sliding-window box blur: tlScratch -> premulRgba
+        // Cache-friendly parallel column-striped vertical 1D sliding-window box blur: scratchBuf -> premulRgba
         float* const dstBase = layer.premulRgba.data();
         auto blurColsStripeFn = [&](int cStart, int cEnd) {
             const std::size_t c0 = static_cast<std::size_t>(std::max(0, cStart));
@@ -591,8 +697,117 @@ void SeparableBoxBlurPremul3Pass(PremulOffscreenLayer& layer, int boxRadius) {
     }
 }
 
+template <bool HasFrac>
+void SeparableBoxBlurAlpha1ChImpl(
+    std::vector<float>& alpha,
+    int w,
+    int h,
+    int coreR,
+    float frac,
+    float invKernel) {
+    const std::size_t rowFloats = static_cast<std::size_t>(w);
+    std::vector<float> scratchBuf;
+    ScopedFloatBufferGuard scratchGuard{scratchBuf};
+    gTlPremulLayerPool.Acquire(scratchBuf, rowFloats * static_cast<std::size_t>(h), false);
+
+    for (int pass = 0; pass < 3; ++pass) {
+        float* const scratchBase = scratchBuf.data();
+        const float* const srcBase = alpha.data();
+        auto blurRowsFn = [&](int yStart, int yEnd) {
+            for (int y = yStart; y < yEnd; ++y) {
+                const float* srcRow = srcBase + static_cast<std::size_t>(y) * rowFloats;
+                float* dstRow = scratchBase + static_cast<std::size_t>(y) * rowFloats;
+                float sumA = 0.0f;
+                for (int k = -coreR; k <= coreR; ++k) {
+                    sumA += srcRow[static_cast<std::size_t>(std::clamp(k, 0, w - 1))];
+                }
+                for (int x = 0; x < w; ++x) {
+                    if constexpr (HasFrac) {
+                        const float lTap = srcRow[static_cast<std::size_t>(std::clamp(x - coreR - 1, 0, w - 1))];
+                        const float rTap = srcRow[static_cast<std::size_t>(std::clamp(x + coreR + 1, 0, w - 1))];
+                        dstRow[x] = (sumA + frac * (lTap + rTap)) * invKernel;
+                    } else {
+                        dstRow[x] = sumA * invKernel;
+                    }
+                    const int removeX = std::clamp(x - coreR, 0, w - 1);
+                    const int addX = std::clamp(x + coreR + 1, 0, w - 1);
+                    sumA += srcRow[addX] - srcRow[removeX];
+                }
+            }
+        };
+        if (!gInScanlineBand && static_cast<std::size_t>(w) * static_cast<std::size_t>(h) >= 16384u) {
+            ScanlineWorkerPool::Instance().ParallelBands4(h, blurRowsFn);
+        } else {
+            blurRowsFn(0, h);
+        }
+
+        float* const dstBase = alpha.data();
+        auto blurColsStripeFn = [&](int cStart, int cEnd) {
+            const std::size_t c0 = static_cast<std::size_t>(std::max(0, cStart));
+            const std::size_t c1 = static_cast<std::size_t>(std::min(static_cast<int>(rowFloats), cEnd));
+            if (c1 <= c0) return;
+            const std::size_t stripeLen = c1 - c0;
+            thread_local std::vector<float> tlStripeSums;
+            if (tlStripeSums.size() < stripeLen) {
+                tlStripeSums.resize(stripeLen);
+            }
+            float* sums = tlStripeSums.data();
+            std::fill_n(sums, stripeLen, 0.0f);
+            for (int k = -coreR; k <= coreR; ++k) {
+                const int sy = std::clamp(k, 0, h - 1);
+                const float* srcRow = scratchBase + static_cast<std::size_t>(sy) * rowFloats + c0;
+                for (std::size_t i = 0u; i < stripeLen; ++i) {
+                    sums[i] += srcRow[i];
+                }
+            }
+            for (int y = 0; y < h; ++y) {
+                float* dstRow = dstBase + static_cast<std::size_t>(y) * rowFloats + c0;
+                const int removeY = std::clamp(y - coreR, 0, h - 1);
+                const int addY = std::clamp(y + coreR + 1, 0, h - 1);
+                const float* remRow = scratchBase + static_cast<std::size_t>(removeY) * rowFloats + c0;
+                const float* addRow = scratchBase + static_cast<std::size_t>(addY) * rowFloats + c0;
+                if constexpr (HasFrac) {
+                    const int topTap = std::clamp(y - coreR - 1, 0, h - 1);
+                    const int botTap = std::clamp(y + coreR + 1, 0, h - 1);
+                    const float* topRow = scratchBase + static_cast<std::size_t>(topTap) * rowFloats + c0;
+                    const float* botRow = scratchBase + static_cast<std::size_t>(botTap) * rowFloats + c0;
+                    for (std::size_t i = 0u; i < stripeLen; ++i) {
+                        dstRow[i] = (sums[i] + frac * (topRow[i] + botRow[i])) * invKernel;
+                        sums[i] += addRow[i] - remRow[i];
+                    }
+                } else {
+                    for (std::size_t i = 0u; i < stripeLen; ++i) {
+                        dstRow[i] = sums[i] * invKernel;
+                        sums[i] += addRow[i] - remRow[i];
+                    }
+                }
+            }
+        };
+        if (!gInScanlineBand && static_cast<std::size_t>(w) * static_cast<std::size_t>(h) >= 16384u && rowFloats >= 64u) {
+            ScanlineWorkerPool::Instance().ParallelBands4(static_cast<int>(rowFloats), blurColsStripeFn);
+        } else {
+            blurColsStripeFn(0, static_cast<int>(rowFloats));
+        }
+    }
+}
+
+void SeparableBoxBlurAlpha1Ch3PassFloat(std::vector<float>& alpha, int w, int h, float boxRadiusF) {
+    if (!std::isfinite(boxRadiusF) || boxRadiusF <= 0.05f || w <= 0 || h <= 0) {
+        return;
+    }
+    const int coreR = std::max(0, static_cast<int>(std::floor(boxRadiusF)));
+    const float frac = std::clamp(boxRadiusF - static_cast<float>(coreR), 0.0f, 1.0f);
+    if (frac <= 0.01f && coreR > 0) {
+        const float invKernel = 1.0f / static_cast<float>(coreR * 2 + 1);
+        SeparableBoxBlurAlpha1ChImpl<false>(alpha, w, h, coreR, 0.0f, invKernel);
+        return;
+    }
+    const float invKernel = 1.0f / (static_cast<float>(coreR * 2 + 1) + 2.0f * frac);
+    SeparableBoxBlurAlpha1ChImpl<true>(alpha, w, h, coreR, frac, invKernel);
+}
+
 [[nodiscard]] Color EvaluateGradientBrushSafe(
-    const GradientBrushDesc& brush,
+    const GradientEvalPod& brush,
     float normU,
     float normV,
     float quadWidthPx,
@@ -611,10 +826,10 @@ void SeparableBoxBlurPremul3Pass(PremulOffscreenLayer& layer, int boxRadius) {
             const float nudgeV = (brush.mappingMode == BrushMappingMode::Absolute)
                 ? ((brush.center.y - 1e-3f) / effH)
                 : (brush.center.y - 1e-3f);
-            return EvaluateGradientBrushAtNormalizedUv(brush, safeU, nudgeV, quadWidthPx, quadHeightPx);
+            return EvaluateGradientPodAtNormalizedUv(brush, safeU, nudgeV, quadWidthPx, quadHeightPx);
         }
     }
-    return EvaluateGradientBrushAtNormalizedUv(brush, normU, normV, quadWidthPx, quadHeightPx);
+    return EvaluateGradientPodAtNormalizedUv(brush, normU, normV, quadWidthPx, quadHeightPx);
 }
 
 void SamplePremulBilinear(
@@ -664,10 +879,7 @@ void ApplySaturationPremulLayer(PremulOffscreenLayer& layer, float saturationVal
     }
 }
 
-[[nodiscard]] bool TryResolveGradientBrush(
-    const PagedRenderTree& tree,
-    std::uint32_t brushId,
-    GradientBrushDesc& outBrush) noexcept;
+// Replaced TryResolveGradientBrush forward decl below after ApplySpanPostProcessEffect.
 
 [[nodiscard]] float EvaluateOpacityMaskStopsAlpha(
     const std::vector<GradientStop>& sortedStops,
@@ -931,12 +1143,11 @@ void ApplySpanPostProcessEffect(
             const float dx = std::cos(ang) * shift;
             const float dy = std::sin(ang) * shift;
             const std::size_t totalFloats = static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 4u;
-            thread_local std::vector<float> tlCaSrc;
-            if (tlCaSrc.size() < totalFloats) {
-                tlCaSrc.resize(totalFloats);
-            }
-            std::memcpy(tlCaSrc.data(), layer.premulRgba.data(), totalFloats * sizeof(float));
-            const float* src = tlCaSrc.data();
+            std::vector<float> caSrcBuf;
+            ScopedFloatBufferGuard caSrcGuard{caSrcBuf};
+            gTlPremulLayerPool.Acquire(caSrcBuf, totalFloats, false);
+            std::memcpy(caSrcBuf.data(), layer.premulRgba.data(), totalFloats * sizeof(float));
+            const float* src = caSrcBuf.data();
             auto caBandFn = [&](int y0, int y1) {
                 for (int y = y0; y < y1; ++y) {
                     float* dstRow = layer.premulRgba.data() +
@@ -979,12 +1190,11 @@ void ApplySpanPostProcessEffect(
             const float step = radius / static_cast<float>(halfTaps);
             const float invTaps = 1.0f / static_cast<float>(halfTaps * 2 + 1);
             const std::size_t totalFloats = static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 4u;
-            thread_local std::vector<float> tlDbSrc;
-            if (tlDbSrc.size() < totalFloats) {
-                tlDbSrc.resize(totalFloats);
-            }
-            std::memcpy(tlDbSrc.data(), layer.premulRgba.data(), totalFloats * sizeof(float));
-            const float* src = tlDbSrc.data();
+            std::vector<float> dbSrcBuf;
+            ScopedFloatBufferGuard dbSrcGuard{dbSrcBuf};
+            gTlPremulLayerPool.Acquire(dbSrcBuf, totalFloats, false);
+            std::memcpy(dbSrcBuf.data(), layer.premulRgba.data(), totalFloats * sizeof(float));
+            const float* src = dbSrcBuf.data();
             auto dbBandFn = [&](int y0, int y1) {
                 for (int y = y0; y < y1; ++y) {
                     float* dstRow = layer.premulRgba.data() +
@@ -1029,16 +1239,12 @@ void ApplySpanPostProcessEffect(
             const float dxPx = std::cos(angRad) * depthPx;
             const float dyPx = -std::sin(angRad) * depthPx;
 
-            PremulOffscreenLayer shadowLayer{};
-            ScopedPremulLayerGuard shadowGuard{shadowLayer};
-            shadowLayer.originX = layer.originX;
-            shadowLayer.originY = layer.originY;
-            shadowLayer.width = w;
-            shadowLayer.height = h;
+            std::vector<float> shadowAlpha;
+            ScopedFloatBufferGuard shadowAlphaGuard{shadowAlpha};
             const std::size_t pxCount = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
-            gTlPremulLayerPool.Acquire(shadowLayer.premulRgba, pxCount * 4u, false);
+            gTlPremulLayerPool.Acquire(shadowAlpha, pxCount, false);
             const float* src = layer.premulRgba.data();
-            float* shDst = shadowLayer.premulRgba.data();
+            float* shAlphaDst = shadowAlpha.data();
 
             auto sampleAlphaZeroOutside = [src, w, h](float fx, float fy) noexcept -> float {
                 if (fx < 0.0f || fy < 0.0f ||
@@ -1068,19 +1274,15 @@ void ApplySpanPostProcessEffect(
 
             for (int y = 0; y < h; ++y) {
                 const float sy = static_cast<float>(y) - dyPx;
-                float* dRow = shDst + static_cast<std::size_t>(y) * static_cast<std::size_t>(w) * 4u;
+                float* dRow = shAlphaDst + static_cast<std::size_t>(y) * static_cast<std::size_t>(w);
                 for (int x = 0; x < w; ++x) {
-                    const float a = std::clamp(sampleAlphaZeroOutside(static_cast<float>(x) - dxPx, sy), 0.0f, 1.0f);
-                    float* dp = dRow + static_cast<std::size_t>(x) * 4u;
-                    dp[0] = 0.0f;
-                    dp[1] = 0.0f;
-                    dp[2] = 0.0f;
-                    dp[3] = a;
+                    dRow[x] = std::clamp(sampleAlphaZeroOutside(static_cast<float>(x) - dxPx, sy), 0.0f, 1.0f);
                 }
             }
             const float boxRf = ComputeSpanBoxRadiusFloat(span) * dpi;
             if (boxRf > 0.05f) {
-                SeparableBoxBlurPremul3PassFloat(shadowLayer, boxRf);
+                SeparableBoxBlurAlpha1Ch3PassFloat(shadowAlpha, w, h, boxRf);
+                shAlphaDst = shadowAlpha.data();
             }
             const float shColR = std::clamp(span.effectColor.r, 0.0f, 1.0f);
             const float shColG = std::clamp(span.effectColor.g, 0.0f, 1.0f);
@@ -1091,7 +1293,7 @@ void ApplySpanPostProcessEffect(
             for (std::size_t i = 0u; i < pxCount; ++i) {
                 float* dp = dst + i * 4u;
                 const float srcA = std::clamp(dp[3], 0.0f, 1.0f);
-                const float shA = std::clamp(shDst[i * 4u + 3u] * shColA, 0.0f, 1.0f);
+                const float shA = std::clamp(shAlphaDst[i] * shColA, 0.0f, 1.0f);
                 const float invSrcA = 1.0f - srcA;
                 dp[0] = std::clamp((dp[0] + (shColR * shA) * invSrcA) * outerOp, 0.0f, 1.0f);
                 dp[1] = std::clamp((dp[1] + (shColG * shA) * invSrcA) * outerOp, 0.0f, 1.0f);
@@ -1108,19 +1310,48 @@ void ApplySpanPostProcessEffect(
     }
 }
 
-[[nodiscard]] bool TryResolveGradientBrush(
+[[nodiscard]] const GradientEvalPod* TryResolveGradientEvalPodTls(
     const PagedRenderTree& tree,
-    std::uint32_t brushId,
-    GradientBrushDesc& outBrush) noexcept {
+    std::uint32_t brushId) noexcept {
     if (brushId == 0u) {
-        return false;
+        return nullptr;
     }
+    struct TlsGradCacheSlot {
+        const GradientBrushRegistry* reg = nullptr;
+        std::uint32_t brushId = 0u;
+        std::uint32_t revision = 0u;
+        GradientEvalPod pod{};
+    };
+    constexpr std::size_t kGradCacheSlots = 8u;
+    thread_local std::array<TlsGradCacheSlot, kGradCacheSlots> tlGradCache{};
+
+    auto tryRegistry = [&](const GradientBrushRegistry* reg) noexcept -> const GradientEvalPod* {
+        if (reg == nullptr) {
+            return nullptr;
+        }
+        TlsGradCacheSlot& slot = tlGradCache[brushId & (kGradCacheSlots - 1u)];
+        const std::uint32_t curRev = reg->Revision();
+        if (slot.reg == reg && slot.brushId == brushId && slot.revision == curRev) {
+            return &slot.pod;
+        }
+        GradientEvalPod pod{};
+        std::uint32_t fetchedRev = 0u;
+        if (reg->TryGetEvalPodWithRevision(brushId, pod, fetchedRev)) {
+            slot.reg = reg;
+            slot.brushId = brushId;
+            slot.revision = fetchedRev;
+            slot.pod = pod;
+            return &slot.pod;
+        }
+        return nullptr;
+    };
+
     if (const UIResourceStore* store = tree.ResourceStore(); store != nullptr) {
-        if (store->GradientBrushes().TryGetBrush(brushId, outBrush)) {
-            return true;
+        if (const GradientEvalPod* pod = tryRegistry(&store->GradientBrushes())) {
+            return pod;
         }
     }
-    return GradientBrushRegistry::Instance().TryGetBrush(brushId, outBrush);
+    return tryRegistry(&GradientBrushRegistry::Instance());
 }
 
 void RasterizeSingleNode(
@@ -1177,6 +1408,12 @@ void RasterizeSingleNode(
     std::shared_ptr<const std::vector<std::uint8_t>> cachedNodeTexPixels;
     bool resolvedNodeMtsdf = false;
     const AxbMtsdfPathEntry* cachedNodeMtsdf = nullptr;
+    bool resolvedNodeSdf = false;
+    bool hasNodeSdfView = false;
+    const std::uint8_t* cachedSdfData = nullptr;
+    std::uint16_t cachedSdfW = 0u;
+    std::uint16_t cachedSdfH = 0u;
+    std::uint16_t cachedSdfGlyphH = 0u;
 
     const std::size_t quadCount = nd->vertexCount / 4u;
     for (std::size_t q = 0; q < quadCount; ++q) {
@@ -1225,9 +1462,14 @@ void RasterizeSingleNode(
         const float baseAlpha = static_cast<float>(a8) / 255.0f;
         const AeroPrimType prim = DecodeVertexPrimType(v0.primType);
         if (prim == AeroPrimType::TexturedQuad && !resolvedNodeTex) {
-            (void)imageAtlasRef.TryGetTextureSlotSnapshot(
-                boundTextureId, cachedNodeTexW, cachedNodeTexH, cachedNodeTexPixels);
+            (void)TryGetTextureSlotCached(
+                imageAtlasRef, boundTextureId, cachedNodeTexW, cachedNodeTexH, cachedNodeTexPixels);
             resolvedNodeTex = true;
+        }
+        if (prim == AeroPrimType::SdfTextGlyph && !resolvedNodeSdf) {
+            hasNodeSdfView = fontAtlasRef.AcquireSdfView(
+                cachedSdfData, cachedSdfW, cachedSdfH, cachedSdfGlyphH);
+            resolvedNodeSdf = true;
         }
         const bool hasBoundTexture =
             (cachedNodeTexPixels != nullptr && cachedNodeTexW > 0u && cachedNodeTexH > 0u);
@@ -1358,17 +1600,16 @@ void RasterizeSingleNode(
                    ? nd->gradientBrushId
                    : static_cast<std::uint32_t>((v0.primType >> 4u) & 0x0FFFu))
             : 0u;
-        GradientBrushDesc hoistedPathGradDesc{};
-        const GradientBrushDesc* hoistedPathGradBrush =
-            TryResolveGradientBrush(tree, pathGradId, hoistedPathGradDesc)
-            ? &hoistedPathGradDesc
+        const GradientEvalPod* hoistedPathGradBrush = (pathGradId != 0u)
+            ? TryResolveGradientEvalPodTls(tree, pathGradId)
             : nullptr;
 
         std::uint32_t hoistedRectGradId = 0u;
         float hoistedGradRadius = 0.0f;
         bool hoistedGradIsEllipse = false;
-        GradientBrushDesc hoistedRectGradDesc{};
-        const GradientBrushDesc* hoistedRectGradBrush = nullptr;
+        const GradientEvalPod* hoistedRectGradBrush = nullptr;
+        bool hoistedUniformGradCr = true;
+        float hoistedMaxGradCr = 0.0f;
         if (prim == AeroPrimType::GradientRoundedRect) {
             UnpackGradientRoundedRectVertexParams(
                 v0.primType,
@@ -1379,9 +1620,32 @@ void RasterizeSingleNode(
             if (hoistedRectGradId == 0u) {
                 hoistedRectGradId = nd->gradientBrushId;
             }
-            if (TryResolveGradientBrush(tree, hoistedRectGradId, hoistedRectGradDesc)) {
-                hoistedRectGradBrush = &hoistedRectGradDesc;
+            if (hoistedRectGradId != 0u) {
+                hoistedRectGradBrush = TryResolveGradientEvalPodTls(tree, hoistedRectGradId);
             }
+            hoistedUniformGradCr = IsUniformCornerRadius(nd->cornerRadii);
+            hoistedMaxGradCr = hoistedUniformGradCr
+                ? hoistedGradRadius
+                : std::max(std::max(nd->cornerRadii.topLeft, nd->cornerRadii.topRight),
+                           std::max(nd->cornerRadii.bottomRight, nd->cornerRadii.bottomLeft));
+        }
+
+        float hoistedSdfScreenPxRange = 1.25f;
+        float hoistedSdfUSpan = 0.0f;
+        float hoistedSdfVSpan = 0.0f;
+        float hoistedSdfDuV = 0.0f;
+        float hoistedSdfDvU = 0.0f;
+        if (prim == AeroPrimType::SdfTextGlyph && hasNodeSdfView) {
+            hoistedSdfUSpan = v1.u - v0.u;
+            hoistedSdfVSpan = v3.v - v0.v;
+            hoistedSdfDuV = v3.u - v0.u;
+            hoistedSdfDvU = v1.v - v0.v;
+            const float texW = std::max(1.0f, std::fabs(hoistedSdfUSpan) * static_cast<float>(cachedSdfW));
+            const float texH = std::max(1.0f, std::fabs(hoistedSdfVSpan) * static_cast<float>(cachedSdfH));
+            const float scaleX = std::max(1.0f, perpQuadW) / texW;
+            const float scaleY = std::max(1.0f, perpQuadH) / texH;
+            const float avgScale = 0.5f * (scaleX + scaleY);
+            hoistedSdfScreenPxRange = std::max(2.0f * std::max(FontAtlas::kDefaultSdfPxRange, 1.0f) * avgScale, 1.25f);
         }
 
         float hoistedMtsdfStrokePx = 0.0f;
@@ -1512,6 +1776,18 @@ void RasterizeSingleNode(
             }
         };
 
+        const bool canHoistTexturedRowY =
+            (prim == AeroPrimType::TexturedQuad) && hasBoundTexture &&
+            !usePerspectiveInverse && e1y == 0.0f && e3x == 0.0f &&
+            v0.v == v1.v && v3.v == v2.v;
+        const std::uint8_t* hoistedTexPixelsData = hasBoundTexture ? cachedNodeTexPixels->data() : nullptr;
+        const int hoistedTexMaxX = hasBoundTexture ? (static_cast<int>(cachedNodeTexW) - 1) : 0;
+        const int hoistedTexMaxY = hasBoundTexture ? (static_cast<int>(cachedNodeTexH) - 1) : 0;
+        const std::size_t hoistedTexStride = hasBoundTexture ? (static_cast<std::size_t>(cachedNodeTexW) * 4u) : 0u;
+        const std::uint8_t* rowTexPtr0 = nullptr;
+        const std::uint8_t* rowTexPtr1 = nullptr;
+        float rowTexFy = 0.0f;
+
         float perspRowU = 0.0f, perspRowV = 0.0f, perspRowW = 0.0f;
         for (int py = bandClampedPyStart; py < bandClampedPyEnd; ++py) {
             const float sy = static_cast<float>(py) + 0.5f;
@@ -1529,6 +1805,17 @@ void RasterizeSingleNode(
                 rowPxEnd = std::min(pxEnd, rowPxEnd);
                 if (rowPxStart >= rowPxEnd) {
                     continue;
+                }
+                if (canHoistTexturedRowY) {
+                    const float svRow = (e1x * dy) * invDet;
+                    const float clampedV = std::clamp(v0.v + svRow * (v3.v - v0.v), 0.0f, 1.0f);
+                    const float texY = clampedV * static_cast<float>(cachedNodeTexH) - 0.5f;
+                    const float flY = std::floor(texY);
+                    const int y0 = std::clamp(static_cast<int>(flY), 0, hoistedTexMaxY);
+                    const int y1 = std::min(y0 + 1, hoistedTexMaxY);
+                    rowTexFy = std::clamp(texY - flY, 0.0f, 1.0f);
+                    rowTexPtr0 = hoistedTexPixelsData + static_cast<std::size_t>(y0) * hoistedTexStride;
+                    rowTexPtr1 = hoistedTexPixelsData + static_cast<std::size_t>(y1) * hoistedTexStride;
                 }
                 if (hasAxisAlignedMtsdfBounds) {
                     const float svA = baseSv + (static_cast<float>(rowPxStart) + 0.5f) * stepSvX;
@@ -1982,7 +2269,7 @@ void RasterizeSingleNode(
                         coverage = fillCov;
                     }
                     if (hoistedPathGradBrush != nullptr && coverage > 0.0f) {
-                        if (const GradientBrushDesc* gBrush = hoistedPathGradBrush) {
+                        if (const GradientEvalPod* gBrush = hoistedPathGradBrush) {
                             const Color gc = EvaluateGradientBrushSafe(
                                 *gBrush,
                                 std::clamp(su, 0.0f, 1.0f),
@@ -2014,17 +2301,46 @@ void RasterizeSingleNode(
                         innerRatio,
                         aaFeather);
                 } else if (prim == AeroPrimType::SdfTextGlyph) {
-                    const float uInterp = v0.u + su * (v1.u - v0.u) + sv * (v3.u - v0.u);
-                    const float vInterp = v0.v + su * (v1.v - v0.v) + sv * (v3.v - v0.v);
-                    const float uSpan = v1.u - v0.u;
-                    const float vSpan = v3.v - v0.v;
-                    coverage = fontAtlasRef.EvaluateGlyphSdfCoverage(
-                        uInterp,
-                        vInterp,
-                        uSpan,
-                        vSpan,
-                        perpQuadW,
-                        perpQuadH);
+                    if (!hasNodeSdfView) {
+                        coverage = 0.0f;
+                    } else {
+                        const float uInterp = v0.u + su * hoistedSdfUSpan + sv * hoistedSdfDuV;
+                        const float vInterp = v0.v + su * hoistedSdfDvU + sv * hoistedSdfVSpan;
+                        const float tx = std::clamp(uInterp, 0.0f, 1.0f) * static_cast<float>(cachedSdfW) - 0.5f;
+                        const float ty = std::clamp(vInterp, 0.0f, 1.0f) * static_cast<float>(cachedSdfH) - 0.5f;
+                        const float flX = std::floor(tx);
+                        const float flY = std::floor(ty);
+                        const int maxSdfX = static_cast<int>(cachedSdfW) - 1;
+                        const int maxSdfY = static_cast<int>(cachedSdfH) - 1;
+                        const int x0 = std::clamp(static_cast<int>(flX), 0, maxSdfX);
+                        const int y0 = std::clamp(static_cast<int>(flY), 0, maxSdfY);
+                        const int glyphHInt = static_cast<int>(cachedSdfGlyphH);
+                        float sd = 0.0f;
+                        if (y0 < glyphHInt) {
+                            const int x1 = std::min(x0 + 1, maxSdfX);
+                            const int y1 = std::min(y0 + 1, maxSdfY);
+                            const float fx = std::clamp(tx - flX, 0.0f, 1.0f);
+                            const float fy = std::clamp(ty - flY, 0.0f, 1.0f);
+                            constexpr float kInv255 = 1.0f / 255.0f;
+                            const std::size_t row0Off = static_cast<std::size_t>(y0) * cachedSdfW;
+                            const float c00 = static_cast<float>(cachedSdfData[row0Off + static_cast<std::size_t>(x0)]) * kInv255;
+                            const float c10 = static_cast<float>(cachedSdfData[row0Off + static_cast<std::size_t>(x1)]) * kInv255;
+                            float c01 = 0.0f;
+                            float c11 = 0.0f;
+                            if (y1 < glyphHInt) {
+                                const std::size_t row1Off = static_cast<std::size_t>(y1) * cachedSdfW;
+                                c01 = static_cast<float>(cachedSdfData[row1Off + static_cast<std::size_t>(x0)]) * kInv255;
+                                c11 = static_cast<float>(cachedSdfData[row1Off + static_cast<std::size_t>(x1)]) * kInv255;
+                            }
+                            const float top = c00 + (c10 - c00) * fx;
+                            const float bot = c01 + (c11 - c01) * fx;
+                            sd = top + (bot - top) * fy;
+                        }
+                        constexpr float kEdgeMidpoint = 128.0f / 255.0f;
+                        const float screenDist = (sd - kEdgeMidpoint) * hoistedSdfScreenPxRange;
+                        const float cov = std::clamp(screenDist + 0.5f, 0.0f, 1.0f);
+                        coverage = cov * cov * (3.0f - 2.0f * cov);
+                    }
                     if (!uniformVertexColor && coverage > 0.002f) {
                         auto bilerpVertByte = [&](std::uint32_t shift) noexcept -> float {
                             const float c0 = static_cast<float>((v0.rgba >> shift) & 0xFFu);
@@ -2045,13 +2361,35 @@ void RasterizeSingleNode(
                     const float botU = v3.u + su * (v2.u - v3.u);
                     const float uInterp = topU + sv * (botU - topU);
 
-                    const float topV = v0.v + su * (v1.v - v0.v);
-                    const float botV = v3.v + su * (v2.v - v3.v);
-                    const float vInterp = topV + sv * (botV - topV);
-
-                    const Color texel = hasBoundTexture
-                        ? SampleTextureSlotBilinear(cachedNodeTexW, cachedNodeTexH, *cachedNodeTexPixels, uInterp, vInterp)
-                        : Color{1.0f, 1.0f, 1.0f, 1.0f};
+                    Color texel{1.0f, 1.0f, 1.0f, 1.0f};
+                    if (canHoistTexturedRowY) {
+                        const float clampedU = std::clamp(uInterp, 0.0f, 1.0f);
+                        const float texX = clampedU * static_cast<float>(cachedNodeTexW) - 0.5f;
+                        const float flX = std::floor(texX);
+                        const int x0 = std::clamp(static_cast<int>(flX), 0, hoistedTexMaxX);
+                        const int x1 = std::min(x0 + 1, hoistedTexMaxX);
+                        const float fx = std::clamp(texX - flX, 0.0f, 1.0f);
+                        const std::uint8_t* p00 = rowTexPtr0 + static_cast<std::size_t>(x0) * 4u;
+                        const std::uint8_t* p10 = rowTexPtr0 + static_cast<std::size_t>(x1) * 4u;
+                        const std::uint8_t* p01 = rowTexPtr1 + static_cast<std::size_t>(x0) * 4u;
+                        const std::uint8_t* p11 = rowTexPtr1 + static_cast<std::size_t>(x1) * 4u;
+                        constexpr float kInv255 = 1.0f / 255.0f;
+                        auto bilerpRowCh = [&](std::size_t ch) noexcept -> float {
+                            const float c00 = static_cast<float>(p00[ch]);
+                            const float c10 = static_cast<float>(p10[ch]);
+                            const float c01 = static_cast<float>(p01[ch]);
+                            const float c11 = static_cast<float>(p11[ch]);
+                            const float top = c00 + (c10 - c00) * fx;
+                            const float bot = c01 + (c11 - c01) * fx;
+                            return (top + (bot - top) * rowTexFy) * kInv255;
+                        };
+                        texel = Color{bilerpRowCh(0u), bilerpRowCh(1u), bilerpRowCh(2u), bilerpRowCh(3u)};
+                    } else if (hasBoundTexture) {
+                        const float topV = v0.v + su * (v1.v - v0.v);
+                        const float botV = v3.v + su * (v2.v - v3.v);
+                        const float vInterp = topV + sv * (botV - topV);
+                        texel = SampleTextureSlotBilinear(cachedNodeTexW, cachedNodeTexH, *cachedNodeTexPixels, uInterp, vInterp);
+                    }
 
                     float vertR = static_cast<float>(r8) * (1.0f / 255.0f);
                     float vertG = static_cast<float>(g8) * (1.0f / 255.0f);
@@ -2157,10 +2495,7 @@ void RasterizeSingleNode(
                     const float aaFeather = quadAaFeather;
 
                     float shapeCov = 1.0f;
-                    const float maxGradCr = IsUniformCornerRadius(nd->cornerRadii)
-                        ? gradRadius
-                        : std::max(std::max(nd->cornerRadii.topLeft, nd->cornerRadii.topRight),
-                                   std::max(nd->cornerRadii.bottomRight, nd->cornerRadii.bottomLeft));
+                    const float maxGradCr = hoistedMaxGradCr;
                     if (isEllipse || nd->isEllipseShape) {
                         shapeCov = EvaluateSdfEllipseCoverage(
                             localX,
@@ -2173,7 +2508,7 @@ void RasterizeSingleNode(
                     } else if (std::fabs(localX) <= (halfW - maxGradCr - aaFeather - 0.5f) &&
                                std::fabs(localY) <= (halfH - maxGradCr - aaFeather - 0.5f)) {
                         shapeCov = 1.0f;
-                    } else if (!IsUniformCornerRadius(nd->cornerRadii)) {
+                    } else if (!hoistedUniformGradCr) {
                         shapeCov = EvaluateSdfRoundedRectCoverage(
                             localX,
                             localY,
@@ -2192,7 +2527,7 @@ void RasterizeSingleNode(
                     }
 
                     if (shapeCov > 0.002f) {
-                        const GradientBrushDesc* brush = hoistedRectGradBrush;
+                        const GradientEvalPod* brush = hoistedRectGradBrush;
                         const Color gradCol = brush
                             ? EvaluateGradientBrushSafe(
                                   *brush,
@@ -2532,6 +2867,7 @@ void RasterizeNodeSpanRecursive(
                         ScanlineWorkerPool::Instance().ParallelBands4(
                             subLayer.height,
                             [&](int relY0, int relY1) {
+                                ScopedBandTexCacheGuard subBandTexGuard;
                                 const int p0 = gRasterBandY0;
                                 const int p1 = gRasterBandY1;
                                 gRasterBandY0 = subLayer.originY + relY0;
@@ -2648,6 +2984,7 @@ void ZeroCopyGpuStream::RasterizeTreeToRgba8(
     if (pixelCount == 0u) {
         return;
     }
+    ScopedBandTexCacheGuard rootTexGuard;
 
     const std::uint32_t clearPacked = PackColorRgba8(clearColor, 1.0f);
     const std::uint8_t cr = static_cast<std::uint8_t>(clearPacked & 0xFFu);
@@ -2733,6 +3070,7 @@ void ZeroCopyGpuStream::RasterizeTreeToRgba8(
                 ScanlineWorkerPool::Instance().ParallelBands4(
                     vpHInt,
                     [&](int y0, int y1) {
+                        ScopedBandTexCacheGuard bandTexGuard;
                         const int prevY0 = gRasterBandY0;
                         const int prevY1 = gRasterBandY1;
                         gRasterBandY0 = y0;
@@ -2757,6 +3095,7 @@ void ZeroCopyGpuStream::RasterizeTreeToRgba8(
             ScanlineWorkerPool::Instance().ParallelBands4(
                 static_cast<int>(viewportHeight),
                 [&](int y0, int y1) {
+                    ScopedBandTexCacheGuard bandTexGuard;
                     const int prevY0 = gRasterBandY0;
                     const int prevY1 = gRasterBandY1;
                     gRasterBandY0 = y0;
@@ -2876,14 +3215,18 @@ bool ZeroCopyGpuStream::RasterizeBlurSpanPatchPremulRgba8(
         return false;
     }
 
+    ScopedBandTexCacheGuard patchTexGuard;
+
     PremulOffscreenLayer subLayer{};
+    ScopedPremulLayerGuard subLayerGuard{subLayer};
     subLayer.originX = bx0;
     subLayer.originY = by0;
     subLayer.width = bx1 - bx0;
     subLayer.height = by1 - by0;
-    subLayer.premulRgba.assign(
+    gTlPremulLayerPool.Acquire(
+        subLayer.premulRgba,
         static_cast<std::size_t>(subLayer.width) * static_cast<std::size_t>(subLayer.height) * 4u,
-        0.0f);
+        true);
 
     const auto& blurSpans = tree.BlurLayerSpans();
     if (ioBlurCursor < blurSpans.size() &&
@@ -3005,12 +3348,15 @@ bool ZeroCopyGpuStream::ComputeBackdropBlurPatchPremulRgba8(
     const int vpH = static_cast<int>(std::min<std::uint32_t>(viewportHeight, 0x3FFFFFFFu));
 
     PremulOffscreenLayer bgLayer{};
+    ScopedPremulLayerGuard bgLayerGuard{bgLayer};
     bgLayer.originX = readX;
     bgLayer.originY = readY;
     bgLayer.width = readW;
     bgLayer.height = readH;
-    bgLayer.premulRgba.resize(
-        static_cast<std::size_t>(readW) * static_cast<std::size_t>(readH) * 4u);
+    gTlPremulLayerPool.Acquire(
+        bgLayer.premulRgba,
+        static_cast<std::size_t>(readW) * static_cast<std::size_t>(readH) * 4u,
+        false);
     for (int ry = 0; ry < readH; ++ry) {
         const std::uint8_t* srcRow = topDownReadbackRgba8 +
             static_cast<std::size_t>(ry) * static_cast<std::size_t>(readW) * 4u;

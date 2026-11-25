@@ -572,13 +572,25 @@ bool UIResourceStore::StoreOrLookupPathMaskLocked(
         while (!pathMaskEntries_.empty() &&
                (pathMaskEntries_.size() >= kMaxPathMaskEntries ||
                 (pathMaskTotalBytes_ + incomingBytes > kMaxPathMaskTotalBytes))) {
-            auto lru = pathMaskEntries_.begin();
+            auto lruStandalone = pathMaskEntries_.end();
+            auto lruAny = pathMaskEntries_.end();
             for (auto it = pathMaskEntries_.begin(); it != pathMaskEntries_.end(); ++it) {
-                if (it->second.lastUsedTick < lru->second.lastUsedTick) {
-                    lru = it;
+                if (lruAny == pathMaskEntries_.end() ||
+                    it->second.lastUsedTick < lruAny->second.lastUsedTick) {
+                    lruAny = it;
+                }
+                if (it->second.byteSize > 0u &&
+                    (lruStandalone == pathMaskEntries_.end() ||
+                     it->second.lastUsedTick < lruStandalone->second.lastUsedTick)) {
+                    lruStandalone = it;
                 }
             }
-            evictIter(lru);
+            if (lruStandalone != pathMaskEntries_.end() &&
+                (pathMaskTotalBytes_ + incomingBytes > kMaxPathMaskTotalBytes)) {
+                evictIter(lruStandalone);
+            } else {
+                evictIter(lruAny);
+            }
         }
     }
 
@@ -777,11 +789,21 @@ bool UIResourceStore::GetOrRasterizePathStrokeMask(
     const auto capBits = (static_cast<std::uint64_t>(startLineCap & 0xFu) << 4u) |
                          static_cast<std::uint64_t>(endLineCap & 0xFu);
 
-    std::uint64_t key = safeHash ^ 0xD1B54A32D192ED03ULL;
-    key ^= (static_cast<std::uint64_t>(clampedW) << 32u) | static_cast<std::uint64_t>(clampedH);
-    key *= 1099511628211ULL;
-    key ^= (quantizedStroke << 16u) | (capBits << 8u) | static_cast<std::uint64_t>(clampedPad);
-    key *= 1099511628211ULL;
+    auto makeStrokeKey = [&](std::uint32_t w, std::uint32_t h, float sW) noexcept -> std::uint64_t {
+        const auto qStroke = static_cast<std::uint64_t>(std::max<long>(1L, std::lround(sW * 16.0f)));
+        std::uint64_t k = safeHash ^ 0xD1B54A32D192ED03ULL;
+        k ^= (static_cast<std::uint64_t>(w) << 32u) | static_cast<std::uint64_t>(h);
+        k *= 1099511628211ULL;
+        k ^= (qStroke << 16u) | (capBits << 8u) | static_cast<std::uint64_t>(clampedPad);
+        k *= 1099511628211ULL;
+        return k;
+    };
+
+    const std::uint64_t strokeGroup = safeHash ^ 0x5A5A5A5A00000002ULL;
+    std::uint32_t effW = clampedW;
+    std::uint32_t effH = clampedH;
+    float effStrokeW = strokeWidthPx;
+    std::uint64_t key = makeStrokeKey(effW, effH, effStrokeW);
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -790,17 +812,50 @@ bool UIResourceStore::GetOrRasterizePathStrokeMask(
             outEntry = it->second;
             return true;
         }
+        bool hasSameGroup = false;
+        for (const auto& kv : pathMaskEntries_) {
+            if (kv.second.groupHash == strokeGroup) {
+                hasSameGroup = true;
+                break;
+            }
+        }
+        if (hasSameGroup) {
+            static constexpr std::uint32_t kBuckets[] = {
+                16u, 24u, 32u, 48u, 64u, 96u, 128u, 192u, 256u, 384u, 512u, 768u, 1024u, 1536u, 2048u
+            };
+            const std::uint32_t maxDim = std::max(clampedW, clampedH);
+            std::uint32_t bucketMax = 2048u;
+            for (const std::uint32_t b : kBuckets) {
+                if (b >= maxDim) {
+                    bucketMax = b;
+                    break;
+                }
+            }
+            if (maxDim > 0u && bucketMax != maxDim) {
+                const float scale = static_cast<float>(bucketMax) / static_cast<float>(maxDim);
+                effW = std::clamp<std::uint32_t>(
+                    static_cast<std::uint32_t>(std::lround(static_cast<float>(clampedW) * scale)), 1u, 2048u);
+                effH = std::clamp<std::uint32_t>(
+                    static_cast<std::uint32_t>(std::lround(static_cast<float>(clampedH) * scale)), 1u, 2048u);
+                effStrokeW = std::max(0.25f, strokeWidthPx * scale);
+                key = makeStrokeKey(effW, effH, effStrokeW);
+                if (const auto bit = pathMaskEntries_.find(key); bit != pathMaskEntries_.end()) {
+                    bit->second.lastUsedTick = ++pathMaskAccessSeq_;
+                    outEntry = bit->second;
+                    return true;
+                }
+            }
+        }
     }
 
     std::vector<std::uint8_t> rgba8;
     if (!RasterizeSvgPathStrokeAlphaMask(
-            pathData, rawBounds, clampedW, clampedH, strokeWidthPx, clampedPad, rgba8, startLineCap, endLineCap)) {
+            pathData, rawBounds, effW, effH, effStrokeW, clampedPad, rgba8, startLineCap, endLineCap)) {
         return false;
     }
 
-    const std::uint32_t texW = clampedW + 2u * clampedPad;
-    const std::uint32_t texH = clampedH + 2u * clampedPad;
-    const std::uint64_t strokeGroup = safeHash ^ 0x5A5A5A5A00000002ULL;
+    const std::uint32_t texW = effW + 2u * clampedPad;
+    const std::uint32_t texH = effH + 2u * clampedPad;
     return StoreOrLookupPathMaskLocked(key, strokeGroup, texW, texH, 0.0f, 0.0f, 1.0f, 1.0f, std::move(rgba8), outEntry, true);
 }
 

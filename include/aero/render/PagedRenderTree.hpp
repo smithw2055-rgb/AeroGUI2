@@ -576,9 +576,13 @@ public:
         const CornerRadius& cornerRadii,
         const Matrix2D& world2D,
         BlendingMode blend) noexcept;
-    void SetSyncedWorldState(std::uint64_t worldId, std::uint64_t structureVersion) noexcept {
+    void SetSyncedWorldState(
+        std::uint64_t worldId,
+        std::uint64_t structureVersion,
+        std::uint64_t drawBufferVersion = 0u) noexcept {
         syncedWorldId_ = worldId;
         syncedStructureVersion_ = structureVersion;
+        syncedDrawBufferVersion_ = drawBufferVersion;
     }
     [[nodiscard]] bool MatchesSyncedWorldState(
         std::uint64_t worldId,
@@ -586,6 +590,9 @@ public:
         return worldId != 0u &&
                syncedWorldId_ == worldId &&
                syncedStructureVersion_ == structureVersion;
+    }
+    [[nodiscard]] std::uint64_t SyncedDrawBufferVersion() const noexcept {
+        return syncedDrawBufferVersion_;
     }
     bool UpdateNodeTransform2D(
         std::uint32_t nodeId,
@@ -627,9 +634,8 @@ public:
     [[nodiscard]] const CommandPage& GetPage(std::size_t pageIndex) const noexcept {
         return pages_[pageIndex];
     }
-    [[nodiscard]] const float* PageVertexClipW(std::size_t pageIndex) const noexcept {
-        return (pageIndex < pageClipW_.size()) ? pageClipW_[pageIndex].data() : nullptr;
-    }
+    [[nodiscard]] const float* PageVertexClipW(std::size_t pageIndex) const noexcept;
+    [[nodiscard]] bool HasAnyPerspective3D() const noexcept { return hasAnyPerspective3D_; }
 
     [[nodiscard]] std::size_t NodeCount() const noexcept { return nodes_.size(); }
     [[nodiscard]] const Matrix4x4& GetNodeWorldMatrix3D(const RenderNodeDescriptor& node) const noexcept;
@@ -660,6 +666,7 @@ public:
     [[nodiscard]] const std::vector<std::uint32_t>& DirtyPageIndices() const noexcept {
         return dirtyPageList_;
     }
+    void MarkAllPagesDirty() noexcept;
     void ClearDirtyPages() noexcept;
 
     [[nodiscard]] const GlyphUvRect& LookupPreCachedGlyph(char asciiChar) const {
@@ -690,6 +697,7 @@ private:
         const Rect& clipRect,
         bool clipActive,
         std::uint32_t textureId = 0u);
+    float* EnsureWritablePageClipW(std::size_t pageIndex);
     void WriteQuadVertices(RenderNodeDescriptor& node) noexcept;
     void ZeroOutNodeVertices(RenderNodeDescriptor& node) noexcept;
     void MarkPageDirty(std::uint32_t pageIndex, std::uint16_t vertexOffsetInPage) noexcept;
@@ -754,7 +762,9 @@ private:
     bool hasOutOfOrderCoalesce_ = false;
     Rect hintNextBounds_{};
     bool hasHintNextBounds_ = false;
-    std::vector<std::array<float, kVerticesPerCommandPage>> pageClipW_;
+    std::vector<std::uint32_t> pageClipWPoolIndices_;
+    std::vector<std::array<float, kVerticesPerCommandPage>> pageClipWPool_;
+    bool hasAnyPerspective3D_ = false;
     std::vector<RenderNodeDescriptor> nodes_;
     std::vector<Matrix4x4> worldMatrices3D_;
     std::vector<std::uint8_t> pageDirtyFlags_;
@@ -780,13 +790,13 @@ private:
     std::uint32_t mtsdfOwnerId_ = 0u;
     std::uint64_t syncedWorldId_ = 0u;
     std::uint64_t syncedStructureVersion_ = 0u;
+    std::uint64_t syncedDrawBufferVersion_ = 0u;
     std::uint64_t mtsdfAtlasRevision_ = 0u;
     std::uint32_t mtsdfPopulatedRows_ = 0u;
     std::uint32_t mtsdfShelfX_ = 0u;
     std::uint32_t mtsdfShelfY_ = 512u;
     std::uint32_t mtsdfShelfRowH_ = 0u;
     std::vector<std::uint8_t> mtsdfAtlasRgba8_;
-    std::unordered_set<std::uint64_t> mtsdfRegisteredHashes_;
     std::unordered_map<std::uint64_t, AxbMtsdfPathEntry> mtsdfEntries_;
 };
 

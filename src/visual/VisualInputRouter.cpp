@@ -241,11 +241,37 @@ namespace {
     }
 
     if (!node->children.empty()) {
-        const std::vector<VisualNodeId> paintOrder = SortedChildrenByZOrder(world, node->children);
-        for (std::size_t i = paintOrder.size(); i > 0u; --i) {
-            const VisualNodeId childHit = HitTestNodeRecursive(world, paintOrder[i - 1u], viewportPoint);
-            if (childHit.IsValid()) {
-                return childHit;
+        bool uniformZ = (node->children.size() <= 1u);
+        if (!uniformZ) {
+            std::int32_t firstZ = 0;
+            bool hasFirstZ = false;
+            uniformZ = true;
+            for (VisualNodeId cid : node->children) {
+                if (const VisualNode* ch = world.GetNode(cid)) {
+                    if (!hasFirstZ) {
+                        firstZ = ch->layout.zIndex;
+                        hasFirstZ = true;
+                    } else if (ch->layout.zIndex != firstZ) {
+                        uniformZ = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if (uniformZ) {
+            for (std::size_t i = node->children.size(); i > 0u; --i) {
+                const VisualNodeId childHit = HitTestNodeRecursive(world, node->children[i - 1u], viewportPoint);
+                if (childHit.IsValid()) {
+                    return childHit;
+                }
+            }
+        } else {
+            const std::vector<VisualNodeId> paintOrder = SortedChildrenByZOrder(world, node->children);
+            for (std::size_t i = paintOrder.size(); i > 0u; --i) {
+                const VisualNodeId childHit = HitTestNodeRecursive(world, paintOrder[i - 1u], viewportPoint);
+                if (childHit.IsValid()) {
+                    return childHit;
+                }
             }
         }
     }

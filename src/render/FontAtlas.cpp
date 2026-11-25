@@ -347,53 +347,7 @@ void AppendYMonotonicQuad(
     }
 }
 
-[[nodiscard]] int EvaluateWindingNumber(
-    const std::vector<YMonotonicSeg>& segs,
-    float px,
-    float py) noexcept {
-    int winding = 0;
-    for (const auto& s : segs) {
-        if (py < s.minY || py >= s.maxY || px >= s.maxX) {
-            continue;
-        }
-        const bool upward = (s.y0 <= py && s.y2 > py);
-        const bool downward = (s.y0 > py && s.y2 <= py);
-        if (!upward && !downward) {
-            continue;
-        }
-        float xCross = 0.0f;
-        if (!s.isQuadratic) {
-            const float t = (py - s.y0) / (s.y2 - s.y0);
-            xCross = s.x0 + t * (s.x2 - s.x0);
-        } else {
-            const float a = s.y0 - 2.0f * s.y1 + s.y2;
-            const float b = s.y1 - s.y0;
-            const float c = s.y0 - py;
-            float t = 0.0f;
-            if (std::fabs(a) <= 1e-5f) {
-                const float dy = s.y2 - s.y0;
-                t = (std::fabs(dy) > 1e-8f) ? (-c / dy) : 0.0f;
-            } else {
-                const float disc = std::max(0.0f, b * b - a * c);
-                const float root = std::sqrt(disc);
-                if (upward) {
-                    const float denom = b + root;
-                    t = (std::fabs(denom) > 1e-8f) ? (-c / denom) : ((-b + root) / a);
-                } else {
-                    const float denom = -b + root;
-                    t = (std::fabs(denom) > 1e-8f) ? (c / denom) : ((-b - root) / a);
-                }
-            }
-            t = std::clamp(t, 0.0f, 1.0f);
-            const float u = 1.0f - t;
-            xCross = u * u * s.x0 + 2.0f * u * t * s.x1 + t * t * s.x2;
-        }
-        if (xCross > px) {
-            winding += upward ? 1 : -1;
-        }
-    }
-    return winding;
-}
+// EvaluateWindingNumber precomputed per-row in BakeOutlineToSdfCell.
 
 // Compact crisp 8x12 printable ASCII bitmap font (U+0020 .. U+007E, 95 glyphs * 12 bytes = 1,140 bytes)
 // Used ONLY as built-in zero-file fallback so headless tests without .ttf render crisp readable ASCII SDF text.
@@ -600,16 +554,12 @@ void BakeBitmap8x12ToSdfCell(
 // TrueTypeFontFace Implementation
 // ============================================================================
 
-bool TrueTypeFontFace::LoadFromMemory(
-    const std::uint8_t* data,
-    std::size_t size,
-    std::string* outError) {
+bool TrueTypeFontFace::ParseLoadedBuffer(std::string* outError) {
     valid_ = false;
     isCff_ = false;
     weightClass_ = 400u;
     isItalic_ = false;
     contentHash_ = 0u;
-    data_.clear();
     familyName_.clear();
     fullName_.clear();
     cmap12Groups_.clear();
@@ -620,7 +570,9 @@ bool TrueTypeFontFace::LoadFromMemory(
     hasFormat4_ = false;
     isSymbolCmap_ = false;
 
-    if (!data || size < 12u) {
+    const std::size_t size = data_.size();
+    if (size < 12u) {
+        data_.clear();
         if (outError) {
             *outError = "TTF buffer is null or smaller than 12-byte offset table";
         }
@@ -630,19 +582,37 @@ bool TrueTypeFontFace::LoadFromMemory(
     std::uint64_t h = 14695981039346656037ULL;
     const std::size_t stride = (size > 65536u) ? (size / 16384u) : 1u;
     for (std::size_t i = 0u; i < size; i += stride) {
-        h ^= static_cast<std::uint64_t>(data[i]);
+        h ^= static_cast<std::uint64_t>(data_[i]);
         h *= 1099511628211ULL;
     }
     h ^= static_cast<std::uint64_t>(size);
     h *= 1099511628211ULL;
     contentHash_ = (h == 0u) ? 1u : h;
-    data_.assign(data, data + size);
     if (!ParseTables(outError)) {
         data_.clear();
         return false;
     }
     valid_ = true;
     return true;
+}
+
+bool TrueTypeFontFace::LoadFromMemory(
+    const std::uint8_t* data,
+    std::size_t size,
+    std::string* outError) {
+    if (!data || size < 12u) {
+        data_.clear();
+        return ParseLoadedBuffer(outError);
+    }
+    data_.assign(data, data + size);
+    return ParseLoadedBuffer(outError);
+}
+
+bool TrueTypeFontFace::LoadFromMemory(
+    std::vector<std::uint8_t>&& ownedData,
+    std::string* outError) {
+    data_ = std::move(ownedData);
+    return ParseLoadedBuffer(outError);
 }
 
 bool TrueTypeFontFace::LoadFromFile(std::string_view filePath, std::string* outError) {
@@ -670,7 +640,7 @@ bool TrueTypeFontFace::LoadFromFile(std::string_view filePath, std::string* outE
         return false;
     }
 
-    if (!LoadFromMemory(bytes.data(), bytes.size(), outError)) {
+    if (!LoadFromMemory(std::move(bytes), outError)) {
         return false;
     }
 
@@ -2536,19 +2506,31 @@ void FontAtlas::BlitCellR8Locked(
         return;
     }
     if (sdfPixels_.empty()) {
-        sdfPixels_.assign(static_cast<std::size_t>(atlasWidth_) * atlasHeight_, 0u);
+        sdfPixels_.assign(static_cast<std::size_t>(atlasWidth_) * glyphRegionHeight_, 0u);
     }
-    for (std::uint16_t r = 0u; r < cellH; ++r) {
-        if (dstY + r >= atlasHeight_) {
-            break;
-        }
+    const std::uint32_t maxRow = std::min<std::uint32_t>(
+        glyphRegionHeight_,
+        static_cast<std::uint32_t>(dstY) + static_cast<std::uint32_t>(cellH));
+    for (std::uint32_t absY = dstY; absY < maxRow; ++absY) {
+        const std::uint32_t r = absY - dstY;
         const std::size_t copyW = std::min<std::size_t>(
             cellW,
             atlasWidth_ - std::min<std::uint16_t>(dstX, atlasWidth_));
         std::memcpy(
-            sdfPixels_.data() + static_cast<std::size_t>(dstY + r) * atlasWidth_ + dstX,
+            sdfPixels_.data() + static_cast<std::size_t>(absY) * atlasWidth_ + dstX,
             srcPixels + static_cast<std::size_t>(r) * cellW,
             copyW);
+    }
+    if (maxRow > dstY) {
+        if (!hasDirtyRowSpan_) {
+            dirtyBaseRevision_ = revision_.load(std::memory_order_relaxed);
+            dirtyRowMin_ = dstY;
+            dirtyRowMax_ = maxRow;
+            hasDirtyRowSpan_ = true;
+        } else {
+            dirtyRowMin_ = std::min<std::uint32_t>(dirtyRowMin_, dstY);
+            dirtyRowMax_ = std::max<std::uint32_t>(dirtyRowMax_, maxRow);
+        }
     }
     revision_.fetch_add(1u, std::memory_order_release);
 }
@@ -2654,6 +2636,10 @@ void FontAtlas::ClearCustomFonts() {
     nextFontId_ = 1u;
     skyline_.Clear();
     std::fill(sdfPixels_.begin(), sdfPixels_.end(), 0u);
+    hasDirtyRowSpan_ = true;
+    dirtyRowMin_ = 0u;
+    dirtyRowMax_ = glyphRegionHeight_;
+    dirtyBaseRevision_ = 0u;
     revision_.fetch_add(1u, std::memory_order_release);
     InitBuiltInFallbackAscii();
     builtInAsciiReady_.store(true, std::memory_order_release);
@@ -2773,8 +2759,16 @@ void FontAtlas::BakeOutlineToSdfCell(
     const float maxCutoffDist = safeRange + 1.5f;
     const float maxCutoffSq = maxCutoffDist * maxCutoffDist;
 
+    struct RowWindingCrossing {
+        float xCross = 0.0f;
+        int delta = 0;
+    };
     std::vector<YMonotonicSeg> rowWindSegs;
     rowWindSegs.reserve(windSegs.size());
+    std::vector<RowWindingCrossing> rowCrossings;
+    rowCrossings.reserve(windSegs.size());
+    std::vector<int> rowSuffixWinding;
+    rowSuffixWinding.reserve(windSegs.size() + 1u);
     std::vector<const CellDistCurve*> rowDistCurves;
     rowDistCurves.reserve(distCurves.size());
 
@@ -2797,9 +2791,65 @@ void FontAtlas::BakeOutlineToSdfCell(
             // Entire row is outside and beyond maxCutoffDist -> QuantizeSdfByte(-maxCutoffDist, safeRange) == 0u
             continue;
         }
+        rowCrossings.clear();
+        for (const auto& s : rowWindSegs) {
+            if (sy < s.minY || sy >= s.maxY) {
+                continue;
+            }
+            const bool upward = (s.y0 <= sy && s.y2 > sy);
+            const bool downward = (s.y0 > sy && s.y2 <= sy);
+            if (!upward && !downward) {
+                continue;
+            }
+            float xCross = 0.0f;
+            if (!s.isQuadratic) {
+                const float t = (sy - s.y0) / (s.y2 - s.y0);
+                xCross = s.x0 + t * (s.x2 - s.x0);
+            } else {
+                const float a = s.y0 - 2.0f * s.y1 + s.y2;
+                const float b = s.y1 - s.y0;
+                const float c = s.y0 - sy;
+                float t = 0.0f;
+                if (std::fabs(a) <= 1e-5f) {
+                    const float dy = s.y2 - s.y0;
+                    t = (std::fabs(dy) > 1e-8f) ? (-c / dy) : 0.0f;
+                } else {
+                    const float disc = std::max(0.0f, b * b - a * c);
+                    const float root = std::sqrt(disc);
+                    if (upward) {
+                        const float denom = b + root;
+                        t = (std::fabs(denom) > 1e-8f) ? (-c / denom) : ((-b + root) / a);
+                    } else {
+                        const float denom = -b + root;
+                        t = (std::fabs(denom) > 1e-8f) ? (c / denom) : ((-b - root) / a);
+                    }
+                }
+                t = std::clamp(t, 0.0f, 1.0f);
+                const float u = 1.0f - t;
+                xCross = u * u * s.x0 + 2.0f * u * t * s.x1 + t * t * s.x2;
+            }
+            rowCrossings.push_back(RowWindingCrossing{xCross, upward ? 1 : -1});
+        }
+        std::sort(
+            rowCrossings.begin(),
+            rowCrossings.end(),
+            [](const RowWindingCrossing& lhs, const RowWindingCrossing& rhs) noexcept {
+                return lhs.xCross < rhs.xCross;
+            });
+        const std::size_t crossCount = rowCrossings.size();
+        rowSuffixWinding.resize(crossCount + 1u);
+        rowSuffixWinding[crossCount] = 0;
+        for (std::size_t ci = crossCount; ci > 0u; --ci) {
+            rowSuffixWinding[ci - 1u] = rowSuffixWinding[ci] + rowCrossings[ci - 1u].delta;
+        }
+        std::size_t crossCursor = 0u;
+
         for (std::uint16_t px = 0u; px < cellW; ++px) {
             const float sx = static_cast<float>(px) + 0.5f;
-            const bool inside = !rowWindSegs.empty() && (EvaluateWindingNumber(rowWindSegs, sx, sy) != 0);
+            while (crossCursor < crossCount && rowCrossings[crossCursor].xCross <= sx) {
+                ++crossCursor;
+            }
+            const bool inside = (rowSuffixWinding[crossCursor] != 0);
 
             float bestDistSq = maxCutoffSq;
             for (const CellDistCurve* cp : rowDistCurves) {
@@ -2830,6 +2880,7 @@ namespace {
 struct ProcessFontFaceCache {
     std::mutex mtx;
     std::unordered_map<std::uint64_t, std::shared_ptr<TrueTypeFontFace>> faces;
+    std::size_t totalBytes = 0u;
 
     static ProcessFontFaceCache& Instance() noexcept {
         static ProcessFontFaceCache inst;
@@ -2845,6 +2896,7 @@ struct ProcessBakedGlyphEntry {
 struct ProcessBakedGlyphCache {
     std::mutex mtx;
     std::unordered_map<std::uint64_t, ProcessBakedGlyphEntry> entries;
+    std::size_t totalBytes = 0u;
 
     static ProcessBakedGlyphCache& Instance() noexcept {
         static ProcessBakedGlyphCache inst;
@@ -2873,6 +2925,16 @@ bool FontAtlas::LoadTrueTypeFontFromMemory(
     std::string_view familyAlias,
     bool setAsDefault,
     std::string* outError) {
+    return LoadTrueTypeFontFromMemoryImpl(data, size, nullptr, familyAlias, setAsDefault, outError);
+}
+
+bool FontAtlas::LoadTrueTypeFontFromMemoryImpl(
+    const std::uint8_t* data,
+    std::size_t size,
+    std::vector<std::uint8_t>* optOwnedBytes,
+    std::string_view familyAlias,
+    bool setAsDefault,
+    std::string* outError) {
     const std::uint64_t blobKey = ComputeFontBlobKey(data, size);
     std::shared_ptr<TrueTypeFontFace> face;
     if (blobKey != 0u) {
@@ -2885,15 +2947,25 @@ bool FontAtlas::LoadTrueTypeFontFromMemory(
     }
     if (!face) {
         auto parsed = std::make_shared<TrueTypeFontFace>();
-        if (!parsed->LoadFromMemory(data, size, outError)) {
+        const bool ok = (optOwnedBytes != nullptr)
+            ? parsed->LoadFromMemory(std::move(*optOwnedBytes), outError)
+            : parsed->LoadFromMemory(data, size, outError);
+        if (!ok) {
             return false;
         }
         face = std::move(parsed);
         if (blobKey != 0u) {
             auto& fc = ProcessFontFaceCache::Instance();
             std::lock_guard<std::mutex> g(fc.mtx);
-            if (fc.faces.size() >= 64u) fc.faces.clear();
-            fc.faces.emplace(blobKey, face);
+            const std::size_t faceBytes = face->RawByteSize();
+            if (fc.faces.size() >= 64u || fc.totalBytes + faceBytes > 32u * 1024u * 1024u) {
+                fc.faces.clear();
+                fc.totalBytes = 0u;
+            }
+            if (faceBytes <= 32u * 1024u * 1024u) {
+                fc.totalBytes += faceBytes;
+                fc.faces.emplace(blobKey, face);
+            }
         }
     }
 
@@ -3039,7 +3111,8 @@ bool FontAtlas::LoadTrueTypeFontFromFile(
         }
         derivedAlias.assign(stem);
     }
-    return LoadTrueTypeFontFromMemory(buf.data(), buf.size(), derivedAlias, setAsDefault, outError);
+    const auto bufSize = buf.size();
+    return LoadTrueTypeFontFromMemoryImpl(buf.data(), bufSize, &buf, derivedAlias, setAsDefault, outError);
 }
 
 void FontAtlas::SetDefaultFontFamily(std::string_view familyName) {
@@ -3189,7 +3262,17 @@ FontAtlasGlyph FontAtlas::EnsureGlyphFromChainLocked(
         return EnsureGlyphLocked(chain.front(), codePoint);
     }
     for (const RegisteredFontEntry* entry : chain) {
-        if (entry && entry->face && entry->face->IsValid()) {
+        if (!entry) {
+            continue;
+        }
+        const std::uint64_t cacheKey = (static_cast<std::uint64_t>(entry->fontId) << 32u) | codePoint;
+        if (const auto it = glyphCache_.find(cacheKey); it != glyphCache_.end()) {
+            if (outChosenEntry) {
+                *outChosenEntry = entry;
+            }
+            return it->second;
+        }
+        if (entry->face && entry->face->IsValid()) {
             if (entry->face->FindGlyphIndex(codePoint) != 0u) {
                 if (outChosenEntry) {
                     *outChosenEntry = entry;
@@ -3337,8 +3420,15 @@ FontAtlasGlyph FontAtlas::EnsureGlyphLocked(
                     if (procGlyphKey != 0u) {
                         auto& pgc = ProcessBakedGlyphCache::Instance();
                         std::lock_guard<std::mutex> g(pgc.mtx);
-                        if (pgc.entries.size() >= 8192u) pgc.entries.clear();
-                        pgc.entries.emplace(procGlyphKey, ProcessBakedGlyphEntry{meta, cellPixels});
+                        const std::size_t cellBytes = cellPixels.size();
+                        if (pgc.entries.size() >= 8192u || pgc.totalBytes + cellBytes > 8u * 1024u * 1024u) {
+                            pgc.entries.clear();
+                            pgc.totalBytes = 0u;
+                        }
+                        if (cellBytes <= 8u * 1024u * 1024u) {
+                            pgc.totalBytes += cellBytes;
+                            pgc.entries.emplace(procGlyphKey, ProcessBakedGlyphEntry{meta, cellPixels});
+                        }
                     }
                 }
             }
@@ -3705,12 +3795,9 @@ TextLayoutResult FontAtlas::MeasureLayout(
     singleRun.fontSize = fontSize;
     singleRun.fontWeight = (fontWeight > 0) ? fontWeight : 400;
     singleRun.fontItalic = fontItalic ? 1 : 0;
-    std::vector<RichTextRunInput> runs;
-    if (!utf8Text.empty()) {
-        runs.push_back(singleRun);
-    }
-    return MeasureRichLayout(
-        runs,
+    return MeasureRichLayoutSpan(
+        &singleRun,
+        utf8Text.empty() ? 0u : 1u,
         fontFamily,
         fontSize,
         (fontWeight > 0) ? fontWeight : 400,
@@ -4017,6 +4104,36 @@ TextLayoutResult FontAtlas::MeasureRichLayout(
     bool baseRtl,
     TextTrimming trimMode,
     float maxHeight) {
+    return MeasureRichLayoutSpan(
+        runs.data(),
+        runs.size(),
+        defaultFontFamily,
+        defaultFontSize,
+        defaultFontWeight,
+        defaultItalic,
+        maxWidth,
+        wrapMode,
+        charSpacing,
+        explicitLineHeight,
+        baseRtl,
+        trimMode,
+        maxHeight);
+}
+
+TextLayoutResult FontAtlas::MeasureRichLayoutSpan(
+    const RichTextRunInput* runsData,
+    std::size_t runCount,
+    std::string_view defaultFontFamily,
+    float defaultFontSize,
+    int defaultFontWeight,
+    bool defaultItalic,
+    float maxWidth,
+    TextWrapping wrapMode,
+    float charSpacing,
+    float explicitLineHeight,
+    bool baseRtl,
+    TextTrimming trimMode,
+    float maxHeight) {
     TextLayoutResult result{};
     result.baseRtl = baseRtl;
     const float baseFont = std::max(1.0f, defaultFontSize);
@@ -4058,7 +4175,7 @@ TextLayoutResult FontAtlas::MeasureRichLayout(
         ? std::max(natBaseLineH, validExplicitLineH)
         : natBaseLineH;
 
-    if (runs.empty()) {
+    if (!runsData || runCount == 0u) {
         return result;
     }
 
@@ -4099,9 +4216,10 @@ TextLayoutResult FontAtlas::MeasureRichLayout(
         keepAliveFaces.push_back(sp);
     };
 
-    std::vector<const RegisteredFontEntry*> runChain;
+    std::vector<const RegisteredFontEntry*> scratchRunChain;
     std::uint32_t rawCodePointIdx = 0u;
-    for (const RichTextRunInput& run : runs) {
+    for (std::size_t runIdx = 0u; runIdx < runCount; ++runIdx) {
+        const RichTextRunInput& run = runsData[runIdx];
         if (run.text.empty()) {
             continue;
         }
@@ -4112,7 +4230,12 @@ TextLayoutResult FontAtlas::MeasureRichLayout(
         const bool runItalic = (run.fontItalic >= 0) ? (run.fontItalic != 0) : defaultItalic;
         const std::string_view runFamily = !run.fontFamily.empty() ? run.fontFamily : defaultFontFamily;
 
-        ResolveFontChainLocked(runFamily, runWeight, runItalic, runChain);
+        const bool matchesDefault =
+            (runFamily == defaultFontFamily) &&
+            (runWeight == baseWeight) &&
+            (runItalic == defaultItalic);
+        const std::vector<const RegisteredFontEntry*>& runChain =
+            matchesDefault ? defaultChain : (ResolveFontChainLocked(runFamily, runWeight, runItalic, scratchRunChain), scratchRunChain);
         const bool wantBold = (runWeight >= 600);
         const bool runHasCustom = !runChain.empty();
         if (runHasCustom) {
@@ -4970,12 +5093,83 @@ void FontAtlas::CopyGlyphRegionRgba8(
     }
 }
 
-float FontAtlas::SampleSdfBilinear(float u, float v) const noexcept {
+void FontAtlas::CopyGlyphDirtyBandRgba8(
+    std::uint32_t maxRows,
+    std::uint64_t& ioKnownRevision,
+    std::vector<std::uint8_t>& outRgba8,
+    std::uint32_t& outWidth,
+    std::uint32_t& outYOffset,
+    std::uint32_t& outRows,
+    bool& outFullBand) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    outWidth = atlasWidth_;
+    const std::uint32_t limitRows = std::min<std::uint32_t>(
+        maxRows,
+        std::min<std::uint32_t>(glyphRegionHeight_, atlasHeight_));
+    const std::uint64_t curRev = revision_.load(std::memory_order_relaxed);
+    if (limitRows == 0u || outWidth == 0u) {
+        outYOffset = 0u;
+        outRows = 0u;
+        outFullBand = false;
+        outRgba8.clear();
+        ioKnownRevision = curRev;
+        return;
+    }
+
+    const bool canPartial =
+        (ioKnownRevision != 0u) &&
+        hasDirtyRowSpan_ &&
+        (ioKnownRevision == dirtyBaseRevision_) &&
+        (dirtyRowMax_ > dirtyRowMin_) &&
+        (dirtyRowMin_ < limitRows);
+
+    const std::uint32_t y0 = canPartial ? dirtyRowMin_ : 0u;
+    const std::uint32_t y1 = canPartial ? std::min<std::uint32_t>(dirtyRowMax_, limitRows) : limitRows;
+    outYOffset = y0;
+    outRows = y1 - y0;
+    outFullBand = !canPartial;
+
+    const std::size_t startTexel = static_cast<std::size_t>(y0) * outWidth;
+    const std::size_t pixelCount = static_cast<std::size_t>(outWidth) * outRows;
+    outRgba8.resize(pixelCount * 4u);
+    std::uint8_t* __restrict dst = outRgba8.data();
+    const std::size_t availEnd = std::min(startTexel + pixelCount, sdfPixels_.size());
+    const std::size_t copyCount = (availEnd > startTexel) ? (availEnd - startTexel) : 0u;
+    const std::uint8_t* __restrict src = sdfPixels_.data() + startTexel;
+    for (std::size_t i = 0u; i < copyCount; ++i) {
+        const std::uint8_t sd = src[i];
+        const std::size_t base = i * 4u;
+        dst[base + 0u] = sd;
+        dst[base + 1u] = sd;
+        dst[base + 2u] = sd;
+        dst[base + 3u] = 255u;
+    }
+    for (std::size_t i = copyCount; i < pixelCount; ++i) {
+        const std::size_t base = i * 4u;
+        dst[base + 0u] = 0u;
+        dst[base + 1u] = 0u;
+        dst[base + 2u] = 0u;
+        dst[base + 3u] = 255u;
+    }
+
+    dirtyBaseRevision_ = curRev;
+    hasDirtyRowSpan_ = false;
+    dirtyRowMin_ = 0xFFFFFFFFu;
+    dirtyRowMax_ = 0u;
+    ioKnownRevision = curRev;
+}
+
+bool FontAtlas::AcquireSdfView(
+    const std::uint8_t*& outData,
+    std::uint16_t& outAtlasW,
+    std::uint16_t& outAtlasH,
+    std::uint16_t& outGlyphH) const noexcept {
     struct TlsFontView {
         std::uint64_t instanceId = 0u;
         std::uint64_t rev = 0u;
         std::uint16_t w = 0u;
         std::uint16_t h = 0u;
+        std::uint16_t glyphH = 0u;
         const std::uint8_t* data = nullptr;
     };
     thread_local TlsFontView tlsView{};
@@ -4983,28 +5177,51 @@ float FontAtlas::SampleSdfBilinear(float u, float v) const noexcept {
     if (tlsView.instanceId != instanceId_ || tlsView.rev != curRev) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (sdfPixels_.empty() || atlasWidth_ == 0u || atlasHeight_ == 0u) {
-            return 0.0f;
+            return false;
         }
         tlsView.instanceId = instanceId_;
-        tlsView.rev = curRev;
+        tlsView.rev = revision_.load(std::memory_order_acquire);
         tlsView.w = atlasWidth_;
         tlsView.h = atlasHeight_;
+        tlsView.glyphH = std::min<std::uint16_t>(
+            glyphRegionHeight_,
+            static_cast<std::uint16_t>(sdfPixels_.size() / atlasWidth_));
         tlsView.data = sdfPixels_.data();
     }
-    const std::uint16_t atlasWidth_ = tlsView.w;
-    const std::uint16_t atlasHeight_ = tlsView.h;
-    const std::uint8_t* const sdfPixels_ = tlsView.data;
+    outData = tlsView.data;
+    outAtlasW = tlsView.w;
+    outAtlasH = tlsView.h;
+    outGlyphH = tlsView.glyphH;
+    return outData != nullptr && outAtlasW > 0u && outAtlasH > 0u;
+}
+
+float FontAtlas::SampleSdfBilinear(float u, float v) const noexcept {
+    const std::uint8_t* sdfPixels_ = nullptr;
+    std::uint16_t atlasWidth_ = 0u;
+    std::uint16_t atlasHeight_ = 0u;
+    std::uint16_t glyphH = 0u;
+    if (!AcquireSdfView(sdfPixels_, atlasWidth_, atlasHeight_, glyphH)) {
+        return 0.0f;
+    }
     const float tx = std::clamp(u, 0.0f, 1.0f) * static_cast<float>(atlasWidth_) - 0.5f;
     const float ty = std::clamp(v, 0.0f, 1.0f) * static_cast<float>(atlasHeight_) - 0.5f;
 
-    const int x0 = std::clamp(static_cast<int>(std::floor(tx)), 0, static_cast<int>(atlasWidth_) - 1);
-    const int y0 = std::clamp(static_cast<int>(std::floor(ty)), 0, static_cast<int>(atlasHeight_) - 1);
+    const float flX = std::floor(tx);
+    const float flY = std::floor(ty);
+    const int x0 = std::clamp(static_cast<int>(flX), 0, static_cast<int>(atlasWidth_) - 1);
+    const int y0 = std::clamp(static_cast<int>(flY), 0, static_cast<int>(atlasHeight_) - 1);
     const int x1 = std::min(x0 + 1, static_cast<int>(atlasWidth_) - 1);
     const int y1 = std::min(y0 + 1, static_cast<int>(atlasHeight_) - 1);
-    const float fx = std::clamp(tx - std::floor(tx), 0.0f, 1.0f);
-    const float fy = std::clamp(ty - std::floor(ty), 0.0f, 1.0f);
+    const float fx = std::clamp(tx - flX, 0.0f, 1.0f);
+    const float fy = std::clamp(ty - flY, 0.0f, 1.0f);
 
-    const auto at = [&](int x, int y) noexcept -> float {
+    if (y0 >= static_cast<int>(glyphH)) {
+        return 0.0f;
+    }
+    auto at = [&](int x, int y) noexcept -> float {
+        if (y >= static_cast<int>(glyphH)) {
+            return 0.0f;
+        }
         return static_cast<float>(
                    sdfPixels_[static_cast<std::size_t>(y) * atlasWidth_ + static_cast<std::size_t>(x)]) *
                (1.0f / 255.0f);

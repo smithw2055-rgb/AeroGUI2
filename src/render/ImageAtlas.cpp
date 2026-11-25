@@ -1052,8 +1052,10 @@ bool DecodePngFromMemory(
     std::uint16_t transG = 0u;
     std::uint16_t transB = 0u;
 
+    const std::uint8_t* singleIdatPtr = nullptr;
+    std::size_t singleIdatLen = 0u;
+    std::size_t idatCount = 0u;
     std::vector<std::uint8_t> idatCompressed;
-    idatCompressed.reserve(size);
 
     std::size_t pos = 8u;
     while (pos + 12u <= size) {
@@ -1123,7 +1125,17 @@ bool DecodePngFromMemory(
                 transB = ReadBe16(chunkData + 4u);
             }
         } else if (std::memcmp(typePtr, "IDAT", 4u) == 0) {
-            idatCompressed.insert(idatCompressed.end(), chunkData, chunkData + chunkLen);
+            if (idatCount == 0u) {
+                singleIdatPtr = chunkData;
+                singleIdatLen = chunkLen;
+            } else {
+                if (idatCount == 1u) {
+                    idatCompressed.reserve(size);
+                    idatCompressed.insert(idatCompressed.end(), singleIdatPtr, singleIdatPtr + singleIdatLen);
+                }
+                idatCompressed.insert(idatCompressed.end(), chunkData, chunkData + chunkLen);
+            }
+            ++idatCount;
         } else if (std::memcmp(typePtr, "IEND", 4u) == 0) {
             seenIend = true;
             break;
@@ -1132,7 +1144,8 @@ bool DecodePngFromMemory(
         pos += static_cast<std::size_t>(chunkLen) + 4u; // skip CRC
     }
 
-    if (!seenIhdr || idatCompressed.empty() || (colorType == 3u && paletteEntries == 0u)) {
+    const bool hasIdat = (idatCount == 1u) ? (singleIdatLen > 0u) : !idatCompressed.empty();
+    if (!seenIhdr || !hasIdat || (colorType == 3u && paletteEntries == 0u)) {
         (void)seenIend;
         SetError(outError, "Incomplete PNG data (missing IHDR, PLTE, or IDAT).");
         return false;
@@ -1183,14 +1196,19 @@ bool DecodePngFromMemory(
         return false;
     }
 
+    const std::uint8_t* idatPtr = (idatCount == 1u) ? singleIdatPtr : idatCompressed.data();
+    const std::size_t idatLen = (idatCount == 1u) ? singleIdatLen : idatCompressed.size();
     std::vector<std::uint8_t> rawDecompressed;
     if (!DecompressZlib(
-            idatCompressed.data(),
-            idatCompressed.size(),
+            idatPtr,
+            idatLen,
             rawDecompressed,
             static_cast<std::size_t>(expectedDecompressedBytes))) {
         SetError(outError, "Failed to decompress PNG zlib IDAT stream.");
         return false;
+    }
+    if (!idatCompressed.empty()) {
+        std::vector<std::uint8_t>().swap(idatCompressed);
     }
 
     outImage.width = width;
@@ -1962,6 +1980,7 @@ bool DecodeJpegFromMemory(
                     InverseDct8x8(dequant, dstBlock, comp.planeStride);
                 }
             }
+            std::vector<std::int16_t>().swap(comp.progCoeffs);
         }
     }
 
@@ -2780,6 +2799,17 @@ bool ImageAtlas::RegisterEncodedMemoryAsset(
     return true;
 }
 
+void ImageAtlas::EnsureWritableAtlasPixelsLocked(
+    TextureSlotBuffer& atlasBuf,
+    std::uint32_t atlasSize) {
+    const std::size_t byteSize = static_cast<std::size_t>(atlasSize) * atlasSize * 4u;
+    if (!atlasBuf.cowAtlasPixels) {
+        atlasBuf.cowAtlasPixels = std::make_shared<std::vector<std::uint8_t>>(byteSize, 0u);
+    } else if (atlasBuf.cowAtlasPixels.use_count() > 1) {
+        atlasBuf.cowAtlasPixels = std::make_shared<std::vector<std::uint8_t>>(*atlasBuf.cowAtlasPixels);
+    }
+}
+
 void ImageAtlas::EnsureSharedAtlasAllocatedLocked() {
     if (textureSlots_.find(kSharedUiAtlasTextureId) != textureSlots_.end()) {
         return;
@@ -2790,9 +2820,7 @@ void ImageAtlas::EnsureSharedAtlasAllocatedLocked() {
     slot.height = sharedAtlasSize_;
     slot.dirtyRevision = 1u;
     slot.isAtlas = true;
-    slot.rgbaPixels.assign(
-        static_cast<std::size_t>(sharedAtlasSize_) * sharedAtlasSize_ * 4u, 0u);
-    // Defer pixelSnapshot materialization lazily until CPU software sampling requests it
+    EnsureWritableAtlasPixelsLocked(slot, sharedAtlasSize_);
     slot.pixelSnapshot.reset();
     slot.hasDirtyRect = false;
     slot.dirtyBaseRevision = 1u;
@@ -2826,17 +2854,22 @@ void ImageAtlas::BlitWithExtrudedBorderLocked(
     std::uint32_t iw,
     std::uint32_t ih,
     const std::uint8_t* srcPixels) noexcept {
+    EnsureWritableAtlasPixelsLocked(atlasBuf, atlasBuf.width);
+    std::uint8_t* const atlasData = atlasBuf.cowAtlasPixels ? atlasBuf.cowAtlasPixels->data() : nullptr;
+    if (!atlasData) {
+        return;
+    }
     const std::uint32_t aw = atlasBuf.width;
 
     auto copyTexel = [&](std::uint32_t dstX, std::uint32_t dstY, std::uint32_t srcX, std::uint32_t srcY) noexcept {
-        std::uint8_t* dst = atlasBuf.rgbaPixels.data() + (static_cast<std::size_t>(dstY) * aw + dstX) * 4u;
+        std::uint8_t* dst = atlasData + (static_cast<std::size_t>(dstY) * aw + dstX) * 4u;
         const std::uint8_t* src = srcPixels + (static_cast<std::size_t>(srcY) * iw + srcX) * 4u;
         std::memcpy(dst, src, 4u);
     };
 
     // Copy interior rows
     for (std::uint32_t y = 0u; y < ih; ++y) {
-        std::uint8_t* dstRow = atlasBuf.rgbaPixels.data() +
+        std::uint8_t* dstRow = atlasData +
             (static_cast<std::size_t>(innerY + y) * aw + innerX) * 4u;
         const std::uint8_t* srcRow = srcPixels + static_cast<std::size_t>(y) * iw * 4u;
         std::memcpy(dstRow, srcRow, static_cast<std::size_t>(iw) * 4u);
@@ -2852,7 +2885,7 @@ void ImageAtlas::BlitWithExtrudedBorderLocked(
 
     // 1px top & bottom extruded border + 4 corners
     if (innerY > 0u) {
-        std::uint8_t* topDst = atlasBuf.rgbaPixels.data() +
+        std::uint8_t* topDst = atlasData +
             (static_cast<std::size_t>(innerY - 1u) * aw + innerX) * 4u;
         const std::uint8_t* topSrc = srcPixels;
         std::memcpy(topDst, topSrc, static_cast<std::size_t>(iw) * 4u);
@@ -2860,7 +2893,7 @@ void ImageAtlas::BlitWithExtrudedBorderLocked(
         if (innerX + iw < aw) copyTexel(innerX + iw, innerY - 1u, iw - 1u, 0u);
     }
     if (innerY + ih < atlasBuf.height) {
-        std::uint8_t* botDst = atlasBuf.rgbaPixels.data() +
+        std::uint8_t* botDst = atlasData +
             (static_cast<std::size_t>(innerY + ih) * aw + innerX) * 4u;
         const std::uint8_t* botSrc = srcPixels + static_cast<std::size_t>(ih - 1u) * iw * 4u;
         std::memcpy(botDst, botSrc, static_cast<std::size_t>(iw) * 4u);
@@ -2868,7 +2901,6 @@ void ImageAtlas::BlitWithExtrudedBorderLocked(
         if (innerX + iw < aw) copyTexel(innerX + iw, innerY + ih, iw - 1u, ih - 1u);
     }
 
-    // Invalidate cached CPU snapshot without deep-copying 16MB on every icon blit!
     atlasBuf.pixelSnapshot.reset();
     const std::uint32_t bx0 = (innerX > 0u) ? (innerX - 1u) : 0u;
     const std::uint32_t by0 = (innerY > 0u) ? (innerY - 1u) : 0u;
@@ -2969,32 +3001,51 @@ const ImageAtlasEntry* ImageAtlas::InsertDecodedLocked(
     if (!image.Valid()) {
         return nullptr;
     }
+    auto pixels = std::make_shared<const std::vector<std::uint8_t>>(std::move(image.rgbaPixels));
+    return InsertDecodedSharedLocked(
+        std::move(canonicalKey),
+        image.width,
+        image.height,
+        std::move(pixels),
+        forceStandalone);
+}
+
+const ImageAtlasEntry* ImageAtlas::InsertDecodedSharedLocked(
+    std::string canonicalKey,
+    std::uint32_t width,
+    std::uint32_t height,
+    std::shared_ptr<const std::vector<std::uint8_t>> pixels,
+    bool forceStandalone) {
+    const std::size_t expectedBytes = static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4u;
+    if (width == 0u || height == 0u || !pixels || pixels->size() != expectedBytes) {
+        return nullptr;
+    }
 
     if (const auto existing = entries_.find(canonicalKey); existing != entries_.end()) {
         return &existing->second;
     }
 
     const bool fitsPackThreshold = !forceStandalone &&
-        image.width <= maxPackableWidth_ &&
-        image.height <= maxPackableHeight_ &&
-        (image.width + 2u) <= sharedAtlasSize_ &&
-        (image.height + 2u) <= sharedAtlasSize_;
+        width <= maxPackableWidth_ &&
+        height <= maxPackableHeight_ &&
+        (width + 2u) <= sharedAtlasSize_ &&
+        (height + 2u) <= sharedAtlasSize_;
 
     ImageAtlasEntry entry{};
     entry.uriKey = canonicalKey;
-    entry.width = image.width;
-    entry.height = image.height;
+    entry.width = width;
+    entry.height = height;
 
     bool packedInSharedAtlas = false;
     if (fitsPackThreshold) {
         EnsureSharedAtlasAllocatedLocked();
         std::uint32_t paddedX = 0u;
         std::uint32_t paddedY = 0u;
-        if (TryAllocateSkylineRectLocked(image.width + 2u, image.height + 2u, paddedX, paddedY)) {
+        if (TryAllocateSkylineRectLocked(width + 2u, height + 2u, paddedX, paddedY)) {
             const std::uint32_t innerX = paddedX + 1u;
             const std::uint32_t innerY = paddedY + 1u;
             TextureSlotBuffer& sharedBuf = textureSlots_[kSharedUiAtlasTextureId];
-            BlitWithExtrudedBorderLocked(sharedBuf, innerX, innerY, image);
+            BlitWithExtrudedBorderLocked(sharedBuf, innerX, innerY, width, height, pixels->data());
 
             const float invAtlasW = 1.0f / static_cast<float>(sharedAtlasSize_);
             const float invAtlasH = 1.0f / static_cast<float>(sharedAtlasSize_);
@@ -3005,8 +3056,8 @@ const ImageAtlasEntry* ImageAtlas::InsertDecodedLocked(
             entry.atlasHeight = sharedAtlasSize_;
             entry.u0 = static_cast<float>(innerX) * invAtlasW;
             entry.v0 = static_cast<float>(innerY) * invAtlasH;
-            entry.u1 = static_cast<float>(innerX + image.width) * invAtlasW;
-            entry.v1 = static_cast<float>(innerY + image.height) * invAtlasH;
+            entry.u1 = static_cast<float>(innerX + width) * invAtlasW;
+            entry.v1 = static_cast<float>(innerY + height) * invAtlasH;
             entry.isStandalone = false;
             packedInSharedAtlas = true;
         }
@@ -3017,11 +3068,11 @@ const ImageAtlasEntry* ImageAtlas::InsertDecodedLocked(
         const std::uint64_t pendingRev = revision_.load(std::memory_order_relaxed) + 1u;
         TextureSlotBuffer slot{};
         slot.textureId = texId;
-        slot.width = image.width;
-        slot.height = image.height;
+        slot.width = width;
+        slot.height = height;
         slot.dirtyRevision = static_cast<std::uint32_t>(pendingRev != 0u ? pendingRev : 1u);
         slot.isAtlas = false;
-        slot.pixelSnapshot = std::make_shared<const std::vector<std::uint8_t>>(std::move(image.rgbaPixels));
+        slot.pixelSnapshot = std::move(pixels);
         slot.rgbaPixels.clear();
         textureSlots_.emplace(texId, std::move(slot));
         revision_.fetch_add(1u, std::memory_order_release);
@@ -3784,22 +3835,28 @@ const ImageAtlasEntry* ImageAtlas::LoadOrGet(
         }
     }
 
+    struct CachedDecodedImage {
+        std::uint32_t width = 0u;
+        std::uint32_t height = 0u;
+        std::shared_ptr<const std::vector<std::uint8_t>> rgbaPixels;
+    };
+
     struct GlobalDecodedFileCache {
         std::mutex mutex;
-        std::unordered_map<std::string, DecodedImage> byKey;
+        std::unordered_map<std::string, CachedDecodedImage> byKey;
         std::size_t totalBytes = 0u;
 
-        void InsertBounded(const std::string& key, const DecodedImage& img) {
-            constexpr std::size_t kMaxCacheEntries = 96u;
-            constexpr std::size_t kMaxCacheBytes = 64u * 1024u * 1024u;
-            const std::size_t imgBytes = img.rgbaPixels.size();
-            if (imgBytes > 32u * 1024u * 1024u || imgBytes > kMaxCacheBytes) {
+        void InsertBounded(const std::string& key, const CachedDecodedImage& img) {
+            constexpr std::size_t kMaxCacheEntries = 64u;
+            constexpr std::size_t kMaxCacheBytes = 32u * 1024u * 1024u;
+            const std::size_t imgBytes = img.rgbaPixels ? img.rgbaPixels->size() : 0u;
+            if (imgBytes == 0u || imgBytes > 24u * 1024u * 1024u || imgBytes > kMaxCacheBytes) {
                 return;
             }
             std::lock_guard<std::mutex> dLock(mutex);
             const auto existing = byKey.find(key);
             if (existing != byKey.end()) {
-                const std::size_t oldBytes = existing->second.rgbaPixels.size();
+                const std::size_t oldBytes = existing->second.rgbaPixels ? existing->second.rgbaPixels->size() : 0u;
                 totalBytes = (totalBytes >= oldBytes) ? (totalBytes - oldBytes) : 0u;
                 byKey.erase(existing);
             }
@@ -3813,7 +3870,7 @@ const ImageAtlasEntry* ImageAtlas::LoadOrGet(
     };
     static GlobalDecodedFileCache sDecodedFileCache;
 
-    DecodedImage decoded{};
+    CachedDecodedImage sharedDecoded{};
     std::string canonicalKey;
     if (!memCopy.empty()) {
         std::uint64_t h64 = 1469598103934665603ULL;
@@ -3827,15 +3884,20 @@ const ImageAtlasEntry* ImageAtlas::LoadOrGet(
             std::lock_guard<std::mutex> dLock(sDecodedFileCache.mutex);
             const auto cit = sDecodedFileCache.byKey.find(memCacheKey);
             if (cit != sDecodedFileCache.byKey.end()) {
-                decoded = cit->second;
+                sharedDecoded = cit->second;
                 hitMemCache = true;
             }
         }
         if (!hitMemCache) {
+            DecodedImage decoded{};
             if (!DecodeImageFromMemory(memCopy.data(), memCopy.size(), decoded)) {
                 return nullptr;
             }
-            sDecodedFileCache.InsertBounded(memCacheKey, decoded);
+            sharedDecoded.width = decoded.width;
+            sharedDecoded.height = decoded.height;
+            sharedDecoded.rgbaPixels =
+                std::make_shared<const std::vector<std::uint8_t>>(std::move(decoded.rgbaPixels));
+            sDecodedFileCache.InsertBounded(memCacheKey, sharedDecoded);
         }
         canonicalKey = clean;
     } else if (!resolvedDiskPath.empty()) {
@@ -3845,15 +3907,20 @@ const ImageAtlasEntry* ImageAtlas::LoadOrGet(
             std::lock_guard<std::mutex> dLock(sDecodedFileCache.mutex);
             const auto cit = sDecodedFileCache.byKey.find(diskCacheKey);
             if (cit != sDecodedFileCache.byKey.end()) {
-                decoded = cit->second;
+                sharedDecoded = cit->second;
                 hitDiskCache = true;
             }
         }
         if (!hitDiskCache) {
+            DecodedImage decoded{};
             if (!DecodeImageFromFile(resolvedDiskPath, decoded)) {
                 return nullptr;
             }
-            sDecodedFileCache.InsertBounded(diskCacheKey, decoded);
+            sharedDecoded.width = decoded.width;
+            sharedDecoded.height = decoded.height;
+            sharedDecoded.rgbaPixels =
+                std::make_shared<const std::vector<std::uint8_t>>(std::move(decoded.rgbaPixels));
+            sDecodedFileCache.InsertBounded(diskCacheKey, sharedDecoded);
         }
         canonicalKey = resolvedDiskPath;
     } else {
@@ -3861,7 +3928,12 @@ const ImageAtlasEntry* ImageAtlas::LoadOrGet(
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
-    return InsertDecodedLocked(std::move(canonicalKey), std::move(decoded), false);
+    return InsertDecodedSharedLocked(
+        std::move(canonicalKey),
+        sharedDecoded.width,
+        sharedDecoded.height,
+        std::move(sharedDecoded.rgbaPixels),
+        false);
 }
 
 bool ImageAtlas::HasTextureSlot(std::uint32_t textureId) const noexcept {
@@ -3895,7 +3967,10 @@ bool ImageAtlas::TryGetTextureSlotSnapshot(
         return false;
     }
     const TextureSlotBuffer& slot = it->second;
-    std::shared_ptr<const std::vector<std::uint8_t>> snap = slot.pixelSnapshot;
+    std::shared_ptr<const std::vector<std::uint8_t>> snap =
+        slot.cowAtlasPixels
+            ? std::static_pointer_cast<const std::vector<std::uint8_t>>(slot.cowAtlasPixels)
+            : slot.pixelSnapshot;
     if (!snap && !slot.rgbaPixels.empty()) {
         try {
             snap = std::make_shared<const std::vector<std::uint8_t>>(slot.rgbaPixels);
@@ -3933,7 +4008,9 @@ bool ImageAtlas::CopyTextureSlotIfModified(
         return false;
     }
     const TextureSlotBuffer& slot = it->second;
-    const std::vector<std::uint8_t>& px = slot.pixelSnapshot ? *slot.pixelSnapshot : slot.rgbaPixels;
+    const std::vector<std::uint8_t>& px =
+        slot.cowAtlasPixels ? *slot.cowAtlasPixels
+                            : (slot.pixelSnapshot ? *slot.pixelSnapshot : slot.rgbaPixels);
     const std::size_t expectedBytes = static_cast<std::size_t>(slot.width) * slot.height * 4u;
     if (slot.width == 0u || slot.height == 0u || px.size() < expectedBytes) {
         outWidth = 0u;
@@ -3970,7 +4047,9 @@ bool ImageAtlas::CopyTextureSlotDirtySubRectIfModified(
         return false;
     }
     const TextureSlotBuffer& slot = it->second;
-    const std::vector<std::uint8_t>& px = slot.pixelSnapshot ? *slot.pixelSnapshot : slot.rgbaPixels;
+    const std::vector<std::uint8_t>& px =
+        slot.cowAtlasPixels ? *slot.cowAtlasPixels
+                            : (slot.pixelSnapshot ? *slot.pixelSnapshot : slot.rgbaPixels);
     const std::size_t expectedBytes = static_cast<std::size_t>(slot.width) * slot.height * 4u;
     if (slot.width == 0u || slot.height == 0u || px.size() < expectedBytes) {
         outSlotWidth = 0u;
@@ -4058,7 +4137,10 @@ Color ImageAtlas::SampleBilinearRgba(std::uint32_t textureId, float u, float v) 
             return Color{1.0f, 1.0f, 1.0f, 1.0f};
         }
         const TextureSlotBuffer& sBuf = it->second;
-        std::shared_ptr<const std::vector<std::uint8_t>> snap = sBuf.pixelSnapshot;
+        std::shared_ptr<const std::vector<std::uint8_t>> snap =
+            sBuf.cowAtlasPixels
+                ? std::static_pointer_cast<const std::vector<std::uint8_t>>(sBuf.cowAtlasPixels)
+                : sBuf.pixelSnapshot;
         if (!snap && !sBuf.rgbaPixels.empty()) {
             try {
                 snap = std::make_shared<const std::vector<std::uint8_t>>(sBuf.rgbaPixels);

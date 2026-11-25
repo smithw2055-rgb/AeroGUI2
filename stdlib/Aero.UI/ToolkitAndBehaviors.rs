@@ -63,21 +63,24 @@ public class DateTimeControl : Control {
 
     public static void TickLiveClocks() {
         if (_liveClocks == null || _liveClocks.Length == 0) { return; }
-        var alive = new DateTimeControl[0];
+        int w = 0;
         for (int i = 0; i < _liveClocks.Length; i += 1) {
             DateTimeControl dt = _liveClocks[i];
             if (dt == null || dt._isDisposedTree) { continue; }
-            alive.Push(dt);
+            if (w != i) { _liveClocks[w] = dt; }
+            w += 1;
             if (dt._useSystemTime) {
                 dt.SyncFromSystemTime();
             }
         }
-        _liveClocks = alive;
+        while (_liveClocks.Length > w) {
+            _liveClocks.RemoveAt(_liveClocks.Length - 1);
+        }
     }
 
     public void SyncFromSystemTime() {
         if (!_useSystemTime || _isDisposedTree) { return; }
-        Host_RequestWake();
+        Host_RequestWakeAfterMs(100);
         int yr = Host_GetLocalTimePart(0);
         int mo = Host_GetLocalTimePart(1);
         int dy = Host_GetLocalTimePart(2);
@@ -1825,9 +1828,12 @@ public class BehaviorEventTrigger : BehaviorTriggerBase {
         for (int i = 0; i < _pendingTriggers.Length; i += 1) {
             if (_pendingTriggers[i] == trig && _pendingOwners[i] == owner) { return; }
         }
+        _lastRetryTreeEpoch = -1;
         _pendingTriggers.Push(trig);
         _pendingOwners.Push(owner);
     }
+
+    private static int _lastRetryTreeEpoch = -1;
 
     internal static void CleanupDisposedPending() {
         if (_pendingTriggers == null || _pendingOwners == null) { return; }
@@ -1841,8 +1847,9 @@ public class BehaviorEventTrigger : BehaviorTriggerBase {
 
     public static void RetryPendingAttaches() {
         if (_pendingTriggers == null || _pendingTriggers.Length == 0) { return; }
-        var remT = new BehaviorEventTrigger[0];
-        var remO = new UIElement[0];
+        if (UIElement._treeParentEpoch == _lastRetryTreeEpoch) { return; }
+        _lastRetryTreeEpoch = UIElement._treeParentEpoch;
+        int w = 0;
         for (int i = 0; i < _pendingTriggers.Length; i += 1) {
             BehaviorEventTrigger trig = _pendingTriggers[i];
             UIElement owner = _pendingOwners[i];
@@ -1851,12 +1858,18 @@ public class BehaviorEventTrigger : BehaviorTriggerBase {
             if (src != null) {
                 trig.WireSourceEvents(src, owner);
             } else {
-                remT.Push(trig);
-                remO.Push(owner);
+                if (w != i) {
+                    _pendingTriggers[w] = trig;
+                    _pendingOwners[w] = owner;
+                }
+                w += 1;
             }
         }
-        _pendingTriggers = remT;
-        _pendingOwners = remO;
+        while (_pendingTriggers.Length > w) {
+            int last = _pendingTriggers.Length - 1;
+            _pendingTriggers.RemoveAt(last);
+            _pendingOwners.RemoveAt(last);
+        }
     }
 
     public override void Attach(UIElement associatedObject) {
@@ -2662,8 +2675,10 @@ public class PropertyChangedTrigger : BehaviorTriggerBase {
         }
     }
 
-    private void CheckTarget(UIElement owner) {
-        PruneDisposedTargets();
+    private static int _lastPctCleanupDisposeEpoch = -1;
+
+    private void CheckTarget(UIElement owner, bool prune = true) {
+        if (prune) { PruneDisposedTargets(); }
         Binding b = this.Binding;
         if (owner == null || owner._isDisposedTree || b == null || owner.IsInsideClosedPopup()) { return; }
         int existingIdx = -1;
@@ -2685,8 +2700,7 @@ public class PropertyChangedTrigger : BehaviorTriggerBase {
                     }
                     _cachedSrcEls[existingIdx] = se;
                 }
-                if (se != null && BindingEntry.CanUseFastElementPropEpoch(se, bp) &&
-                    (se.GetPropertyValue(bp) != null || se.IsExplicitNullProperty(bp) || se.DataContext == null)) {
+                if (se != null && BindingEntry.CanUseFastElementPropEpoch(se, bp)) {
                     int ep = BindingEntry.GetFastElementEpoch(se, bp);
                     if (ep >= 0 && ep == _cachedSrcEpochs[existingIdx]) {
                         return;
@@ -2725,10 +2739,13 @@ public class PropertyChangedTrigger : BehaviorTriggerBase {
     }
 
     public static void FlushAll() {
-        if (_allPct == null) { return; }
-        CleanupDisposed();
+        if (_allPct == null || _allPct.Length == 0) { return; }
+        if (UIElement._disposeEpoch != _lastPctCleanupDisposeEpoch) {
+            _lastPctCleanupDisposeEpoch = UIElement._disposeEpoch;
+            CleanupDisposed();
+        }
         for (int i = 0; i < _allPct.Length; i += 1) {
-            _allPct[i].CheckTarget(_allPctOwners[i]);
+            _allPct[i].CheckTarget(_allPctOwners[i], false);
         }
     }
 
@@ -2745,9 +2762,9 @@ public class PropertyChangedTrigger : BehaviorTriggerBase {
         }
         _allPct.Push(this);
         _allPctOwners.Push(associatedObject);
-        CheckTarget(associatedObject);
-        associatedObject.Loaded += (object s, RoutedEventArgs e) => { CheckTarget(associatedObject); };
-        associatedObject.DataContextChanged += (object s, DependencyPropertyChangedEventArgs e) => { CheckTarget(associatedObject); };
+        CheckTarget(associatedObject, false);
+        associatedObject.Loaded += (object s, RoutedEventArgs e) => { CheckTarget(associatedObject, true); };
+        associatedObject.DataContextChanged += (object s, DependencyPropertyChangedEventArgs e) => { CheckTarget(associatedObject, true); };
     }
 }
 

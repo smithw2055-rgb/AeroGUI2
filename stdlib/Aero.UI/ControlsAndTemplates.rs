@@ -129,6 +129,9 @@ public class Control : FrameworkElement {
     private bool _hasExplicitFontWeight = false;
     private bool _hasExplicitForeground = false;
     private bool _isTabStop = true;
+    private bool _templateHasVsm = false;
+    private bool _nativeBoxStyleZeroed = false;
+    private bool _nativePaddingZeroed = false;
 
     public Control() : base(VisualKind.Box) {
         if (_fontFamily == null || _fontFamily.Length == 0) { _fontFamily = "Segoe UI"; }
@@ -218,6 +221,11 @@ public class Control : FrameworkElement {
             _hasTemplateResources = (_template != null && (_template.HasResources() || _template.RawResourcesOrNull() != null));
             _hasTemplateAmbientResources = (_template != null && _template.AmbientResources != null);
             _templateApplied = false;
+            _templateHasVsm = false;
+            if (_template == null) {
+                _nativeBoxStyleZeroed = false;
+                _nativePaddingZeroed = false;
+            }
             if (UIElement._closedPopupBuildDepth > 0) { return; }
             ApplyTemplate();
         }
@@ -246,7 +254,7 @@ public class Control : FrameworkElement {
     }
 
     protected virtual void UpdateVisualStates(bool useTransitions) {
-        if (_templateRoot == null && _vsgBox == null) { return; }
+        if (!_templateHasVsm && _vsgBox == null && !VisualStateManager._anyNonControlVsg) { return; }
         UpdateCommonVisualStates(useTransitions);
         VisualStateManager.GoToState(this, IsFocused ? "Focused" : "Unfocused", useTransitions);
     }
@@ -259,20 +267,26 @@ public class Control : FrameworkElement {
     protected override void SyncBoxStyleToNative() {
         if (!ParseUtil.IsValidHandle(__nativeHandle)) { return; }
         if (_template != null) {
+            if (_nativeBoxStyleZeroed) { return; }
+            _nativeBoxStyleZeroed = true;
             Visual_SetBoxStyle(__nativeHandle, 0u, 0u, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
             Visual_SetBoxGradients(__nativeHandle, -1, -1);
             Visual_SetBoxBrushOpacity(__nativeHandle, 1.0f);
             return;
         }
+        _nativeBoxStyleZeroed = false;
         base.SyncBoxStyleToNative();
     }
 
     protected override void SyncPadding() {
         if (!ParseUtil.IsValidHandle(__nativeHandle)) { return; }
         if (_template != null) {
+            if (_nativePaddingZeroed) { return; }
+            _nativePaddingZeroed = true;
             Visual_SetPadding(__nativeHandle, 0.0f, 0.0f, 0.0f, 0.0f);
             return;
         }
+        _nativePaddingZeroed = false;
         base.SyncPadding();
     }
 
@@ -505,8 +519,22 @@ public class Control : FrameworkElement {
         if (_templateRoot != null && HasLoadedFired() && !_loadingSelf) {
             _templateRoot.EnsureLoadedSubtree();
         }
+        _templateHasVsm = (_templateRoot != null) && Control.SubtreeHasVsm(_templateRoot, this);
         UpdateVisualStates(false);
         return _templateRoot != null;
+    }
+
+    private static bool SubtreeHasVsm(UIElement node, UIElement owner) {
+        if (node == null) { return false; }
+        if (node._vsgBox != null) { return true; }
+        int cc = node.ChildCount();
+        for (int c = 0; c < cc; c += 1) {
+            UIElement ch = node.ChildAt(c);
+            if (ch != null && ch.TemplatedParent == owner && Control.SubtreeHasVsm(ch, owner)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static void MarkTemplateOwner(UIElement rootEl, Control owner) {
@@ -519,7 +547,7 @@ public class Control : FrameworkElement {
             UIElement el = q[idx];
             idx += 1;
             if (el == null) { continue; }
-            if (el.TemplatedParent == null) { el.TemplatedParent = ownerEl; }
+            if (el.TemplatedParent == null) { el.SetTemplatedParentDirect(ownerEl); }
             if (el is ContentPresenter || el.TemplatedParent != ownerEl) { continue; }
             for (int i = 0; i < el.ChildCount(); i += 1) {
                 q.Push(el.ChildAt(i));
