@@ -597,6 +597,15 @@ public:
     bool BindOwner(VisualNodeId id, ObjectRef owner, std::uint32_t callbackMask);
     [[nodiscard]] ObjectRef GetOwner(VisualNodeId id) const noexcept;
 
+    // Lightweight ephemeron object boxes (zero VisualNode allocation)
+    [[nodiscard]] NativeHandle CreateObjectBox();
+    [[nodiscard]] bool IsObjectBoxHandle(NativeHandle handle) const noexcept;
+    bool BindObjectBox(NativeHandle handle, const rs_rt::Value& val, std::uint32_t flags);
+    [[nodiscard]] rs_rt::Value GetObjectBoxValue(NativeHandle handle) const noexcept;
+    bool DestroyObjectBox(NativeHandle handle) noexcept;
+    std::size_t SweepDeadObjectBoxes() noexcept;
+    [[nodiscard]] std::size_t LiveObjectBoxCount() const noexcept { return liveObjectBoxCount_; }
+
     // Geometry & Layout
     bool SetSize(VisualNodeId id, float width, float height) noexcept;
     bool SetMinMaxSize(VisualNodeId id, float minW, float minH, float maxW, float maxH) noexcept;
@@ -843,10 +852,25 @@ public:
     [[nodiscard]] std::size_t LiveNodeCount() const noexcept { return liveCount_; }
     [[nodiscard]] std::uint64_t DestroyedNodeCount() const noexcept { return destroyedCount_; }
     [[nodiscard]] std::size_t ArenaSlotCount() const noexcept { return nodes_.size(); }
+    [[nodiscard]] std::size_t EstimatedMemoryBytes() const noexcept;
     [[nodiscard]] VisualNode* NodeAtSlot(std::size_t slot) noexcept;
     [[nodiscard]] const VisualNode* NodeAtSlot(std::size_t slot) const noexcept;
 
 private:
+    struct ObjectBoxSlot {
+        bool alive = false;
+        std::uint32_t index = 0u;
+        std::uint32_t generation = 0u;
+        NativeHandle nativeHandle{};
+        rs_rt::Value value{};
+        ObjectRef ownerBox{};
+        PersistentRoot pinnedValueRoot{};
+    };
+
+    [[nodiscard]] ObjectBoxSlot* ResolveObjectBox(NativeHandle handle) noexcept;
+    [[nodiscard]] const ObjectBoxSlot* ResolveObjectBox(NativeHandle handle) const noexcept;
+    void RefreshObjectBoxPin(ObjectBoxSlot& slot) noexcept;
+
     void MarkAncestorsDirty(VisualNodeId id, VisualDirtyFlags flags) noexcept;
     void DetachFromParent(VisualNode& child) noexcept;
     void DestroySubtreeDetached(VisualNodeId id) noexcept;
@@ -857,6 +881,7 @@ private:
     void RefreshSubtreeDepths(VisualNodeId id, std::uint16_t depth) noexcept;
 
     SymbolId visualNodeTypeId_ = 0u;
+    SymbolId objectBoxTypeId_ = 0u;
     NativeHandleRegistry ownedFallbackRegistry_;
     NativeHandleRegistry* handleRegistry_ = nullptr;
     UIResourceStore* resourceStore_ = nullptr;
@@ -864,6 +889,9 @@ private:
 
     ChunkedArena<VisualNode, 256> nodes_;
     std::vector<std::uint32_t> freeIndices_;
+    ChunkedArena<ObjectBoxSlot, 256> objectBoxes_;
+    std::vector<std::uint32_t> freeObjectBoxIndices_;
+    std::size_t liveObjectBoxCount_ = 0u;
     std::vector<VisualNodeId> canvasDrawNodes_;
     mutable std::vector<std::pair<VisualNodeId, std::uint16_t>> depthRefreshStack_;
     VisualNodeId rootId_{};

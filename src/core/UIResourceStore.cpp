@@ -965,4 +965,17 @@ void UIResourceStore::ClearAll() noexcept {
     pathMaskFrameStartSeq_ = 0u;
 }
 
+std::size_t UIResourceStore::EstimatedMemoryBytes() const noexcept {
+    std::size_t total = 0u;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        total += pathMaskTotalBytes_;
+        for (const auto& [k, e] : mtsdfEntries_) {
+            (void)k;
+            total += e.mtsdfRgbaPixels.capacity();
+        }
+    }
+    return total;
+}
+
 } // namespace aero

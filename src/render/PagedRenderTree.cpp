@@ -2853,4 +2853,19 @@ void PagedRenderTree::ClearDirtyPages() noexcept {
     dirtyPageList_.clear();
 }
 
+std::size_t PagedRenderTree::EstimatedMemoryBytes() const noexcept {
+    std::size_t total = pages_.capacity() * sizeof(CommandPage);
+    total += pageScreenBounds_.capacity() * sizeof(Rect);
+    total += pageBoundsState_.capacity() * sizeof(std::uint8_t);
+    total += pageClipWPoolIndices_.capacity() * sizeof(std::uint32_t);
+    total += pageClipWPool_.capacity() * sizeof(std::array<float, kVerticesPerCommandPage>);
+    total += nodes_.capacity() * sizeof(RenderNodeDescriptor);
+    total += worldMatrices3D_.capacity() * sizeof(Matrix4x4);
+    total += pageDirtyFlags_.capacity() * sizeof(std::uint8_t);
+    total += dirtyPageList_.capacity() * sizeof(std::uint32_t);
+    total += blurLayerSpans_.capacity() * sizeof(BlurLayerSpan);
+    total += mtsdfAtlasRgba8_.capacity();
+    return total;
+}
+
 } // namespace aero

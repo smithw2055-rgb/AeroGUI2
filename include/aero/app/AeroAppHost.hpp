@@ -304,6 +304,8 @@ private:
     SimTickCallback simTickCallback_{};
     std::unordered_map<std::uint64_t, std::pair<float, float>> lastCanvasDrawSizes_;
     std::uint64_t lastGcDestroyedNodes_ = 0u;
+    std::size_t lastLazyCompiledCount_ = 0u;
+    std::uint32_t idleLazyFrames_ = 0u;
     std::vector<PlayedSoundRecord> playedSounds_;
     std::string lastError_;
     Size lastNotifiedViewport_{-1.0f, -1.0f};

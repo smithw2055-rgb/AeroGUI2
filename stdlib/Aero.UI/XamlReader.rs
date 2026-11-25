@@ -691,7 +691,7 @@ internal static class XamlDomParser {
                 }
                 for (int a = 0; a < attrCount; a += 1) {
                     string aName = Xml_AttrName(id, a);
-                    string aLocal = XamlStr.StripPrefix(aName);
+                    string aLocal = aName.Contains(":") ? XamlStr.StripPrefix(aName) : aName;
                     n.Attrs.Push(new XamlXmlAttr(aName, aLocal, Xml_AttrValue(id, a)));
                 }
                 nodes[id] = n;
@@ -841,12 +841,68 @@ public static class XamlReader {
         _cachedExtDicts.Push(rd);
     }
 
+    private static string[] _cachedDocUris;
+    private static XamlXmlNode[] _cachedDocNodes;
+
+    private static XamlXmlNode TryGetCachedDoc(string uri) {
+        if (uri == null || uri.Length == 0 || _cachedDocUris == null) { return null; }
+        for (int i = _cachedDocUris.Length - 1; i >= 0; i -= 1) {
+            if (_cachedDocUris[i] == uri) {
+                XamlXmlNode hit = _cachedDocNodes[i];
+                int last = _cachedDocUris.Length - 1;
+                if (i != last) {
+                    _cachedDocUris.RemoveAt(i);
+                    _cachedDocNodes.RemoveAt(i);
+                    _cachedDocUris.Push(uri);
+                    _cachedDocNodes.Push(hit);
+                }
+                return hit;
+            }
+        }
+        return null;
+    }
+
+    private static void StoreCachedDoc(string uri, XamlXmlNode root) {
+        if (uri == null || uri.Length == 0 || root == null) { return; }
+        if (_cachedDocUris == null) {
+            _cachedDocUris = new string[0];
+            _cachedDocNodes = new XamlXmlNode[0];
+        }
+        for (int i = 0; i < _cachedDocUris.Length; i += 1) {
+            if (_cachedDocUris[i] == uri) {
+                _cachedDocUris.RemoveAt(i);
+                _cachedDocNodes.RemoveAt(i);
+                _cachedDocUris.Push(uri);
+                _cachedDocNodes.Push(root);
+                return;
+            }
+        }
+        if (_cachedDocUris.Length >= 16) {
+            _cachedDocUris.RemoveAt(0);
+            _cachedDocNodes.RemoveAt(0);
+        }
+        _cachedDocUris.Push(uri);
+        _cachedDocNodes.Push(root);
+    }
+
+    public static void ClearDocumentCache() {
+        _cachedDocUris = null;
+        _cachedDocNodes = null;
+    }
+
     public static UIElement LoadUri(string uri, ResourceDictionary fallbackResources = null) {
         if (uri == null || uri.Trim().Length == 0) { return null; }
         string normUri = uri.Trim();
+        XamlXmlNode cachedRoot = TryGetCachedDoc(normUri);
+        if (cachedRoot != null) {
+            return ParseRootWithUri(cachedRoot, fallbackResources, normUri);
+        }
         string text = Host_ReadTextAsset(normUri);
         if (text == null || text.Trim().Length == 0) { return null; }
-        return ParseWithUri(text, fallbackResources, normUri);
+        XamlXmlNode root = XamlDomParser.ParseDocument(text);
+        if (root == null) { return null; }
+        StoreCachedDoc(normUri, root);
+        return ParseRootWithUri(root, fallbackResources, normUri);
     }
 
     public static UIElement Parse(string xamlText, ResourceDictionary fallbackResources = null) {
@@ -871,6 +927,11 @@ public static class XamlReader {
     private static UIElement ParseWithUri(string xamlText, ResourceDictionary fallbackResources, string baseUri) {
         if (xamlText == null || xamlText.Trim().Length == 0) { return null; }
         XamlXmlNode root = XamlDomParser.ParseDocument(xamlText);
+        if (root == null) { return null; }
+        return ParseRootWithUri(root, fallbackResources, baseUri);
+    }
+
+    private static UIElement ParseRootWithUri(XamlXmlNode root, ResourceDictionary fallbackResources, string baseUri) {
         if (root == null) { return null; }
         var ctx = new XamlBuildContext(fallbackResources, baseUri);
         if (root.LocalName == "ResourceDictionary") {
@@ -1315,6 +1376,76 @@ public static class XamlReader {
         string val = rawVal == null ? "" : rawVal;
         if (XamlStr.StartsWith(val, "{}")) { val = val.Substring(2); }
 
+        if (propName == "Text" && el is TextBlock) {
+            (el as TextBlock).Text = val;
+            return;
+        }
+        if (propName == "Margin") {
+            el.Margin = Thickness.Parse(val);
+            return;
+        }
+        if (propName == "Padding") {
+            el.Padding = Thickness.Parse(val);
+            return;
+        }
+        if (propName == "Width" && !val.Contains("*")) {
+            string lowW = val.Trim().ToLower();
+            el.Width = (lowW == "auto" || lowW == "nan") ? ParseUtil.NaN() : ParseUtil.ParseFloat(val, ParseUtil.NaN());
+            return;
+        }
+        if (propName == "Height" && !val.Contains("*")) {
+            string lowH = val.Trim().ToLower();
+            el.Height = (lowH == "auto" || lowH == "nan") ? ParseUtil.NaN() : ParseUtil.ParseFloat(val, ParseUtil.NaN());
+            return;
+        }
+        if (propName == "Grid.Row") {
+            UIElement.SetGridRow(el, ParseUtil.ParseInt(val, 0));
+            return;
+        }
+        if (propName == "Grid.Column") {
+            UIElement.SetGridColumn(el, ParseUtil.ParseInt(val, 0));
+            return;
+        }
+        if (propName == "HorizontalAlignment") {
+            string ha = val.Trim();
+            if (ha == "Left") { el.HorizontalAlignment = HorizontalAlignment.Left; }
+            else if (ha == "Center") { el.HorizontalAlignment = HorizontalAlignment.Center; }
+            else if (ha == "Right") { el.HorizontalAlignment = HorizontalAlignment.Right; }
+            else { el.HorizontalAlignment = HorizontalAlignment.Stretch; }
+            return;
+        }
+        if (propName == "VerticalAlignment") {
+            string va = val.Trim();
+            if (va == "Top") { el.VerticalAlignment = VerticalAlignment.Top; }
+            else if (va == "Center") { el.VerticalAlignment = VerticalAlignment.Center; }
+            else if (va == "Bottom") { el.VerticalAlignment = VerticalAlignment.Bottom; }
+            else { el.VerticalAlignment = VerticalAlignment.Stretch; }
+            return;
+        }
+        if (propName == "Visibility") {
+            string vs = val.Trim();
+            if (vs == "Collapsed") { el.Visibility = Visibility.Collapsed; }
+            else if (vs == "Hidden") { el.Visibility = Visibility.Hidden; }
+            else { el.Visibility = Visibility.Visible; }
+            return;
+        }
+        if (propName == "Orientation" && el is StackPanel) {
+            (el as StackPanel).Orientation = val.Trim() == "Horizontal" ? Orientation.Horizontal : Orientation.Vertical;
+            return;
+        }
+        if (propName == "Content" && el is ContentControl) {
+            (el as ContentControl).SetContent(val);
+            return;
+        }
+        if (propName == "Header" && el is HeaderedContentControl) {
+            (el as HeaderedContentControl).SetHeader(val);
+            return;
+        }
+        if (propName == "Background" && !(el is Shape)) {
+            el.Background = new SolidColorBrush(val.Trim());
+            return;
+        }
+
         if (propName == "TransitionContentPresenter.Enter") {
             TransitionContentPresenter.SetEnterKey(el, val.Trim());
             return;
@@ -1528,125 +1659,285 @@ public static class XamlReader {
         return attrName == "SnapsToDevicePixels" || attrName == "UseLayoutRounding";
     }
 
+    private static Dictionary<string, int> _uiTagKindMap;
+
+    private static void EnsureUiTagKindMap() {
+        if (_uiTagKindMap != null) { return; }
+        var m = new Dictionary<string, int>();
+        m["Grid"] = 1;
+        m["StackPanel"] = 2;
+        m["VirtualizingStackPanel"] = 3;
+        m["TabPanel"] = 4;
+        m["ToolBarPanel"] = 5;
+        m["DockPanel"] = 6;
+        m["WrapPanel"] = 7;
+        m["ToolBarOverflowPanel"] = 8;
+        m["UniformGrid"] = 9;
+        m["Canvas"] = 10;
+        m["Panel"] = 11;
+        m["Border"] = 12;
+        m["Decorator"] = 13;
+        m["BoxShadow"] = 14;
+        m["Viewbox"] = 15;
+        m["ScrollViewer"] = 16;
+        m["ScrollContentPresenter"] = 17;
+        m["ContentControl"] = 18;
+        m["ContentPresenter"] = 19;
+        m["TransitionContentPresenter"] = 19;
+        m["Label"] = 20;
+        m["HeaderedContentControl"] = 21;
+        m["GroupBox"] = 22;
+        m["Expander"] = 23;
+        m["Separator"] = 24;
+        m["UserControl"] = 25;
+        m["Page"] = 26;
+        m["Window"] = 27;
+        m["TextBlock"] = 28;
+        m["RichText"] = 28;
+        m["TextBox"] = 29;
+        m["PasswordBox"] = 30;
+        m["Button"] = 31;
+        m["RepeatButton"] = 32;
+        m["ToggleButton"] = 33;
+        m["CheckBox"] = 34;
+        m["RadioButton"] = 35;
+        m["Hyperlink"] = 36;
+        m["Slider"] = 37;
+        m["ProgressBar"] = 38;
+        m["ScrollBar"] = 39;
+        m["Track"] = 40;
+        m["Thumb"] = 41;
+        m["TickBar"] = 42;
+        m["GridSplitter"] = 43;
+        m["ItemsControl"] = 44;
+        m["ItemsPresenter"] = 45;
+        m["ListBox"] = 46;
+        m["ListBoxItem"] = 47;
+        m["ListView"] = 48;
+        m["ListViewItem"] = 49;
+        m["ComboBox"] = 50;
+        m["ComboBoxItem"] = 51;
+        m["TabControl"] = 52;
+        m["TabItem"] = 53;
+        m["TreeView"] = 54;
+        m["TreeViewItem"] = 55;
+        m["Menu"] = 56;
+        m["MenuItem"] = 57;
+        m["ContextMenu"] = 58;
+        m["ToolBar"] = 59;
+        m["StatusBar"] = 60;
+        m["StatusBarItem"] = 61;
+        m["ToolTip"] = 62;
+        m["Popup"] = 63;
+        m["GridViewColumnHeader"] = 64;
+        m["GridViewHeaderRowPresenter"] = 65;
+        m["GridViewRowPresenter"] = 66;
+        m["Image"] = 67;
+        m["Rectangle"] = 68;
+        m["Ellipse"] = 69;
+        m["Line"] = 70;
+        m["Path"] = 71;
+        m["Geometry"] = 72;
+        m["Polygon"] = 73;
+        m["Polyline"] = 74;
+        m["CustomDrawElement"] = 75;
+        m["RiveControl"] = 76;
+        m["RiveInput"] = 77;
+        m["NumericScrubber"] = 78;
+        m["Vector2Field"] = 79;
+        m["Vector3Field"] = 80;
+        m["ViewportSurface"] = 81;
+        m["DockPane"] = 82;
+        m["DockTabGroup"] = 83;
+        m["DockSplitNode"] = 84;
+        m["DockingWorkspace"] = 85;
+        m["CodeEditorView"] = 86;
+        m["PropertyGrid"] = 87;
+        m["NodeGraphCanvas"] = 88;
+        _uiTagKindMap = m;
+    }
+
     private static UIElement CreateUIElementByTag(string localName) {
-        if (localName == "Grid") { return new Grid(); }
-        if (localName == "StackPanel") { return new StackPanel(); }
-        if (localName == "VirtualizingStackPanel") { return new VirtualizingStackPanel(); }
-        if (localName == "TabPanel") { return new TabPanel(); }
-        if (localName == "ToolBarPanel") { return new ToolBarPanel(); }
-        if (localName == "DockPanel") { return new DockPanel(); }
-        if (localName == "WrapPanel") { return new WrapPanel(); }
-        if (localName == "ToolBarOverflowPanel") { return new ToolBarOverflowPanel(); }
-        if (localName == "UniformGrid") { return new UniformGrid(); }
-        if (localName == "Canvas") { return new Canvas(); }
-        if (localName == "Panel") { return new Panel(); }
+        if (localName == null || localName.Length == 0) { return null; }
+        EnsureUiTagKindMap();
+        if (!_uiTagKindMap.ContainsKey(localName)) { return null; }
+        int kind = _uiTagKindMap[localName];
+        switch (kind) {
+            case 1: return new Grid();
+            case 2: return new StackPanel();
+            case 3: return new VirtualizingStackPanel();
+            case 4: return new TabPanel();
+            case 5: return new ToolBarPanel();
+            case 6: return new DockPanel();
+            case 7: return new WrapPanel();
+            case 8: return new ToolBarOverflowPanel();
+            case 9: return new UniformGrid();
+            case 10: return new Canvas();
+            case 11: return new Panel();
+            case 12: return new Border();
+            case 13: return new Decorator();
+            case 14: return new BoxShadow();
+            case 15: return new Viewbox();
+            case 16: return new ScrollViewer();
+            case 17: return new ScrollContentPresenter();
+            case 18: return new ContentControl();
+            case 19: return new ContentPresenter();
+            case 20: return new Label();
+            case 21: return new HeaderedContentControl();
+            case 22: return new GroupBox();
+            case 23: return new Expander();
+            case 24: return new Separator();
+            case 25: return new UserControl();
+            case 26: return new Page();
+            case 27: return new Window();
+            case 28: return new TextBlock();
+            case 29: return new TextBox();
+            case 30: return new PasswordBox();
+            case 31: return new Button();
+            case 32: return new RepeatButton();
+            case 33: return new ToggleButton();
+            case 34: return new CheckBox();
+            case 35: return new RadioButton();
+            case 36: return new Hyperlink();
+            case 37: return new Slider();
+            case 38: return new ProgressBar();
+            case 39: return new ScrollBar();
+            case 40: return new Track();
+            case 41: return new Thumb();
+            case 42: return new TickBar();
+            case 43: return new GridSplitter();
+            case 44: return new ItemsControl();
+            case 45: return new ItemsPresenter();
+            case 46: return new ListBox();
+            case 47: return new ListBoxItem();
+            case 48: return new ListView();
+            case 49: return new ListViewItem();
+            case 50: return new ComboBox();
+            case 51: return new ComboBoxItem();
+            case 52: return new TabControl();
+            case 53: return new TabItem();
+            case 54: return new TreeView();
+            case 55: return new TreeViewItem();
+            case 56: return new Menu();
+            case 57: return new MenuItem();
+            case 58: return new ContextMenu();
+            case 59: return new ToolBar();
+            case 60: return new StatusBar();
+            case 61: return new StatusBarItem();
+            case 62: return new ToolTip();
+            case 63: return new Popup();
+            case 64: return new GridViewColumnHeader();
+            case 65: return new GridViewHeaderRowPresenter();
+            case 66: return new GridViewRowPresenter();
+            case 67: return new Image();
+            case 68: return new Rectangle();
+            case 69: return new Ellipse();
+            case 70: return new Line();
+            case 71: return new Path();
+            case 72: return new Geometry();
+            case 73: return new Polygon();
+            case 74: return new Polyline();
+            case 75: return new CustomDrawElement();
+            case 76: return new RiveControl();
+            case 77: return new RiveInput();
+            case 78: return new NumericScrubber();
+            case 79: return new Vector2Field();
+            case 80: return new Vector3Field();
+            case 81: return new ViewportSurface();
+            case 82: return new DockPane();
+            case 83: return new DockTabGroup();
+            case 84: return new DockSplitNode();
+            case 85: return new DockingWorkspace();
+            case 86: return new CodeEditorView();
+            case 87: return new PropertyGrid();
+            case 88: return new NodeGraphCanvas();
+            default: return null;
+        }
+    }
 
-        if (localName == "Border") { return new Border(); }
-        if (localName == "Decorator") { return new Decorator(); }
-        if (localName == "BoxShadow") { return new BoxShadow(); }
-        if (localName == "Viewbox") { return new Viewbox(); }
-        if (localName == "ScrollViewer") { return new ScrollViewer(); }
-        if (localName == "ScrollContentPresenter") { return new ScrollContentPresenter(); }
-        if (localName == "ContentControl") { return new ContentControl(); }
-        if (localName == "ContentPresenter" || localName == "TransitionContentPresenter") { return new ContentPresenter(); }
-        if (localName == "Label") { return new Label(); }
-        if (localName == "HeaderedContentControl") { return new HeaderedContentControl(); }
-        if (localName == "GroupBox") { return new GroupBox(); }
-        if (localName == "Expander") { return new Expander(); }
-        if (localName == "Separator") { return new Separator(); }
-        if (localName == "UserControl") { return new UserControl(); }
-        if (localName == "Page") { return new Page(); }
-        if (localName == "Window") { return new Window(); }
+    private static Dictionary<string, int> _nonVisTagKindMap;
 
-        if (localName == "TextBlock" || localName == "RichText") { return new TextBlock(); }
-        if (localName == "TextBox") { return new TextBox(); }
-        if (localName == "PasswordBox") { return new PasswordBox(); }
-
-        if (localName == "Button") { return new Button(); }
-        if (localName == "RepeatButton") { return new RepeatButton(); }
-        if (localName == "ToggleButton") { return new ToggleButton(); }
-        if (localName == "CheckBox") { return new CheckBox(); }
-        if (localName == "RadioButton") { return new RadioButton(); }
-        if (localName == "Hyperlink") { return new Hyperlink(); }
-        if (localName == "Slider") { return new Slider(); }
-        if (localName == "ProgressBar") { return new ProgressBar(); }
-        if (localName == "ScrollBar") { return new ScrollBar(); }
-        if (localName == "Track") { return new Track(); }
-        if (localName == "Thumb") { return new Thumb(); }
-        if (localName == "TickBar") { return new TickBar(); }
-        if (localName == "GridSplitter") { return new GridSplitter(); }
-
-        if (localName == "ItemsControl") { return new ItemsControl(); }
-        if (localName == "ItemsPresenter") { return new ItemsPresenter(); }
-        if (localName == "ListBox") { return new ListBox(); }
-        if (localName == "ListBoxItem") { return new ListBoxItem(); }
-        if (localName == "ListView") { return new ListView(); }
-        if (localName == "ListViewItem") { return new ListViewItem(); }
-        if (localName == "ComboBox") { return new ComboBox(); }
-        if (localName == "ComboBoxItem") { return new ComboBoxItem(); }
-        if (localName == "TabControl") { return new TabControl(); }
-        if (localName == "TabItem") { return new TabItem(); }
-        if (localName == "TreeView") { return new TreeView(); }
-        if (localName == "TreeViewItem") { return new TreeViewItem(); }
-        if (localName == "Menu") { return new Menu(); }
-        if (localName == "MenuItem") { return new MenuItem(); }
-        if (localName == "ContextMenu") { return new ContextMenu(); }
-        if (localName == "ToolBar") { return new ToolBar(); }
-        if (localName == "StatusBar") { return new StatusBar(); }
-        if (localName == "StatusBarItem") { return new StatusBarItem(); }
-        if (localName == "ToolTip") { return new ToolTip(); }
-        if (localName == "Popup") { return new Popup(); }
-        if (localName == "GridViewColumnHeader") { return new GridViewColumnHeader(); }
-        if (localName == "GridViewHeaderRowPresenter") { return new GridViewHeaderRowPresenter(); }
-        if (localName == "GridViewRowPresenter") { return new GridViewRowPresenter(); }
-
-        if (localName == "Image") { return new Image(); }
-        if (localName == "Rectangle") { return new Rectangle(); }
-        if (localName == "Ellipse") { return new Ellipse(); }
-        if (localName == "Line") { return new Line(); }
-        if (localName == "Path") { return new Path(); }
-        if (localName == "Geometry") { return new Geometry(); }
-        if (localName == "Polygon") { return new Polygon(); }
-        if (localName == "Polyline") { return new Polyline(); }
-        if (localName == "CustomDrawElement") { return new CustomDrawElement(); }
-        if (localName == "RiveControl") { return new RiveControl(); }
-        if (localName == "RiveInput") { return new RiveInput(); }
-        if (localName == "NumericScrubber") { return new NumericScrubber(); }
-        if (localName == "Vector2Field") { return new Vector2Field(); }
-        if (localName == "Vector3Field") { return new Vector3Field(); }
-        if (localName == "ViewportSurface") { return new ViewportSurface(); }
-        if (localName == "DockPane") { return new DockPane(); }
-        if (localName == "DockTabGroup") { return new DockTabGroup(); }
-        if (localName == "DockSplitNode") { return new DockSplitNode(); }
-        if (localName == "DockingWorkspace") { return new DockingWorkspace(); }
-        if (localName == "CodeEditorView") { return new CodeEditorView(); }
-        if (localName == "PropertyGrid") { return new PropertyGrid(); }
-        if (localName == "NodeGraphCanvas") { return new NodeGraphCanvas(); }
-        return null;
+    private static void EnsureNonVisTagKindMap() {
+        if (_nonVisTagKindMap != null) { return; }
+        var m = new Dictionary<string, int>();
+        m["ResourceDictionary"] = 1;
+        m["Style"] = 2;
+        m["ControlTemplate"] = 3;
+        m["HierarchicalDataTemplate"] = 4;
+        m["DataTemplate"] = 5;
+        m["ItemsPanelTemplate"] = 6;
+        m["Storyboard"] = 7;
+        m["SolidColorBrush"] = 8;
+        m["LinearGradientBrush"] = 9;
+        m["RadialGradientBrush"] = 10;
+        m["ImageBrush"] = 11;
+        m["VisualBrush"] = 12;
+        m["BitmapImage"] = 13;
+        m["GradientStop"] = 14;
+        m["GradientStopCollection"] = 15;
+        m["Color"] = 16;
+        m["Double"] = 17;
+        m["sys:Double"] = 17;
+        m["String"] = 18;
+        m["sys:String"] = 18;
+        m["FontFamily"] = 18;
+        m["Boolean"] = 19;
+        m["sys:Boolean"] = 19;
+        m["Int32"] = 20;
+        m["sys:Int32"] = 20;
+        m["Thickness"] = 21;
+        m["CornerRadius"] = 22;
+        m["TranslateTransform"] = 23;
+        m["ScaleTransform"] = 23;
+        m["RotateTransform"] = 23;
+        m["SkewTransform"] = 23;
+        m["TransformGroup"] = 23;
+        m["CompositeTransform3D"] = 24;
+        m["PlaneProjection"] = 25;
+        m["BlurEffect"] = 26;
+        m["DropShadowEffect"] = 26;
+        m["BackdropBlurEffect"] = 26;
+        m["TintEffect"] = 26;
+        m["PixelateEffect"] = 26;
+        m["ChromaticAberrationEffect"] = 26;
+        m["DirectionalBlurEffect"] = 26;
+        m["SaturationEffect"] = 26;
+        m["BoolToVisibilityConverter"] = 27;
+        m["BooleanToVisibilityConverter"] = 27;
+        m["InverseBoolConverter"] = 28;
+        m["NullToVisibilityConverter"] = 29;
+        m["MathConverter"] = 30;
+        m["AlternationConverter"] = 31;
+        m["GridView"] = 32;
+        m["StaticResource"] = 33;
+        _nonVisTagKindMap = m;
     }
 
     private static DependencyObject BuildNonVisualObjectNode(XamlXmlNode node, XamlBuildContext ctx, UIElement contextHost) {
         string tag = node.LocalName;
-
-        if (tag == "ResourceDictionary") { return BuildResourceDictionaryNode(node, ctx); }
-        if (tag == "Style") { return BuildStyleNode(node, ctx); }
-        if (tag == "ControlTemplate") { return BuildControlTemplateNode(node, ctx); }
-        if (tag == "HierarchicalDataTemplate") { return BuildHierarchicalDataTemplateNode(node, ctx); }
-        if (tag == "DataTemplate") { return BuildDataTemplateNode(node, ctx); }
-        if (tag == "ItemsPanelTemplate") { return BuildItemsPanelTemplateNode(node, ctx); }
-        if (tag == "Storyboard") { return BuildStoryboardNode(node, ctx); }
-        if (tag == "SolidColorBrush") { return BuildSolidColorBrushNode(node, ctx); }
-        if (tag == "LinearGradientBrush") { return BuildLinearGradientBrushNode(node, ctx); }
-        if (tag == "RadialGradientBrush") { return BuildRadialGradientBrushNode(node, ctx); }
-        if (tag == "ImageBrush") { return BuildImageBrushNode(node, ctx); }
-        if (tag == "VisualBrush") { return BuildVisualBrushNode(node, ctx, contextHost); }
-        if (tag == "BitmapImage") {
+        if (tag == null || tag.Length == 0) { return null; }
+        EnsureNonVisTagKindMap();
+        if (!_nonVisTagKindMap.ContainsKey(tag)) { return null; }
+        int kind = _nonVisTagKindMap[tag];
+        if (kind == 1) { return BuildResourceDictionaryNode(node, ctx); }
+        if (kind == 2) { return BuildStyleNode(node, ctx); }
+        if (kind == 3) { return BuildControlTemplateNode(node, ctx); }
+        if (kind == 4) { return BuildHierarchicalDataTemplateNode(node, ctx); }
+        if (kind == 5) { return BuildDataTemplateNode(node, ctx); }
+        if (kind == 6) { return BuildItemsPanelTemplateNode(node, ctx); }
+        if (kind == 7) { return BuildStoryboardNode(node, ctx); }
+        if (kind == 8) { return BuildSolidColorBrushNode(node, ctx); }
+        if (kind == 9) { return BuildLinearGradientBrushNode(node, ctx); }
+        if (kind == 10) { return BuildRadialGradientBrushNode(node, ctx); }
+        if (kind == 11) { return BuildImageBrushNode(node, ctx); }
+        if (kind == 12) { return BuildVisualBrushNode(node, ctx, contextHost); }
+        if (kind == 13) {
             string uriSrc = node.GetAttr("UriSource");
             if (uriSrc == null) { uriSrc = node.Text.Trim(); }
             string resolved = (ctx != null && ctx.BaseUri.Length > 0) ? XamlStr.ResolveUri(ctx.BaseUri, uriSrc) : uriSrc;
             return DependencyObject.BoxString(resolved);
         }
-        if (tag == "GradientStop") {
+        if (kind == 14) {
             string cAttr = node.GetAttr("Color");
             string col = "#FF000000";
             if (cAttr != null) {
@@ -1673,7 +1964,7 @@ public static class XamlReader {
             }
             return new GradientStop(col, off);
         }
-        if (tag == "GradientStopCollection") {
+        if (kind == 15) {
             var gsc = new ArrayCollectionBox();
             for (int i = 0; i < node.Children.Length; i += 1) {
                 DependencyObject sub = BuildNonVisualObjectNode(node.Children[i], ctx, contextHost);
@@ -1681,24 +1972,24 @@ public static class XamlReader {
             }
             return gsc;
         }
-        if (tag == "Color") {
+        if (kind == 16) {
             string c = node.Text.Trim();
             if (c.Length == 0) { c = "#00000000"; }
             return DependencyObject.BoxString(ParseUtil.FormatArgbHex(ParseUtil.ParseColor(c)));
         }
-        if (tag == "Double" || tag == "sys:Double") {
+        if (kind == 17) {
             return DependencyObject.BoxFloat(ParseUtil.ParseFloat(node.Text.Trim(), 0.0f));
         }
-        if (tag == "String" || tag == "sys:String" || tag == "FontFamily") {
+        if (kind == 18) {
             return DependencyObject.BoxString(node.Text.Trim());
         }
-        if (tag == "Boolean" || tag == "sys:Boolean") {
+        if (kind == 19) {
             return DependencyObject.BoxBool(ParseUtil.ParseBool(node.Text.Trim(), false));
         }
-        if (tag == "Int32" || tag == "sys:Int32") {
+        if (kind == 20) {
             return DependencyObject.BoxInt(ParseUtil.ParseInt(node.Text.Trim(), 0));
         }
-        if (tag == "Thickness") {
+        if (kind == 21) {
             string ts = node.Text.Trim();
             if (ts.Length == 0) {
                 string l = node.GetAttr("Left");
@@ -1712,36 +2003,33 @@ public static class XamlReader {
             }
             return Thickness.Parse(ts);
         }
-        if (tag == "CornerRadius") {
+        if (kind == 22) {
             return CornerRadius.Parse(node.Text.Trim());
         }
-        if (tag == "TranslateTransform" || tag == "ScaleTransform" || tag == "RotateTransform" ||
-            tag == "SkewTransform" || tag == "TransformGroup") {
+        if (kind == 23) {
             return BuildTransformNode(node, ctx);
         }
-        if (tag == "CompositeTransform3D") {
+        if (kind == 24) {
             return BuildCompositeTransform3DNode(node);
         }
-        if (tag == "PlaneProjection") {
+        if (kind == 25) {
             return BuildPlaneProjectionNode(node);
         }
-        if (tag == "BlurEffect" || tag == "DropShadowEffect" || tag == "BackdropBlurEffect" ||
-            tag == "TintEffect" || tag == "PixelateEffect" || tag == "ChromaticAberrationEffect" ||
-            tag == "DirectionalBlurEffect" || tag == "SaturationEffect") {
+        if (kind == 26) {
             return BuildEffectNode(node, ctx, contextHost);
         }
-        if (tag == "BoolToVisibilityConverter" || tag == "BooleanToVisibilityConverter") {
+        if (kind == 27) {
             return new BoolToVisibilityConverter();
         }
-        if (tag == "InverseBoolConverter") { return new InverseBoolConverter(); }
-        if (tag == "NullToVisibilityConverter") { return new NullToVisibilityConverter(); }
-        if (tag == "MathConverter") {
+        if (kind == 28) { return new InverseBoolConverter(); }
+        if (kind == 29) { return new NullToVisibilityConverter(); }
+        if (kind == 30) {
             var mc = new MathConverter();
             string expr = node.GetAttr("Expression");
             if (expr != null) { mc.Expression = expr; }
             return mc;
         }
-        if (tag == "AlternationConverter") {
+        if (kind == 31) {
             var ac = new AlternationConverter();
             for (int i = 0; i < node.Children.Length; i += 1) {
                 DependencyObject item = BuildObjectNode(node.Children[i], ctx, contextHost);
@@ -1749,7 +2037,7 @@ public static class XamlReader {
             }
             return ac;
         }
-        if (tag == "GridView") {
+        if (kind == 32) {
             var gv = new GridView();
             string acr = node.GetAttr("AllowsColumnReorder");
             if (acr != null) { gv.AllowsColumnReorder = ParseUtil.ParseBool(acr, true); }
@@ -1779,7 +2067,7 @@ public static class XamlReader {
             }
             return gv;
         }
-        if (tag == "StaticResource") {
+        if (kind == 33) {
             string rk = node.GetAttr("ResourceKey");
             if (rk == null) { rk = node.Text.Trim(); }
             return ctx != null ? ctx.FindResourceBox(NormalizeResourceKey(rk), contextHost) : null;

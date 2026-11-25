@@ -67,6 +67,8 @@ public:
     ChunkedArena& operator=(ChunkedArena&&) noexcept = default;
 
     [[nodiscard]] std::size_t size() const noexcept { return size_; }
+    [[nodiscard]] std::size_t chunk_count() const noexcept { return chunks_.size(); }
+    [[nodiscard]] std::size_t capacity_bytes() const noexcept { return chunks_.size() * sizeof(Chunk); }
     [[nodiscard]] bool empty() const noexcept { return size_ == 0u; }
 
     [[nodiscard]] T& operator[](std::size_t idx) noexcept {

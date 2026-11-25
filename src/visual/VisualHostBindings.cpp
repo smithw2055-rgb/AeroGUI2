@@ -1186,11 +1186,19 @@ bool RegisterVisualHostBindings(
 
     // Tree & lifecycle
     ok &= bindFn("Visual_Create", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
-        const auto kind = static_cast<VisualKind>(std::clamp<std::int64_t>(ArgInt(args, 0, 0), 0, 4));
+        const std::int64_t rawKind = ArgInt(args, 0, 0);
+        if (rawKind == -1) {
+            return rs_rt::Value{world.CreateObjectBox()};
+        }
+        const auto kind = static_cast<VisualKind>(std::clamp<std::int64_t>(rawKind, 0, 4));
         const VisualNodeId id = world.CreateNode(kind);
         return rs_rt::Value{world.HandleFor(id)};
     });
     ok &= bindFn("Visual_Destroy", [&world, &drawBuffer](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        rs_rt::NativeHandle rawNh{};
+        if (args.size() > 0u && args[0].tryGetNativeHandle(rawNh) && world.DestroyObjectBox(rawNh)) {
+            return rs_rt::Value{std::int64_t{0}};
+        }
         const VisualNodeId id = ArgNode(args, 0, world);
         if (id.IsValid()) {
             std::vector<VisualNodeId> queue;
@@ -1228,10 +1236,20 @@ bool RegisterVisualHostBindings(
         return rs_rt::Value{std::int64_t{0}};
     });
     ok &= bindFn("Visual_BindOwner", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        rs_rt::NativeHandle rawNh{};
+        if (args.size() > 0u && args[0].tryGetNativeHandle(rawNh) && world.IsObjectBoxHandle(rawNh)) {
+            const rs_rt::Value val = (args.size() > 1u) ? args[1] : rs_rt::Value{rs_rt::NullObject{}};
+            (void)world.BindObjectBox(rawNh, val, static_cast<std::uint32_t>(ArgInt(args, 2, 0)));
+            return rs_rt::Value{std::int64_t{0}};
+        }
         (void)world.BindOwner(ArgNode(args, 0, world), ArgObject(args, 1), static_cast<std::uint32_t>(ArgInt(args, 2, 0)));
         return rs_rt::Value{std::int64_t{0}};
     });
     ok &= bindFn("Visual_GetOwner", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        rs_rt::NativeHandle rawNh{};
+        if (args.size() > 0u && args[0].tryGetNativeHandle(rawNh) && world.IsObjectBoxHandle(rawNh)) {
+            return world.GetObjectBoxValue(rawNh);
+        }
         const rs_rt::ObjectRef obj = world.GetOwner(ArgNode(args, 0, world));
         return (obj.valid() && obj.kind == rs_rt::ObjectKind::Record)
             ? rs_rt::Value{obj}
@@ -2949,9 +2967,17 @@ bool RegisterVisualHostBindings(
                     const std::size_t aStart = ai;
                     while (ai < alen && attrText[ai] != '=' && !isXmlSpace(attrText[ai])) ++ai;
                     const std::string_view aName = trimView(attrText.substr(aStart, ai - aStart));
+                    const bool skipAttr =
+                        aName.empty() ||
+                        aName == "xmlns" ||
+                        aName.rfind("xmlns:", 0u) == 0u ||
+                        aName.rfind("mc:", 0u) == 0u ||
+                        aName.rfind("d:", 0u) == 0u ||
+                        aName == "SnapsToDevicePixels" ||
+                        aName == "UseLayoutRounding";
                     while (ai < alen && isXmlSpace(attrText[ai])) ++ai;
                     if (ai >= alen || attrText[ai] != '=') {
-                        if (!aName.empty()) {
+                        if (!skipAttr) {
                             attrVec.push_back(FastXmlAttr{std::string(aName), std::string{}});
                         }
                         continue;
@@ -2959,21 +2985,25 @@ bool RegisterVisualHostBindings(
                     ++ai; // skip '='
                     while (ai < alen && isXmlSpace(attrText[ai])) ++ai;
                     if (ai >= alen) break;
-                    std::string aVal;
                     const char aq = attrText[ai];
                     if (aq == '"' || aq == '\'') {
                         ++ai;
                         const std::size_t vStart = ai;
                         while (ai < alen && attrText[ai] != aq) ++ai;
-                        aVal = decodeXmlEntities(attrText.substr(vStart, ai - vStart));
+                        if (!skipAttr) {
+                            attrVec.push_back(FastXmlAttr{
+                                std::string(aName),
+                                decodeXmlEntities(attrText.substr(vStart, ai - vStart))});
+                        }
                         if (ai < alen) ++ai;
                     } else {
                         const std::size_t vStart = ai;
                         while (ai < alen && !isXmlSpace(attrText[ai])) ++ai;
-                        aVal = decodeXmlEntities(attrText.substr(vStart, ai - vStart));
-                    }
-                    if (!aName.empty()) {
-                        attrVec.push_back(FastXmlAttr{std::string(aName), std::move(aVal)});
+                        if (!skipAttr) {
+                            attrVec.push_back(FastXmlAttr{
+                                std::string(aName),
+                                decodeXmlEntities(attrText.substr(vStart, ai - vStart))});
+                        }
                     }
                 }
                 maxAttrs = std::max(maxAttrs, attrVec.size());

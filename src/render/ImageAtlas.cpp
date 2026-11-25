@@ -4535,6 +4535,26 @@ std::size_t ImageAtlas::StandaloneTextureCount() const noexcept {
     return count;
 }
 
+std::size_t ImageAtlas::EstimatedMemoryBytes() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::size_t total = 0u;
+    for (const auto& [k, bytes] : memoryEncodedAssets_) {
+        total += k.capacity() + bytes.capacity();
+    }
+    for (const auto& [tid, slot] : textureSlots_) {
+        (void)tid;
+        total += slot.rgbaPixels.capacity();
+        if (slot.pixelSnapshot) {
+            total += slot.pixelSnapshot->capacity();
+        }
+        if (slot.cowAtlasPixels) {
+            total += slot.cowAtlasPixels->capacity();
+        }
+    }
+    total += entries_.size() * (sizeof(ImageAtlasEntry) + 48u);
+    return total;
+}
+
 void ImageAtlas::Clear() noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
     skyline_.ClearToEmpty();

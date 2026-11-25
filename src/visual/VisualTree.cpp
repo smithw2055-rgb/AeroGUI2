@@ -61,6 +61,7 @@ VisualWorld::VisualWorld(
     UIResourceStore* resourceStore,
     ManagedHeap* managedHeap)
     : visualNodeTypeId_(rs_sem::stableTypeId(kVisualNodeTypeName))
+    , objectBoxTypeId_(rs_sem::stableTypeId("Aero.ObjectBox"))
     , handleRegistry_(handleRegistry ? handleRegistry : &ownedFallbackRegistry_)
     , resourceStore_(resourceStore)
     , managedHeap_(managedHeap)
@@ -90,6 +91,15 @@ void VisualWorld::BindRuntime(
                 (void)handleRegistry_->release(node.nativeHandle);
             }
             node.nativeHandle = handleRegistry->createBorrowed(visualNodeTypeId_, &node, false);
+        }
+        for (auto& box : objectBoxes_) {
+            if (!box.alive) {
+                continue;
+            }
+            if (box.nativeHandle.valid()) {
+                (void)handleRegistry_->release(box.nativeHandle);
+            }
+            box.nativeHandle = handleRegistry->createBorrowed(objectBoxTypeId_, &box, false);
         }
         handleRegistry_ = handleRegistry;
     }
@@ -377,6 +387,151 @@ bool VisualWorld::BindOwner(VisualNodeId id, ObjectRef owner, std::uint32_t call
 ObjectRef VisualWorld::GetOwner(VisualNodeId id) const noexcept {
     const VisualNode* node = GetNode(id);
     return node ? node->scriptOwner : ObjectRef{};
+}
+
+NativeHandle VisualWorld::CreateObjectBox() {
+    std::uint32_t idx = 0u;
+    if (!freeObjectBoxIndices_.empty()) {
+        idx = freeObjectBoxIndices_.back();
+        freeObjectBoxIndices_.pop_back();
+        ObjectBoxSlot& slot = objectBoxes_[idx];
+        const std::uint32_t nextGen = slot.generation + 1u;
+        slot = ObjectBoxSlot{};
+        slot.index = idx;
+        slot.generation = (nextGen == 0u) ? 1u : nextGen;
+    } else {
+        idx = static_cast<std::uint32_t>(objectBoxes_.size());
+        objectBoxes_.emplace_back();
+        objectBoxes_.back().index = idx;
+        objectBoxes_.back().generation = 1u;
+    }
+    ObjectBoxSlot& slot = objectBoxes_[idx];
+    slot.alive = true;
+    slot.nativeHandle = handleRegistry_->createBorrowed(objectBoxTypeId_, &slot, false);
+    ++liveObjectBoxCount_;
+    return slot.nativeHandle;
+}
+
+VisualWorld::ObjectBoxSlot* VisualWorld::ResolveObjectBox(NativeHandle handle) noexcept {
+    if (!handle.valid()) {
+        return nullptr;
+    }
+    void* raw = handleRegistry_->resolveRawFast(handle, objectBoxTypeId_);
+    if (!raw) {
+        return nullptr;
+    }
+    auto* slot = static_cast<ObjectBoxSlot*>(raw);
+    if (!slot->alive || slot->nativeHandle != handle) {
+        return nullptr;
+    }
+    return slot;
+}
+
+const VisualWorld::ObjectBoxSlot* VisualWorld::ResolveObjectBox(NativeHandle handle) const noexcept {
+    if (!handle.valid()) {
+        return nullptr;
+    }
+    void* raw = handleRegistry_->resolveRawFast(handle, objectBoxTypeId_);
+    if (!raw) {
+        return nullptr;
+    }
+    const auto* slot = static_cast<const ObjectBoxSlot*>(raw);
+    if (!slot->alive || slot->nativeHandle != handle) {
+        return nullptr;
+    }
+    return slot;
+}
+
+bool VisualWorld::IsObjectBoxHandle(NativeHandle handle) const noexcept {
+    return ResolveObjectBox(handle) != nullptr;
+}
+
+void VisualWorld::RefreshObjectBoxPin(ObjectBoxSlot& slot) noexcept {
+    slot.pinnedValueRoot.reset();
+    if (!managedHeap_) {
+        return;
+    }
+    if (const auto* ov = std::get_if<ObjectRef>(&slot.value); ov && ov->valid() && managedHeap_->isAlive(*ov)) {
+        slot.pinnedValueRoot = managedHeap_->retain(*ov);
+    }
+}
+
+bool VisualWorld::BindObjectBox(NativeHandle handle, const rs_rt::Value& val, std::uint32_t flags) {
+    ObjectBoxSlot* slot = ResolveObjectBox(handle);
+    if (!slot) {
+        return false;
+    }
+    if (flags == 1u) {
+        ObjectRef ref{};
+        if (const auto* ov = std::get_if<ObjectRef>(&val); ov && ov->valid()) {
+            ref = *ov;
+        }
+        slot->ownerBox = ref;
+    } else {
+        slot->value = val;
+        RefreshObjectBoxPin(*slot);
+    }
+    return true;
+}
+
+rs_rt::Value VisualWorld::GetObjectBoxValue(NativeHandle handle) const noexcept {
+    const ObjectBoxSlot* slot = ResolveObjectBox(handle);
+    if (!slot) {
+        return rs_rt::Value{rs_rt::NullObject{}};
+    }
+    if (const auto* ov = std::get_if<ObjectRef>(&slot->value)) {
+        if (managedHeap_ && (!ov->valid() || !managedHeap_->isAlive(*ov))) {
+            return rs_rt::Value{rs_rt::NullObject{}};
+        }
+    }
+    return slot->value;
+}
+
+bool VisualWorld::DestroyObjectBox(NativeHandle handle) noexcept {
+    ObjectBoxSlot* slot = ResolveObjectBox(handle);
+    if (!slot) {
+        return false;
+    }
+    slot->pinnedValueRoot.reset();
+    if (slot->nativeHandle.valid()) {
+        (void)handleRegistry_->release(slot->nativeHandle);
+        slot->nativeHandle = NativeHandle{};
+    }
+    slot->alive = false;
+    slot->value = rs_rt::Value{};
+    slot->ownerBox = ObjectRef{};
+    freeObjectBoxIndices_.push_back(slot->index);
+    if (liveObjectBoxCount_ > 0u) {
+        --liveObjectBoxCount_;
+    }
+    return true;
+}
+
+std::size_t VisualWorld::SweepDeadObjectBoxes() noexcept {
+    if (!managedHeap_ || liveObjectBoxCount_ == 0u) {
+        return 0u;
+    }
+    std::size_t swept = 0u;
+    for (std::size_t i = 0u; i < objectBoxes_.size(); ++i) {
+        ObjectBoxSlot& slot = objectBoxes_[i];
+        if (!slot.alive || !slot.ownerBox.valid() || managedHeap_->isAlive(slot.ownerBox)) {
+            continue;
+        }
+        slot.pinnedValueRoot.reset();
+        if (slot.nativeHandle.valid()) {
+            (void)handleRegistry_->release(slot.nativeHandle);
+            slot.nativeHandle = NativeHandle{};
+        }
+        slot.alive = false;
+        slot.value = rs_rt::Value{};
+        slot.ownerBox = ObjectRef{};
+        freeObjectBoxIndices_.push_back(slot.index);
+        if (liveObjectBoxCount_ > 0u) {
+            --liveObjectBoxCount_;
+        }
+        ++swept;
+    }
+    return swept;
 }
 
 bool VisualWorld::SetSize(VisualNodeId id, float width, float height) noexcept {
@@ -1896,8 +2051,23 @@ void VisualWorld::Clear() noexcept {
             node.nativeHandle = NativeHandle{};
         }
     }
+    for (auto& slot : objectBoxes_) {
+        if (!slot.alive) {
+            continue;
+        }
+        slot.pinnedValueRoot.reset();
+        slot.value = rs_rt::Value{};
+        slot.ownerBox = ObjectRef{};
+        if (slot.nativeHandle.valid()) {
+            (void)handleRegistry_->release(slot.nativeHandle);
+            slot.nativeHandle = NativeHandle{};
+        }
+    }
     nodes_.clear();
     freeIndices_.clear();
+    objectBoxes_.clear();
+    freeObjectBoxIndices_.clear();
+    liveObjectBoxCount_ = 0u;
     canvasDrawNodes_.clear();
     ecsBindings_.clear();
     for (auto& bucket : measureDepthBuckets_) {
@@ -1928,12 +2098,22 @@ void VisualWorld::MarkScriptRootsInPools() const noexcept {
             rs_rt::markValueInPools(UnifiedValue{node.scriptOwner});
         }
     }
+    for (const auto& slot : objectBoxes_) {
+        if (slot.alive) {
+            rs_rt::markValueInPools(slot.value);
+        }
+    }
 }
 
 void VisualWorld::RefreshScriptOwnerPins() noexcept {
     for (auto& node : nodes_) {
         if (node.alive) {
             RefreshOwnerPin(node);
+        }
+    }
+    for (auto& slot : objectBoxes_) {
+        if (slot.alive) {
+            RefreshObjectBoxPin(slot);
         }
     }
 }
@@ -2028,6 +2208,50 @@ void VisualWorld::RefreshSubtreeDepths(VisualNodeId id, std::uint16_t depth) noe
         }
     } catch (...) {
     }
+}
+
+std::size_t VisualWorld::EstimatedMemoryBytes() const noexcept {
+    std::size_t total = nodes_.capacity_bytes() + objectBoxes_.capacity_bytes();
+    total += freeIndices_.capacity() * sizeof(std::uint32_t);
+    total += freeObjectBoxIndices_.capacity() * sizeof(std::uint32_t);
+    total += canvasDrawNodes_.capacity() * sizeof(VisualNodeId);
+    total += dirtyNodes_.capacity() * sizeof(VisualNodeId);
+    total += ecsBindings_.capacity() * sizeof(VisualEcsColumnBinding);
+    for (const auto& b : measureDepthBuckets_) {
+        total += b.capacity() * sizeof(VisualNodeId);
+    }
+    for (const auto& b : arrangeDepthBuckets_) {
+        total += b.capacity() * sizeof(VisualNodeId);
+    }
+    for (const auto& b : transformDepthBuckets_) {
+        total += b.capacity() * sizeof(VisualNodeId);
+    }
+    for (std::size_t i = 0u; i < nodes_.size(); ++i) {
+        const VisualNode& n = nodes_[i];
+        total += n.children.capacity() * sizeof(VisualNodeId);
+        if (n.extras) {
+            total += sizeof(VisualNodeExtras);
+            if (n.extras->spatial3D) total += sizeof(VisualSpatial3DData);
+            if (n.extras->effectMask) total += sizeof(VisualEffectAndMaskData);
+            if (n.extras->text) {
+                total += sizeof(VisualTextData) + n.extras->text->text.capacity() +
+                         n.extras->text->fontFamily.capacity() +
+                         n.extras->text->richSpans.capacity() * sizeof(VisualTextSpan) +
+                         n.extras->text->cachedLayout.glyphs.capacity() * sizeof(PositionedGlyph);
+            }
+            if (n.extras->image) total += sizeof(VisualImageData) + n.extras->image->uri.capacity();
+            if (n.extras->vector) {
+                total += sizeof(VisualVectorData) + n.extras->vector->pathOrParams.capacity() +
+                         n.extras->vector->dashArray.capacity() * sizeof(float);
+            }
+            if (n.extras->gridDefs) {
+                total += sizeof(VisualGridDefsData) +
+                         (n.extras->gridDefs->rowDefs.capacity() + n.extras->gridDefs->colDefs.capacity()) *
+                             sizeof(VisualGridLength);
+            }
+        }
+    }
+    return total;
 }
 
 } // namespace aero

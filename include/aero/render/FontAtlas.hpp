@@ -337,6 +337,7 @@ public:
 
     // Reset custom loaded TrueType fonts & shard glyphs while preserving built-in fallback ASCII SDF atlas
     void ClearCustomFonts();
+    [[nodiscard]] std::size_t EstimatedMemoryBytes() const noexcept;
 
     [[nodiscard]] bool HasFontFamily(std::string_view familyName) const noexcept;
     [[nodiscard]] const TrueTypeFontFace* FindFontFace(std::string_view familyName) const noexcept;

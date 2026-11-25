@@ -638,6 +638,7 @@ public:
     [[nodiscard]] bool HasAnyPerspective3D() const noexcept { return hasAnyPerspective3D_; }
 
     [[nodiscard]] std::size_t NodeCount() const noexcept { return nodes_.size(); }
+    [[nodiscard]] std::size_t EstimatedMemoryBytes() const noexcept;
     [[nodiscard]] const Matrix4x4& GetNodeWorldMatrix3D(const RenderNodeDescriptor& node) const noexcept;
     void SetNodeWorldMatrix3D(RenderNodeDescriptor& node, const Matrix4x4& world3D);
     [[nodiscard]] const RenderNodeDescriptor* GetNode(std::uint32_t nodeId) const noexcept {

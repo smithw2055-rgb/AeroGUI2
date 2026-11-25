@@ -917,6 +917,24 @@ public class MenuItem : HeaderedItemsControl {
         }
     }
 
+    protected override void ResolveDeferredHostFallback() {
+        base.ResolveDeferredHostFallback();
+        if (_itemsPresenter == null && _directItemsHost == null &&
+            _submenuPopup != null && _submenuPopup.Child != null) {
+            _itemsPresenter = FindFirstItemsPresenter(_submenuPopup.Child, this);
+            if (_itemsPresenter != null) {
+                if (ItemsPanelFactory() != null) { _itemsPresenter.PanelFactory = ItemsPanelFactory(); }
+                _itemsPresenter.EnsurePanel();
+            } else {
+                _directItemsHost = FindItemsHostPanel(_submenuPopup.Child, this);
+            }
+        }
+    }
+
+    protected override bool ShouldDeferItemsMaterialization() {
+        return !_isSubmenuOpen;
+    }
+
     public bool IsSubmenuOpen {
         get { return _isSubmenuOpen; }
         set {
@@ -924,6 +942,13 @@ public class MenuItem : HeaderedItemsControl {
             _isSubmenuOpen = value;
             if (_submenuPopup != null) {
                 _submenuPopup.IsOpen = _isSubmenuOpen && ItemCount() > 0;
+            }
+            if (_isSubmenuOpen) {
+                RealizeDeferredItemsIfNeeded();
+                if (_submenuPopup != null && _submenuPopup.IsOpen) {
+                    PopupService.InvalidatePositions();
+                    _submenuPopup.UpdatePosition();
+                }
             }
             UpdateTriggersAndStates();
             NotifyBoundPropertyChanged("IsSubmenuOpen", DependencyObject.BoxBool(_isSubmenuOpen));
@@ -1312,7 +1337,18 @@ public class ContextMenu : MenuBase {
         _popup.Closed += (object s, EventArgs e) => { RaiseClosed(); };
     }
 
-    private void RaiseOpened() { Opened(this, new RoutedEventArgs("Opened", this)); }
+    protected override bool ShouldDeferItemsMaterialization() {
+        return !IsOpen;
+    }
+
+    private void RaiseOpened() {
+        RealizeDeferredItemsIfNeeded();
+        if (_popup != null && _popup.IsOpen) {
+            PopupService.InvalidatePositions();
+            _popup.UpdatePosition();
+        }
+        Opened(this, new RoutedEventArgs("Opened", this));
+    }
     private void RaiseClosed() { Closed(this, new RoutedEventArgs("Closed", this)); }
 
     public override string GetTypeName() { return "ContextMenu"; }
@@ -1607,11 +1643,18 @@ public class TreeViewItem : HeaderedItemsControl {
         }
     }
 
+    protected override bool ShouldDeferItemsMaterialization() {
+        return !_isExpanded;
+    }
+
     public bool IsExpanded {
         get { return _isExpanded; }
         set {
             if (_isExpanded == value) { return; }
             _isExpanded = value;
+            if (_isExpanded) {
+                RealizeDeferredItemsIfNeeded();
+            }
             SyncExpandedState();
             UpdateTriggersAndStates();
             NotifyBoundPropertyChanged("IsExpanded", DependencyObject.BoxBool(_isExpanded));
@@ -1731,6 +1774,7 @@ public class TreeViewItem : HeaderedItemsControl {
     }
 
     private void PropagateOwnerToChildren() {
+        if (_activeContainers == null) { return; }
         for (int i = 0; i < _activeContainers.Length; i += 1) {
             if (_activeContainers[i] is TreeViewItem) {
                 (_activeContainers[i] as TreeViewItem).OwnerTree = _ownerTree;

@@ -2908,6 +2908,7 @@ void AeroAppHost::StepFrameInternal(float dtSeconds, bool forceRenderSync, bool 
         domains_.uiHeap().nurserySize() >= 4096u) {
         rs_rt::ShadowStack emptyStack;
         (void)domains_.uiHeap().collectYoung(emptyStack, 64u);
+        (void)world_.SweepDeadObjectBoxes();
     }
     const std::uint64_t destroyedNow = world_.DestroyedNodeCount();
     const bool majorTeardown = (destroyedNow >= lastGcDestroyedNodes_) &&
@@ -2922,7 +2923,34 @@ void AeroAppHost::StepFrameInternal(float dtSeconds, bool forceRenderSync, bool 
             majorTeardown);
         if (gcStats.cycleCompleted) {
             lastGcDestroyedNodes_ = world_.DestroyedNodeCount();
+            const std::size_t sweptBoxes = world_.SweepDeadObjectBoxes();
+            if (sweptBoxes > 0u && majorTeardown) {
+                (void)domains_.uiHeap().collectIncrementalWithBudget(
+                    rs_rt::RootSet{},
+                    std::chrono::milliseconds(8),
+                    32u,
+                    true);
+                (void)world_.SweepDeadObjectBoxes();
+            }
             (void)domains_.uiHeap().trimExcessCapacity();
+#ifdef _WIN32
+            if (majorTeardown) {
+                (void)_heapmin();
+            }
+#endif
+        }
+    }
+    if (programImage_ && programImage_->decodedLazyChunkCacheSize() > 0u) {
+        const std::size_t compiledNow = programImage_->compiledLazyFunctionCount();
+        if (compiledNow == lastLazyCompiledCount_) {
+            ++idleLazyFrames_;
+            if (idleLazyFrames_ >= 2u) {
+                programImage_->releaseTransientLazyCaches();
+                idleLazyFrames_ = 0u;
+            }
+        } else {
+            lastLazyCompiledCount_ = compiledNow;
+            idleLazyFrames_ = 0u;
         }
     }
     logTrace("done");

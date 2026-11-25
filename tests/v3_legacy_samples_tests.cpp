@@ -3193,12 +3193,17 @@ void TestInteractiveGallery(aero::rs_comp::CompilerSession& session) {
     Require(mediaCatId.IsValid() && basicCatId.IsValid(),
         "Gallery TreeView missing 'Media' or 'Basic Input' category items");
 
-    // Verify HierarchicalDataTemplate populated child TreeViewItems under 'Media'
-    std::vector<aero::VisualNodeId> mediaSubItems;
-    CollectDescendantsByTypeName(host, mediaCatId, "TreeViewItem", mediaSubItems);
-    Require(mediaSubItems.size() >= 5u,
-        "HierarchicalDataTemplate should generate >= 5 sample TreeViewItems under 'Media' (got " +
-        std::to_string(mediaSubItems.size()) + ")");
+    // Verify HierarchicalDataTemplate registered >= 5 child items under 'Media' before expansion
+    std::int64_t mediaLogicalItemCnt = 0;
+    {
+        const aero::VisualNode* mediaNode = host.World().GetNode(mediaCatId);
+        aero::UnifiedValue cntVal{};
+        Require(mediaNode && mediaNode->scriptOwner.valid() &&
+                host.InvokeScriptMethod(mediaNode->scriptOwner, "ItemCount", {}, &cntVal) &&
+                cntVal.tryGetInt64(mediaLogicalItemCnt) && mediaLogicalItemCnt >= 5,
+            "HierarchicalDataTemplate should register >= 5 logical items under 'Media' (got " +
+            std::to_string(mediaLogicalItemCnt) + ")");
+    }
 
     // Helper to expand a category TreeViewItem by clicking its header Border/ExpandButton
     auto clickTreeItemHeader = [&](aero::VisualNodeId itemId) {
@@ -3226,6 +3231,13 @@ void TestInteractiveGallery(aero::rs_comp::CompilerSession& session) {
         Require(mediaNode && ReadBoolMember(host, mediaNode->scriptOwner, "IsExpanded", mediaExpanded) && mediaExpanded,
             "Clicking 'Media' category TreeViewItem should expand it (IsExpanded == true)");
     }
+
+    // Verify HierarchicalDataTemplate materialized child TreeViewItems under 'Media' upon expansion
+    std::vector<aero::VisualNodeId> mediaSubItems;
+    CollectDescendantsByTypeName(host, mediaCatId, "TreeViewItem", mediaSubItems);
+    Require(mediaSubItems.size() >= 5u,
+        "HierarchicalDataTemplate should generate >= 5 sample TreeViewItems under 'Media' after expansion (got " +
+        std::to_string(mediaSubItems.size()) + ")");
 
     auto activeSampleContainerId = [&]() -> aero::VisualNodeId {
         const aero::VisualNodeId c1 = host.FindVisualByOwnerName("SampleContainer1");
@@ -3533,9 +3545,9 @@ void TestInteractiveGalleryReportedSubPages(aero::rs_comp::CompilerSession& sess
                 std::cout << "[DIAG][ComboBox][" << cbName << "] items=" << itemCnt
                           << " containers=" << contCnt
                           << " vp=(" << cbVp.x << "," << cbVp.y << " " << cbVp.width << "x" << cbVp.height << ")\n";
-                Require(itemCnt == kExpectedItems[ciIdx] && contCnt == kExpectedItems[ciIdx],
+                Require(itemCnt == kExpectedItems[ciIdx],
                     std::string("Gallery/ComboBox ") + cbName + " expected " +
-                    std::to_string(kExpectedItems[ciIdx]) + " items/containers (got items=" +
+                    std::to_string(kExpectedItems[ciIdx]) + " logical items (got items=" +
                     std::to_string(itemCnt) + ", containers=" + std::to_string(contCnt) + ")");
                 Require(cbVp.width > 20.0f && cbVp.height > 10.0f,
                     std::string("Gallery/ComboBox ") + cbName + " degenerate viewport bounds");
@@ -3545,6 +3557,8 @@ void TestInteractiveGalleryReportedSubPages(aero::rs_comp::CompilerSession& sess
                 for (int f = 0; f < 6; ++f) {
                     host.StepFrame(1.0f / 60.0f, f == 5);
                 }
+                std::int64_t postItemCnt = -1, postContCnt = -1;
+                readItemAndContainerCounts(cbId, postItemCnt, postContCnt);
                 bool isOpen = false;
                 if (cbNode && cbNode->scriptOwner.valid()) {
                     (void)ReadBoolMember(host, cbNode->scriptOwner, "IsDropDownOpen", isOpen);
@@ -3554,13 +3568,16 @@ void TestInteractiveGalleryReportedSubPages(aero::rs_comp::CompilerSession& sess
                 const aero::VisualNode* visPopNode = visPopId.IsValid() ? host.World().GetNode(visPopId) : nullptr;
                 const aero::Rect popVp = visPopNode ? NodeViewportBounds(*visPopNode) : aero::Rect{};
                 std::cout << "[DIAG][ComboBox][" << cbName << "] afterClick IsDropDownOpen=" << (isOpen ? 1 : 0)
+                          << " containers=" << postContCnt
                           << " visPop=" << (visPopId.IsValid() ? 1 : 0)
                           << " popItems=" << popItems.size()
                           << " popVp=(" << popVp.x << "," << popVp.y << " " << popVp.width << "x" << popVp.height << ")\n";
-                Require(isOpen && visPopId.IsValid() && popVp.width > 20.0f && popVp.height > 20.0f &&
+                Require(isOpen && postContCnt == kExpectedItems[ciIdx] &&
+                        visPopId.IsValid() && popVp.width > 20.0f && popVp.height > 20.0f &&
                         static_cast<std::int64_t>(popItems.size()) >= kExpectedItems[ciIdx],
                     std::string("Gallery/ComboBox ") + cbName + " failed to open dropdown with items (open=" +
-                    std::to_string(isOpen ? 1 : 0) + ", popItems=" + std::to_string(popItems.size()) + ")");
+                    std::to_string(isOpen ? 1 : 0) + ", containers=" + std::to_string(postContCnt) +
+                    ", popItems=" + std::to_string(popItems.size()) + ")");
 
                 // Dismiss popup via Escape before testing next ComboBox
                 host.InjectKey(aero::KeyCode::Escape, true);
@@ -6256,6 +6273,180 @@ void TestRound4All6Fixes(aero::rs_comp::CompilerSession& session) {
     }
 }
 
+void TestGalleryContainerLazyAndMemoryLeak(aero::rs_comp::CompilerSession& session, std::uint32_t clearRgba) {
+    (void)clearRgba;
+    std::cout << "[Regression] Gallery Container Lazy Realization & 3-Cycle Leak Check...\n";
+    aero::AeroV3CompileInput ci;
+    aero::AeroAppHostConfig hc;
+    Require(BuildDiscoveredSample(fs::path(AERO_SAMPLES_DIR) / "Gallery", &session, ci, hc, 1280u, 800u),
+        "Gallery container leak test discover failed");
+    aero::AeroAppHost host(hc);
+    std::string err;
+    Require(host.CompileAndLoad(ci, &err), "Gallery container leak test load failed: " + err);
+    for (int f = 0; f < 10; ++f) {
+        host.StepFrame(1.0f / 60.0f, f == 9);
+    }
+
+    auto selectContainerPage = [&](const char* pageName) -> bool {
+        aero::UnifiedValue ret{};
+        const bool okCall = host.InvokeScriptMethod(
+            host.RootScriptObject(),
+            "SelectSampleByName",
+            {aero::UnifiedValue{aero::rs_rt::StringValue{std::string(pageName)}}},
+            &ret);
+        bool okLoad = false;
+        (void)ret.tryGetBool(okLoad);
+        if (!okCall || !okLoad) {
+            return false;
+        }
+        host.StepFrame(1.0f / 60.0f, false);
+        host.StepFrame(1.0f / 60.0f, true);
+        return true;
+    };
+
+    auto verifyLazyInteraction = [&](const char* pageName, auto&& actionFn) -> bool {
+        if (!selectContainerPage(pageName)) {
+            return false;
+        }
+        std::vector<std::uint8_t> beforeRgba;
+        if (!host.RenderHeadlessRgba(1280u, 800u, beforeRgba)) {
+            return false;
+        }
+        if (!actionFn()) {
+            return false;
+        }
+        host.StepFrame(1.0f / 60.0f, false);
+        host.StepFrame(1.0f / 60.0f, true);
+        std::vector<std::uint8_t> afterRgba;
+        if (!host.RenderHeadlessRgba(1280u, 800u, afterRgba)) {
+            return false;
+        }
+        return CountChangedPixels(beforeRgba, afterRgba) > 0u;
+    };
+
+    auto sampleRootOrWorld = [&]() -> aero::VisualNodeId {
+        const aero::VisualNodeId sr = host.FindVisualByOwnerName("SampleContainer");
+        return sr.IsValid() ? sr : host.World().Root();
+    };
+
+    const std::array<const char*, 11> kContainerPages = {
+        "ItemsControl", "ComboBox", "ListBox", "ListView", "TreeView",
+        "TabControl", "Expander", "ScrollViewer", "Menu", "ContextMenu", "ToolBar"
+    };
+
+    std::size_t cycle2Nodes = 0u, cycle3Nodes = 0u;
+    std::size_t cycle2Boxes = 0u, cycle3Boxes = 0u;
+    std::size_t cycle2Objs = 0u, cycle3Objs = 0u;
+
+    for (int cyc = 1; cyc <= 3; ++cyc) {
+        for (const char* pg : kContainerPages) {
+            Require(selectContainerPage(pg),
+                "Gallery container leak test failed switching to " + std::string(pg));
+        }
+
+        if (cyc == 1) {
+            Require(verifyLazyInteraction("TreeView", [&]() {
+                std::vector<aero::VisualNodeId> items;
+                CollectDescendantsByTypeName(host, sampleRootOrWorld(), "TreeViewItem", items);
+                for (const auto tid : items) {
+                    const auto* tn = host.World().GetNode(tid);
+                    if (!tn || !tn->hasScriptOwner || !tn->scriptOwner.valid()) { continue; }
+                    const aero::Rect vp = NodeViewportBounds(*tn);
+                    if (vp.x <= 220.0f || vp.width <= 20.0f || vp.height <= 10.0f) { continue; }
+                    bool isExp = true;
+                    if (ReadBoolMember(host, tn->scriptOwner, "_isExpanded", isExp) && !isExp) {
+                        aero::UnifiedValue icVal{};
+                        std::int64_t ic = 0;
+                        if (host.InvokeScriptMethod(tn->scriptOwner, "ItemCount", {}, &icVal) &&
+                            icVal.tryGetInt64(ic) && ic > 0) {
+                            host.InjectClick(vp.x + 10.0f, vp.y + 10.0f);
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            }), "Gallery container lazy TreeViewItem expand failed");
+
+            Require(verifyLazyInteraction("ComboBox", [&]() {
+                std::vector<aero::VisualNodeId> cbs;
+                CollectDescendantsByTypeName(host, sampleRootOrWorld(), "ComboBox", cbs);
+                for (const auto cid : cbs) {
+                    const auto* cn = host.World().GetNode(cid);
+                    if (!cn || !cn->hasScriptOwner || !cn->scriptOwner.valid()) { continue; }
+                    const aero::Rect vp = NodeViewportBounds(*cn);
+                    if (vp.width > 40.0f && vp.height > 10.0f && vp.x > 220.0f) {
+                        host.InjectClick(vp.x + vp.width - 14.0f, vp.y + vp.height * 0.5f);
+                        return true;
+                    }
+                }
+                return false;
+            }), "Gallery container lazy ComboBox dropdown open failed");
+
+            Require(verifyLazyInteraction("Expander", [&]() {
+                std::vector<aero::VisualNodeId> exps;
+                CollectDescendantsByTypeName(host, sampleRootOrWorld(), "Expander", exps);
+                for (const auto eid : exps) {
+                    const auto* en = host.World().GetNode(eid);
+                    if (!en || !en->hasScriptOwner || !en->scriptOwner.valid()) { continue; }
+                    const aero::Rect vp = NodeViewportBounds(*en);
+                    if (vp.x <= 220.0f || vp.width <= 100.0f || vp.height <= 20.0f) { continue; }
+                    bool isExp = true;
+                    if (ReadBoolMember(host, en->scriptOwner, "_isExpanded", isExp) && !isExp) {
+                        host.InjectClick(vp.x + 30.0f, vp.y + 12.0f);
+                        return true;
+                    }
+                }
+                return false;
+            }), "Gallery container lazy Expander expand failed");
+
+            Require(verifyLazyInteraction("TabControl", [&]() {
+                std::vector<aero::VisualNodeId> tcs;
+                CollectDescendantsByTypeName(host, sampleRootOrWorld(), "TabControl", tcs);
+                if (!tcs.empty()) {
+                    const auto* tn = host.World().GetNode(tcs[0]);
+                    if (tn && tn->hasScriptOwner && tn->scriptOwner.valid()) {
+                        return host.InvokeScriptMethod(
+                            tn->scriptOwner,
+                            "SelectTabIndex",
+                            {aero::UnifiedValue{std::int64_t{1}}});
+                    }
+                }
+                return false;
+            }), "Gallery container TabControl switch failed");
+        }
+
+        aero::rs_rt::ShadowStack emptyStack;
+        host.Domains().uiHeap().collectFull(emptyStack);
+        if (host.World().SweepDeadObjectBoxes() > 0u) {
+            host.Domains().uiHeap().collectFull(emptyStack);
+        }
+        (void)host.Domains().uiHeap().trimExcessCapacity();
+
+        if (cyc == 2) {
+            cycle2Nodes = host.World().LiveNodeCount();
+            cycle2Boxes = host.World().LiveObjectBoxCount();
+            cycle2Objs = host.Domains().uiHeap().liveObjects();
+        } else if (cyc == 3) {
+            cycle3Nodes = host.World().LiveNodeCount();
+            cycle3Boxes = host.World().LiveObjectBoxCount();
+            cycle3Objs = host.Domains().uiHeap().liveObjects();
+        }
+    }
+
+    std::cout << "[MEM][CONTAINER_3CYC] c2_nodes=" << cycle2Nodes << " c3_nodes=" << cycle3Nodes
+              << " c2_boxes=" << cycle2Boxes << " c3_boxes=" << cycle3Boxes
+              << " c2_objs=" << cycle2Objs << " c3_objs=" << cycle3Objs << "\n";
+    Require(cycle3Nodes <= cycle2Nodes + 2u,
+        "Gallery 3-cycle container switching must not leak VisualNodes (c2=" +
+        std::to_string(cycle2Nodes) + ", c3=" + std::to_string(cycle3Nodes) + ")");
+    Require(cycle3Boxes <= cycle2Boxes + 2u,
+        "Gallery 3-cycle container switching must not leak ObjectBoxes (c2=" +
+        std::to_string(cycle2Boxes) + ", c3=" + std::to_string(cycle3Boxes) + ")");
+    Require(cycle3Objs <= cycle2Objs + 64u,
+        "Gallery 3-cycle container switching must keep uiHeap liveObjects bounded (c2=" +
+        std::to_string(cycle2Objs) + ", c3=" + std::to_string(cycle3Objs) + ")");
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -6326,6 +6517,7 @@ int main(int argc, char** argv) {
         if (want("reviewfixes")) { TestRegressionReviewFixes(sharedSession); }
         if (want("round3fixes")) { TestRound3All18Fixes(sharedSession); }
         if (want("round4fixes")) { TestRound4All6Fixes(sharedSession); }
+        if (want("galleryleak")) { TestGalleryContainerLazyAndMemoryLeak(sharedSession, clearRgba); }
     }
 
     if (want("interactive")) {
@@ -6351,6 +6543,7 @@ int main(int argc, char** argv) {
         TestRegressionReviewFixes(sharedSession);
         TestRound3All18Fixes(sharedSession);
         TestRound4All6Fixes(sharedSession);
+        TestGalleryContainerLazyAndMemoryLeak(sharedSession, clearRgba);
     }
 
     if (gFailureCount != 0) {

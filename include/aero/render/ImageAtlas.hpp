@@ -307,6 +307,7 @@ public:
 
     [[nodiscard]] std::size_t LoadedEntryCount() const noexcept;
     [[nodiscard]] std::size_t StandaloneTextureCount() const noexcept;
+    [[nodiscard]] std::size_t EstimatedMemoryBytes() const noexcept;
 
     void Clear() noexcept;
 

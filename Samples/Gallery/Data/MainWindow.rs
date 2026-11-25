@@ -445,7 +445,6 @@ public partial class MainWindow : Window
                 old2.DisposeSubtree();
             }
         }
-        BindingEngine.Flush();
 
         ResourceDictionary sampleRes = this._sampleThemeResources != null ? this._sampleThemeResources : this.Resources;
         UIElement preview = XamlReader.LoadUri(xamlUri, sampleRes);

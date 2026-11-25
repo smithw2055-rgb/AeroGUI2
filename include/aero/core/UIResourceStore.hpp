@@ -158,6 +158,7 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         return pathMaskTotalBytes_;
     }
+    [[nodiscard]] std::size_t EstimatedMemoryBytes() const noexcept;
 
     void BeginPathMaskFrame() noexcept;
     void ClearAll() noexcept;

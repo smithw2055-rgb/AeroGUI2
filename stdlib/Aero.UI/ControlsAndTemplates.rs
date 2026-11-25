@@ -460,10 +460,13 @@ public class Control : FrameworkElement {
             if (!_templateRoot._isDisposedTree) { q.Push(_templateRoot); }
             _templateRoot = null;
         }
+        bool hadRes = _hasTemplateResources || _hasTemplateAmbientResources;
         _template = null;
         _hasTemplateResources = false;
         _hasTemplateAmbientResources = false;
-        ResourceDictionary.BumpGlobalMutationEpoch();
+        if (hadRes) {
+            ResourceDictionary.BumpGlobalMutationEpoch();
+        }
     }
 
     public override bool ApplyTemplate() {
@@ -471,6 +474,8 @@ public class Control : FrameworkElement {
         if (_template != null && _templateApplied) {
             _template.ResetTriggers(this);
         }
+        bool prevHasTplRes = _hasTemplateResources;
+        bool prevHasTplAmb = _hasTemplateAmbientResources;
         UIElement self = this;
         if (_templateRoot != null) {
             DetachUserContentFromTemplate(_templateRoot, self);
@@ -491,13 +496,18 @@ public class Control : FrameworkElement {
         _templateRoot = nextRoot;
         _hasTemplateResources = (_template != null && (_template.HasResources() || _template.RawResourcesOrNull() != null));
         _hasTemplateAmbientResources = (_template != null && _template.AmbientResources != null);
-        ResourceDictionary.BumpGlobalMutationEpoch();
+        if (prevHasTplRes || prevHasTplAmb || _hasTemplateResources || _hasTemplateAmbientResources) {
+            ResourceDictionary.BumpGlobalMutationEpoch();
+        }
         _templateApplied = true;
         SyncBoxStyleToNative();
         SyncPadding();
         SyncInteractiveFlags();
         if (_templateRoot != null) {
-            MarkTemplateOwner(_templateRoot, this);
+            if (_template == null || _templateRoot.TemplatedParent != self) {
+                MarkTemplateOwner(_templateRoot, this);
+            }
+            BindingEngine.BeginBatch();
             bool prevSuppress = _suppressChildAutoLoaded;
             bool prevSuppressStyle = _suppressChildAutoStyle;
             _suppressChildAutoLoaded = true;
@@ -508,8 +518,9 @@ public class Control : FrameworkElement {
             _templateRoot.ApplyStyleSubtree();
             _templateRoot.RefreshDynamicResourcesRecursive();
             ExpandNestedTemplateControls(_templateRoot, self);
-            BindingEngine.FlushSubtree(_templateRoot);
             SyncTemplatePresenters();
+            BindingEngine.EndBatch();
+            BindingEngine.FlushSubtree(_templateRoot);
         }
         if (_templateRoot != null && _template != null) {
             _template.AttachNonEventTriggers(this);
@@ -1111,11 +1122,13 @@ public class ContentControl : Control {
     public void SetContent(bool v) { SetContentBox(DependencyObject.BoxBool(v)); }
     public void SetContent(object v) { SetContentBox(DependencyObject.BoxObject(v)); }
 
+    protected virtual bool ShouldRealizeContent() { return true; }
+
     public void SetContentBox(DependencyObject newBox) {
         DependencyObject oldBox = _contentBox;
         _contentBox = newBox;
         if (_presenter != null) {
-            _presenter.SetContentBox(_contentBox);
+            _presenter.SetContentBox(ShouldRealizeContent() ? _contentBox : null);
         }
         NotifyBoundPropertyChanged("Content", _contentBox);
         if (UIElement._attachedPropHook != null) {
@@ -1140,7 +1153,7 @@ public class ContentControl : Control {
         _contentTemplate = tpl;
         _contentBox = newBox;
         if (_presenter != null) {
-            _presenter.SetContentAndTemplate(_contentBox, _contentTemplate);
+            _presenter.SetContentAndTemplate(ShouldRealizeContent() ? _contentBox : null, _contentTemplate);
         }
         NotifyBoundPropertyChanged("Content", _contentBox);
         if (UIElement._attachedPropHook != null) {
@@ -1225,7 +1238,7 @@ public class ContentControl : Control {
                 _presenter.TemplatedParent = this;
                 _presenter.SyncFromTemplatedParent(this);
             }
-            _presenter.SetContentAndTemplate(_contentBox, _contentTemplate);
+            _presenter.SetContentAndTemplate(ShouldRealizeContent() ? _contentBox : null, _contentTemplate);
         }
     }
 
@@ -1397,6 +1410,7 @@ public class GroupBox : HeaderedContentControl {
 public class Expander : HeaderedContentControl {
     internal override int FastPropEpochCategory() { return 7; }
     private bool _isExpanded = false;
+    private bool _hasRealizedContent = false;
     private ExpandDirection _expandDirection = ExpandDirection.Down;
     private Border _headerToggle;
     private TextBlock _chevron;
@@ -1416,6 +1430,33 @@ public class Expander : HeaderedContentControl {
 
     public override string GetTypeName() { return "Expander"; }
 
+    protected override bool ShouldRealizeContent() { return _hasRealizedContent; }
+
+    public override DependencyObject GetNamedContentBox(string source) {
+        if (source != "Header" && source != "SelectionBoxItem" && !_hasRealizedContent) {
+            return null;
+        }
+        return base.GetNamedContentBox(source);
+    }
+
+    private void RealizeExpanderContentIfNeeded() {
+        if (_hasRealizedContent || _isDisposedTree) { return; }
+        _hasRealizedContent = true;
+        if (_presenter != null) {
+            _presenter.SetContentAndTemplate(ContentBox, ContentTemplate);
+            if (ContentBox is UIElement) {
+                UIElement cel = ContentBox as UIElement;
+                if (!cel._isDisposedTree && !cel.HasLoadedFired()) {
+                    cel.ApplyStyleSubtree();
+                    cel.RefreshDynamicResourcesRecursive();
+                    cel.ApplyTemplateSubtree();
+                    if (HasLoadedFired()) { cel.EnsureLoadedSubtree(); }
+                    BindingEngine.FlushSubtree(cel);
+                }
+            }
+        }
+    }
+
     protected override void CollectExtraDisposeTargets(UIElement[] q) {
         base.CollectExtraDisposeTargets(q);
         _headerToggle = null;
@@ -1432,6 +1473,9 @@ public class Expander : HeaderedContentControl {
         set {
             if (_isExpanded == value) { return; }
             _isExpanded = value;
+            if (_isExpanded) {
+                RealizeExpanderContentIfNeeded();
+            }
             SyncExpanderState();
             UpdateTriggersAndStates();
             NotifyBoundPropertyChanged("IsExpanded", DependencyObject.BoxBool(_isExpanded));

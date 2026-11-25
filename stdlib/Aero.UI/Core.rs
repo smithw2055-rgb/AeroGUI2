@@ -1393,10 +1393,13 @@ public class NativeObjectBox : DependencyObject {
     private bool _hasSlot;
 
     public NativeObjectBox(object value) {
-        _slot = Visual_Create(0);
-        _hasSlot = true;
-        ParseUtil.MarkNativeReady();
-        Visual_BindOwner(_slot, value, 0);
+        if (value != null) {
+            _slot = Visual_Create(-1);
+            _hasSlot = true;
+            ParseUtil.MarkNativeReady();
+            Visual_BindOwner(_slot, value, 0);
+            Visual_BindOwner(_slot, this, 1);
+        }
     }
 
     public override object UnboxObject() {
@@ -2719,6 +2722,21 @@ internal class UIElementRareData {
     internal string RiveSource = "";
     internal ResourceDictionary LocResources;
     internal string LocSource = "";
+    internal string Uid = "";
+    internal Transform LayoutTransform;
+    internal Brush OpacityMask;
+}
+
+internal class UIElementLayoutExtra {
+    internal int DynResMutEpoch = -1;
+    internal int DynResChainEpoch = -1;
+    internal float CanvasLeft = ParseUtil.NaN();
+    internal float CanvasTop = ParseUtil.NaN();
+    internal float CanvasRight = ParseUtil.NaN();
+    internal float CanvasBottom = ParseUtil.NaN();
+    internal string FlowDirection = "LeftToRight";
+    internal string[] DynPropKeys;
+    internal DependencyObject[] DynPropVals;
 }
 
 internal class ResourceScopeCache {
@@ -2729,6 +2747,8 @@ internal class ResourceScopeCache {
     public string K1; public DependencyObject V1;
     public string K2; public DependencyObject V2;
     public string K3; public DependencyObject V3;
+    public Dictionary<string, int> OverflowIdx;
+    public DependencyObject[] OverflowVals;
 }
 
 public partial class UIElement : DependencyObject {
@@ -2849,13 +2869,17 @@ public partial class UIElement : DependencyObject {
     private VisualKind _visualKind = VisualKind.Box;
 
     private string _name = "";
-    private string _uid = "";
     private DependencyObject _tag;
     internal UIElementRareData _rare;
+    internal UIElementLayoutExtra _extra;
     private ResourceScopeCache _resCache;
     internal UIElementRareData EnsureRare() {
         if (_rare == null) { _rare = new UIElementRareData(); }
         return _rare;
+    }
+    internal UIElementLayoutExtra EnsureExtra() {
+        if (_extra == null) { _extra = new UIElementLayoutExtra(); }
+        return _extra;
     }
     private DependencyObject _explicitDataContext;
     private DependencyObject _inheritedDataContext;
@@ -2900,17 +2924,11 @@ public partial class UIElement : DependencyObject {
     private int _gridRowSpan = 1;
     private int _gridColSpan = 1;
     private Dock _dock = Dock.Left;
-    private float _canvasLeft = ParseUtil.NaN();
-    private float _canvasTop = ParseUtil.NaN();
-    private float _canvasRight = ParseUtil.NaN();
-    private float _canvasBottom = ParseUtil.NaN();
 
     private Transform _renderTransform;
-    private Transform _layoutTransform;
     private Point _renderTransformOrigin;
     internal static AttachedPropChangedHook _attachedPropHook;
     private Effect _effect;
-    private Brush _opacityMask;
     private BlendingMode _blendMode = BlendingMode.Normal;
 
     private Brush _background;
@@ -2927,14 +2945,11 @@ public partial class UIElement : DependencyObject {
     private string _inheritedFontWeight = "";
     private Brush _explicitTextForeground;
     private Brush _inheritedTextForeground;
-    private string _flowDirection = "LeftToRight";
     internal Style _appliedStyle;
     internal bool _hasTemplateResources = false;
     internal bool _hasTemplateAmbientResources = false;
     public string _internalRootName = "";
     internal bool _isDisposedTree = false;
-    private string[] _dynPropKeys;
-    private DependencyObject[] _dynPropVals;
     internal UIElement _logicalParent;
     private string[] _localProps;
     internal string[] _activeTriggerProps;
@@ -2989,7 +3004,6 @@ public partial class UIElement : DependencyObject {
 
     private void InitElement(VisualKind kind) {
         if (_name == null) { _name = ""; }
-        if (_uid == null) { _uid = ""; }
         _width = ParseUtil.NaN();
         _height = ParseUtil.NaN();
         _maxWidth = ParseUtil.PositiveInfinity();
@@ -3003,16 +3017,11 @@ public partial class UIElement : DependencyObject {
         _gridRowSpan = 1;
         _gridColSpan = 1;
         _dock = Dock.Left;
-        _canvasLeft = ParseUtil.NaN();
-        _canvasTop = ParseUtil.NaN();
-        _canvasRight = ParseUtil.NaN();
-        _canvasBottom = ParseUtil.NaN();
         _blendMode = BlendingMode.Normal;
         if (_explicitFontFamily == null) { _explicitFontFamily = ""; }
         if (_inheritedFontFamily == null) { _inheritedFontFamily = ""; }
         if (_explicitFontWeight == null) { _explicitFontWeight = ""; }
         if (_inheritedFontWeight == null) { _inheritedFontWeight = ""; }
-        if (_flowDirection == null || _flowDirection.Length == 0) { _flowDirection = "LeftToRight"; }
         _children = null;
         _detachedLogicalChildren = null;
         _margin = Thickness.SharedZero();
@@ -3051,8 +3060,8 @@ public partial class UIElement : DependencyObject {
         set { _name = value == null ? "" : value; }
     }
     public string Uid {
-        get { return _uid; }
-        set { _uid = value == null ? "" : value; }
+        get { return _rare != null ? _rare.Uid : ""; }
+        set { EnsureRare().Uid = value == null ? "" : value; }
     }
     protected void NotifyBoundPropertyChanged(string propName, DependencyObject boxedValue) {
         BumpPropEpoch();
@@ -3286,9 +3295,13 @@ public partial class UIElement : DependencyObject {
         get { return _style; }
         set {
             if (_style == value && (_appliedStyle == value || _closedPopupBuildDepth > 0)) { return; }
+            Style prev = _style;
             _style = value;
             _appliedStyle = null;
-            ResourceDictionary.BumpGlobalMutationEpoch();
+            if ((prev != null && !prev.HasNoStyleResourcesFast()) ||
+                (value != null && !value.HasNoStyleResourcesFast())) {
+                ResourceDictionary.BumpGlobalMutationEpoch();
+            }
             if (_closedPopupBuildDepth > 0) { return; }
             ApplyStyleInternal();
         }
@@ -3330,6 +3343,7 @@ public partial class UIElement : DependencyObject {
         }
         _dynResProps.Push(propName);
         _dynResKeys.Push(resourceKey);
+        if (_extra != null) { _extra.DynResMutEpoch = -1; }
         ApplyDynamicResourceAt(_dynResProps.Length - 1);
     }
 
@@ -3349,6 +3363,7 @@ public partial class UIElement : DependencyObject {
                 _dynResKeys.RemoveAt(i);
             }
         }
+        if (_extra != null) { _extra.DynResMutEpoch = -1; }
     }
 
     private void ApplyDynamicResourceAt(int idx) {
@@ -3360,11 +3375,18 @@ public partial class UIElement : DependencyObject {
     }
 
     public void RefreshDynamicResourcesRecursive() {
+        int mutEp = ResourceDictionary._globalMutationEpoch;
         if (_children == null || _children.Length == 0) {
             if (!_isDisposedTree && _dynResProps != null) {
+                UIElementLayoutExtra ex = EnsureExtra();
+                if (ex.DynResMutEpoch == mutEp && ex.DynResChainEpoch == _ancestorChainEpoch) {
+                    return;
+                }
                 for (int i = 0; i < _dynResProps.Length; i += 1) {
                     ApplyDynamicResourceAt(i);
                 }
+                ex.DynResMutEpoch = mutEp;
+                ex.DynResChainEpoch = _ancestorChainEpoch;
             }
             return;
         }
@@ -3376,8 +3398,13 @@ public partial class UIElement : DependencyObject {
             idx += 1;
             if (cur == null || cur._isDisposedTree) { continue; }
             if (cur._dynResProps != null) {
-                for (int i = 0; i < cur._dynResProps.Length; i += 1) {
-                    cur.ApplyDynamicResourceAt(i);
+                UIElementLayoutExtra ex = cur.EnsureExtra();
+                if (ex.DynResMutEpoch != mutEp || ex.DynResChainEpoch != cur._ancestorChainEpoch) {
+                    for (int i = 0; i < cur._dynResProps.Length; i += 1) {
+                        cur.ApplyDynamicResourceAt(i);
+                    }
+                    ex.DynResMutEpoch = mutEp;
+                    ex.DynResChainEpoch = cur._ancestorChainEpoch;
                 }
             }
             if (cur != this && cur.IsClosedPopupBoundary()) { continue; }
@@ -3404,8 +3431,12 @@ public partial class UIElement : DependencyObject {
             if (active == _appliedStyle) {
                 active.EvaluateTriggers(this);
             } else {
+                Style prevApplied = _appliedStyle;
                 _appliedStyle = active;
-                ResourceDictionary.BumpGlobalMutationEpoch();
+                if ((prevApplied != null && !prevApplied.HasNoStyleResourcesFast()) ||
+                    !active.HasNoStyleResourcesFast()) {
+                    ResourceDictionary.BumpGlobalMutationEpoch();
+                }
                 active.ApplyTo(this);
                 OnStyleApplied(active);
             }
@@ -3415,7 +3446,7 @@ public partial class UIElement : DependencyObject {
 
     public void ApplyStyleSubtree() {
         if (!(this is Control) && (_children == null || _children.Length == 0)) {
-            if (!_isDisposedTree) { ApplyStyleInternal(); }
+            if (!_isDisposedTree && (_style == null || _style != _appliedStyle)) { ApplyStyleInternal(); }
             return;
         }
         var q = new UIElement[0];
@@ -3426,7 +3457,9 @@ public partial class UIElement : DependencyObject {
             idx += 1;
             if (cur == null || cur._isDisposedTree) { continue; }
             UIElement prevTpl = (cur is Control) ? (cur as Control).TemplateRoot() : null;
-            cur.ApplyStyleInternal();
+            if (cur._style == null || cur._style != cur._appliedStyle) {
+                cur.ApplyStyleInternal();
+            }
             if (cur._isDisposedTree) { continue; }
             UIElement nextTpl = (cur is Control) ? (cur as Control).TemplateRoot() : null;
             if (cur != this && cur.IsClosedPopupBoundary()) { continue; }
@@ -3674,12 +3707,12 @@ public partial class UIElement : DependencyObject {
         set { _renderTransform = value; SyncTransform2D(); NotifyBoundPropertyChanged("RenderTransform", _renderTransform); }
     }
     public Transform LayoutTransform {
-        get { return _layoutTransform; }
-        set { _layoutTransform = value; SyncLayoutTransform(); NotifyBoundPropertyChanged("LayoutTransform", _layoutTransform); }
+        get { return _rare != null ? _rare.LayoutTransform : null; }
+        set { EnsureRare().LayoutTransform = value; SyncLayoutTransform(); NotifyBoundPropertyChanged("LayoutTransform", value); }
     }
     internal void EnsureLayoutTransformEnabledForAnim() {
         if (!_hasNative || HasUiFlag(1)) { return; }
-        if (_layoutTransform != null) {
+        if (_rare != null && _rare.LayoutTransform != null) {
             SyncLayoutTransform();
         } else {
             SetUiFlag(1, true);
@@ -3735,8 +3768,13 @@ public partial class UIElement : DependencyObject {
         }
     }
     public Brush OpacityMask {
-        get { return _opacityMask; }
-        set { if (_opacityMask == value) { return; } _opacityMask = value; SyncOpacityMask(); NotifyBoundPropertyChanged("OpacityMask", _opacityMask); }
+        get { return _rare != null ? _rare.OpacityMask : null; }
+        set {
+            if (OpacityMask == value) { return; }
+            EnsureRare().OpacityMask = value;
+            SyncOpacityMask();
+            NotifyBoundPropertyChanged("OpacityMask", value);
+        }
     }
     public BlendingMode BlendMode {
         get { return _blendMode; }
@@ -4018,10 +4056,10 @@ public partial class UIElement : DependencyObject {
         int guard = 0;
         while (cur != null && guard < 256) {
             guard += 1;
-            if (cur.HasUiFlag(16)) { return cur._flowDirection; }
+            if (cur.HasUiFlag(16)) { return cur._extra != null ? cur._extra.FlowDirection : "LeftToRight"; }
             cur = cur.Parent;
         }
-        return _flowDirection;
+        return _extra != null ? _extra.FlowDirection : "LeftToRight";
     }
 
     public string FlowDirection {
@@ -4029,8 +4067,9 @@ public partial class UIElement : DependencyObject {
         set {
             string fd = (value == null || value.Trim().Length == 0) ? "LeftToRight" : value.Trim();
             SetUiFlag(16, true);
-            if (_flowDirection != fd) {
-                _flowDirection = fd;
+            UIElementLayoutExtra ex = EnsureExtra();
+            if (ex.FlowDirection != fd) {
+                ex.FlowDirection = fd;
             }
             SyncAlignment();
             UpdateLayout();
@@ -4042,7 +4081,7 @@ public partial class UIElement : DependencyObject {
             int hEnc = EnumConvert.ToInt(_hAlign);
             if (HasUiFlag(16)) {
                 hEnc = hEnc + 256;
-                if (_flowDirection == "RightToLeft") { hEnc = hEnc + 512; }
+                if (_extra != null && _extra.FlowDirection == "RightToLeft") { hEnc = hEnc + 512; }
             }
             Visual_SetAlignment(__nativeHandle, hEnc, EnumConvert.ToInt(_vAlign));
         }
@@ -4096,14 +4135,15 @@ public partial class UIElement : DependencyObject {
     }
     public void SyncLayoutTransform() {
         if (!_hasNative) { return; }
-        if (_layoutTransform == null) {
+        Transform lt = _rare != null ? _rare.LayoutTransform : null;
+        if (lt == null) {
             SetUiFlag(1, false);
             Visual_SetLayoutTransform(__nativeHandle, 1.0f, 1.0f, 0.0f, false);
             return;
         }
         SetUiFlag(1, true);
         TransformData td = TransformData.SharedScratch();
-        _layoutTransform.Accumulate(td);
+        lt.Accumulate(td);
         Visual_SetLayoutTransform(__nativeHandle, td.SX, td.SY, td.RotDeg, true);
     }
     public void SyncTransform3D() {
@@ -4137,13 +4177,14 @@ public partial class UIElement : DependencyObject {
     }
     public void SyncOpacityMask() {
         if (!_hasNative) { return; }
-        if (_opacityMask == null) {
+        Brush om = _rare != null ? _rare.OpacityMask : null;
+        if (om == null) {
             Visual_SetOpacityMask(__nativeHandle, false, -1, 4294967295u, 1.0f);
             return;
         }
-        int gradId = _opacityMask.ResolveGradIdUnscaled();
-        uint solidRgba = _opacityMask.ResolveRgbaUnscaled();
-        float op = Math.Clampf(_opacityMask.Opacity, 0.0f, 1.0f);
+        int gradId = om.ResolveGradIdUnscaled();
+        uint solidRgba = om.ResolveRgbaUnscaled();
+        float op = Math.Clampf(om.Opacity, 0.0f, 1.0f);
         Visual_SetOpacityMask(__nativeHandle, true, gradId, solidRgba, op);
     }
 
@@ -4280,17 +4321,17 @@ public partial class UIElement : DependencyObject {
     }
     public static Dock GetDock(UIElement el) { return el == null ? Dock.Left : el._dock; }
 
-    public static void SetCanvasLeft(UIElement el, float v) { if (el != null) { el._canvasLeft = v; el.SyncCanvasOffsets(); } }
-    public static float GetCanvasLeft(UIElement el) { return el == null ? 0.0f : el._canvasLeft; }
-    public static void SetCanvasTop(UIElement el, float v) { if (el != null) { el._canvasTop = v; el.SyncCanvasOffsets(); } }
-    public static float GetCanvasTop(UIElement el) { return el == null ? 0.0f : el._canvasTop; }
-    public static void SetCanvasRight(UIElement el, float v) { if (el != null) { el._canvasRight = v; el.SyncCanvasOffsets(); } }
-    public static float GetCanvasRight(UIElement el) { return el == null ? 0.0f : el._canvasRight; }
-    public static void SetCanvasBottom(UIElement el, float v) { if (el != null) { el._canvasBottom = v; el.SyncCanvasOffsets(); } }
-    public static float GetCanvasBottom(UIElement el) { return el == null ? 0.0f : el._canvasBottom; }
+    public static void SetCanvasLeft(UIElement el, float v) { if (el != null) { el.EnsureExtra().CanvasLeft = v; el.SyncCanvasOffsets(); } }
+    public static float GetCanvasLeft(UIElement el) { return (el != null && el._extra != null) ? el._extra.CanvasLeft : ParseUtil.NaN(); }
+    public static void SetCanvasTop(UIElement el, float v) { if (el != null) { el.EnsureExtra().CanvasTop = v; el.SyncCanvasOffsets(); } }
+    public static float GetCanvasTop(UIElement el) { return (el != null && el._extra != null) ? el._extra.CanvasTop : ParseUtil.NaN(); }
+    public static void SetCanvasRight(UIElement el, float v) { if (el != null) { el.EnsureExtra().CanvasRight = v; el.SyncCanvasOffsets(); } }
+    public static float GetCanvasRight(UIElement el) { return (el != null && el._extra != null) ? el._extra.CanvasRight : ParseUtil.NaN(); }
+    public static void SetCanvasBottom(UIElement el, float v) { if (el != null) { el.EnsureExtra().CanvasBottom = v; el.SyncCanvasOffsets(); } }
+    public static float GetCanvasBottom(UIElement el) { return (el != null && el._extra != null) ? el._extra.CanvasBottom : ParseUtil.NaN(); }
     private void SyncCanvasOffsets() {
-        if (_hasNative) {
-            Visual_SetCanvasOffsets(__nativeHandle, _canvasLeft, _canvasTop, _canvasRight, _canvasBottom);
+        if (_hasNative && _extra != null) {
+            Visual_SetCanvasOffsets(__nativeHandle, _extra.CanvasLeft, _extra.CanvasTop, _extra.CanvasRight, _extra.CanvasBottom);
         }
     }
     public static void SetZIndex(UIElement el, int z) { if (el != null) { el.ZIndex = z; } }
@@ -4528,6 +4569,13 @@ public partial class UIElement : DependencyObject {
                     q.Push(cur._detachedLogicalChildren[i]);
                 }
             }
+            if (cur._tag is UIElement) {
+                UIElement tagEl = cur._tag as UIElement;
+                if (!tagEl._isDisposedTree && (tagEl._parent == null || tagEl._parent == cur)) {
+                    q.Push(tagEl);
+                }
+            }
+            cur._tag = null;
             if (cur._rare != null) {
                 UIElement cmEl = cur._rare.ContextMenuEl;
                 if (cmEl != null) {
@@ -4588,6 +4636,7 @@ public partial class UIElement : DependencyObject {
             cur._children = null;
             cur._detachedLogicalChildren = null;
             cur._rare = null;
+            cur._extra = null;
             cur._resCache = null;
             cur._resources = null;
             cur._ambientResources = null;
@@ -4607,8 +4656,6 @@ public partial class UIElement : DependencyObject {
             }
             cur._borderBrush = null;
             cur._renderTransform = null;
-            cur._layoutTransform = null;
-            cur._opacityMask = null;
             cur._dynResProps = null;
             cur._dynResKeys = null;
             cur._logicalParent = null;
@@ -4644,7 +4691,7 @@ public partial class UIElement : DependencyObject {
                 if (scoped && cur != this) {
                     if (cur._templatedParent == rootTp && cur._name == name) { return cur; }
                     if (cur.IsNamescopeBoundary()) { continue; }
-                    if (cur._templatedParent != rootTp && cur is Control && !(cur is ContentControl) && !(cur is ItemsControl)) { continue; }
+                    if (cur._templatedParent != rootTp && cur is Control && !(cur is ContentControl) && !cur.IsItemsControlBoundary()) { continue; }
                 } else {
                     if (cur._name == name) { return cur; }
                 }
@@ -4789,6 +4836,10 @@ public partial class UIElement : DependencyObject {
             if (rc.K1 == key) { return rc.V1; }
             if (rc.K2 == key) { return rc.V2; }
             if (rc.K3 == key) { return rc.V3; }
+            if (rc.OverflowIdx != null && rc.OverflowIdx.ContainsKey(key)) {
+                int oi = rc.OverflowIdx[key];
+                return (rc.OverflowVals != null && oi >= 0 && oi < rc.OverflowVals.Length) ? rc.OverflowVals[oi] : null;
+            }
         }
         DependencyObject res = anchor.FindResourceBoxUncached(key);
         if (rc == null) {
@@ -4803,13 +4854,22 @@ public partial class UIElement : DependencyObject {
             rc.K1 = null; rc.V1 = null;
             rc.K2 = null; rc.V2 = null;
             rc.K3 = null; rc.V3 = null;
+            rc.OverflowIdx = null;
+            rc.OverflowVals = null;
         }
-        int slot = rc.NextSlot;
-        if (slot == 0) { rc.K0 = key; rc.V0 = res; }
-        else if (slot == 1) { rc.K1 = key; rc.V1 = res; }
-        else if (slot == 2) { rc.K2 = key; rc.V2 = res; }
-        else { rc.K3 = key; rc.V3 = res; }
-        rc.NextSlot = slot >= 3 ? 0 : (slot + 1);
+        if (rc.K0 == null) { rc.K0 = key; rc.V0 = res; }
+        else if (rc.K1 == null) { rc.K1 = key; rc.V1 = res; }
+        else if (rc.K2 == null) { rc.K2 = key; rc.V2 = res; }
+        else if (rc.K3 == null) { rc.K3 = key; rc.V3 = res; }
+        else {
+            if (rc.OverflowIdx == null) {
+                rc.OverflowIdx = new Dictionary<string, int>();
+                rc.OverflowVals = new DependencyObject[0];
+            }
+            int oIdx = rc.OverflowVals.Length;
+            rc.OverflowVals.Push(res);
+            rc.OverflowIdx[key] = oIdx;
+        }
         return res;
     }
 
@@ -4941,22 +5001,24 @@ public partial class UIElement : DependencyObject {
     }
 
     private TransformGroup EnsureLayoutTransformGroup() {
-        if (_layoutTransform is TransformGroup) {
-            return _layoutTransform as TransformGroup;
+        UIElementRareData r = EnsureRare();
+        if (r.LayoutTransform is TransformGroup) {
+            return r.LayoutTransform as TransformGroup;
         }
         var tg = new TransformGroup();
-        if (_layoutTransform != null) {
-            tg.Add(_layoutTransform);
+        if (r.LayoutTransform != null) {
+            tg.Add(r.LayoutTransform);
         }
-        _layoutTransform = tg;
+        r.LayoutTransform = tg;
         return tg;
     }
 
     private void SetLayoutTransformScalar(string prop, float v) {
+        Transform curLt = _rare != null ? _rare.LayoutTransform : null;
         if (prop == "LayoutTransform.ScaleX" || prop == "LayoutTransform.ScaleY") {
-            if (_layoutTransform is ScaleTransform) {
-                if (prop == "LayoutTransform.ScaleX") { (_layoutTransform as ScaleTransform).ScaleX = v; }
-                else { (_layoutTransform as ScaleTransform).ScaleY = v; }
+            if (curLt is ScaleTransform) {
+                if (prop == "LayoutTransform.ScaleX") { (curLt as ScaleTransform).ScaleX = v; }
+                else { (curLt as ScaleTransform).ScaleY = v; }
                 SyncLayoutTransform();
                 return;
             }
@@ -4973,8 +5035,8 @@ public partial class UIElement : DependencyObject {
             return;
         }
         if (prop == "LayoutTransform.Angle" || prop == "LayoutTransform.Rotation") {
-            if (_layoutTransform is RotateTransform) {
-                (_layoutTransform as RotateTransform).Angle = v;
+            if (curLt is RotateTransform) {
+                (curLt as RotateTransform).Angle = v;
                 SyncLayoutTransform();
                 return;
             }
@@ -5190,7 +5252,8 @@ public partial class UIElement : DependencyObject {
         if (prop == "LayoutTransform.ScaleX" || prop == "LayoutTransform.ScaleY" ||
             prop == "LayoutTransform.Angle" || prop == "LayoutTransform.Rotation") {
             TransformData ltd = TransformData.SharedScratch();
-            if (_layoutTransform != null) { _layoutTransform.Accumulate(ltd); }
+            Transform lt = _rare != null ? _rare.LayoutTransform : null;
+            if (lt != null) { lt.Accumulate(ltd); }
             if (prop == "LayoutTransform.ScaleX") { return ltd.SX; }
             if (prop == "LayoutTransform.ScaleY") { return ltd.SY; }
             return ltd.RotDeg;
@@ -5425,10 +5488,10 @@ public partial class UIElement : DependencyObject {
         if (propName == "Grid.Column") { int gv = DependencyObject.UnboxInt(value, 0); SetGridColumn(this, gv); NotifyBoundPropertyChanged(propName, DependencyObject.BoxInt(_gridCol)); return true; }
         if (propName == "Grid.RowSpan") { int gv = DependencyObject.UnboxInt(value, 1); SetGridRowSpan(this, gv); NotifyBoundPropertyChanged(propName, DependencyObject.BoxInt(_gridRowSpan)); return true; }
         if (propName == "Grid.ColumnSpan") { int gv = DependencyObject.UnboxInt(value, 1); SetGridColumnSpan(this, gv); NotifyBoundPropertyChanged(propName, DependencyObject.BoxInt(_gridColSpan)); return true; }
-        if (propName == "Canvas.Left") { SetCanvasLeft(this, DependencyObject.UnboxFloat(value, 0.0f)); NotifyBoundPropertyChanged(propName, DependencyObject.BoxFloat(_canvasLeft)); return true; }
-        if (propName == "Canvas.Top") { SetCanvasTop(this, DependencyObject.UnboxFloat(value, 0.0f)); NotifyBoundPropertyChanged(propName, DependencyObject.BoxFloat(_canvasTop)); return true; }
-        if (propName == "Canvas.Right") { SetCanvasRight(this, DependencyObject.UnboxFloat(value, 0.0f)); NotifyBoundPropertyChanged(propName, DependencyObject.BoxFloat(_canvasRight)); return true; }
-        if (propName == "Canvas.Bottom") { SetCanvasBottom(this, DependencyObject.UnboxFloat(value, 0.0f)); NotifyBoundPropertyChanged(propName, DependencyObject.BoxFloat(_canvasBottom)); return true; }
+        if (propName == "Canvas.Left") { SetCanvasLeft(this, DependencyObject.UnboxFloat(value, 0.0f)); NotifyBoundPropertyChanged(propName, DependencyObject.BoxFloat(GetCanvasLeft(this))); return true; }
+        if (propName == "Canvas.Top") { SetCanvasTop(this, DependencyObject.UnboxFloat(value, 0.0f)); NotifyBoundPropertyChanged(propName, DependencyObject.BoxFloat(GetCanvasTop(this))); return true; }
+        if (propName == "Canvas.Right") { SetCanvasRight(this, DependencyObject.UnboxFloat(value, 0.0f)); NotifyBoundPropertyChanged(propName, DependencyObject.BoxFloat(GetCanvasRight(this))); return true; }
+        if (propName == "Canvas.Bottom") { SetCanvasBottom(this, DependencyObject.UnboxFloat(value, 0.0f)); NotifyBoundPropertyChanged(propName, DependencyObject.BoxFloat(GetCanvasBottom(this))); return true; }
         if (propName == "DockPanel.Dock" || propName == "Dock") {
             Dock d = Dock.Left;
             if (value is BoxedInt) {
@@ -5589,24 +5652,25 @@ public partial class UIElement : DependencyObject {
     private void SetDynamicProp(string cleanKey, DependencyObject value) {
         BumpPropEpoch();
         BindingEngine.MarkFlushDirty();
-        if (_dynPropKeys == null) {
-            _dynPropKeys = new string[0];
-            _dynPropVals = new DependencyObject[0];
+        UIElementLayoutExtra ex = EnsureExtra();
+        if (ex.DynPropKeys == null) {
+            ex.DynPropKeys = new string[0];
+            ex.DynPropVals = new DependencyObject[0];
         }
-        for (int i = 0; i < _dynPropKeys.Length; i += 1) {
-            if (_dynPropKeys[i] == cleanKey) {
-                _dynPropVals[i] = value;
+        for (int i = 0; i < ex.DynPropKeys.Length; i += 1) {
+            if (ex.DynPropKeys[i] == cleanKey) {
+                ex.DynPropVals[i] = value;
                 return;
             }
         }
-        _dynPropKeys.Push(cleanKey);
-        _dynPropVals.Push(value);
+        ex.DynPropKeys.Push(cleanKey);
+        ex.DynPropVals.Push(value);
     }
 
     private DependencyObject GetDynamicProp(string cleanKey) {
-        if (_dynPropKeys == null) { return null; }
-        for (int i = 0; i < _dynPropKeys.Length; i += 1) {
-            if (_dynPropKeys[i] == cleanKey) { return _dynPropVals[i]; }
+        if (_extra == null || _extra.DynPropKeys == null) { return null; }
+        for (int i = 0; i < _extra.DynPropKeys.Length; i += 1) {
+            if (_extra.DynPropKeys[i] == cleanKey) { return _extra.DynPropVals[i]; }
         }
         return null;
     }
@@ -5673,9 +5737,9 @@ public partial class UIElement : DependencyObject {
         }
         if (propName == "BorderBrush") { return _borderBrush; }
         if (propName == "RenderTransform") { return _renderTransform; }
-        if (propName == "LayoutTransform") { return _layoutTransform; }
+        if (propName == "LayoutTransform") { return _rare != null ? _rare.LayoutTransform : null; }
         if (propName == "RenderTransformOrigin") { return _renderTransformOrigin; }
-        if (propName == "OpacityMask") { return _opacityMask; }
+        if (propName == "OpacityMask") { return _rare != null ? _rare.OpacityMask : null; }
         if (propName == "ToolTip" || propName == "ToolTipService.ToolTip") { return _rare != null ? _rare.ToolTip : null; }
         if (propName == "Element.BlendingMode" || propName == "noesis:Element.BlendingMode" ||
             propName == "local:Element.BlendingMode" || propName == "BlendMode") {
@@ -5720,7 +5784,7 @@ public partial class UIElement : DependencyObject {
             propName == "LayoutTransform.Angle" || propName == "LayoutTransform.Rotation") {
             return DependencyObject.BoxFloat(GetTransformScalar(propName));
         }
-        if (propName == "FlowDirection") { return DependencyObject.BoxString(_flowDirection); }
+        if (propName == "FlowDirection") { return DependencyObject.BoxString(_extra != null ? _extra.FlowDirection : "LeftToRight"); }
         if (propName == "ContextMenu") { return _rare != null ? _rare.ContextMenuEl : null; }
         if (propName == "Loc.Source" || propName == "noesis:Loc.Source") { return DependencyObject.BoxString(_rare != null ? _rare.LocSource : ""); }
         DependencyObject customBox = GetDynamicProp(NormalizeCustomPropKey(propName));

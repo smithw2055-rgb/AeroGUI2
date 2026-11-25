@@ -2645,6 +2645,19 @@ void FontAtlas::ClearCustomFonts() {
     builtInAsciiReady_.store(true, std::memory_order_release);
 }
 
+std::size_t FontAtlas::EstimatedMemoryBytes() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::size_t total = sdfPixels_.capacity();
+    total += fonts_.capacity() * sizeof(RegisteredFontEntry);
+    for (const auto& f : fonts_) {
+        if (f.face) {
+            total += f.face->RawByteSize();
+        }
+    }
+    total += glyphCache_.size() * (sizeof(std::uint64_t) + sizeof(FontAtlasGlyph) + 16u);
+    return total;
+}
+
 void FontAtlas::BakeOutlineToSdfCell(
     const TtfGlyphOutline& outline,
     std::uint16_t unitsPerEm,
