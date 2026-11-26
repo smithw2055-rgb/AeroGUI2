@@ -1754,8 +1754,9 @@ Size MeasureNode(VisualWorld& world, VisualNodeId id, Size availSize) {
     const float marginV =
         (std::isfinite(node->layout.margin.top) ? node->layout.margin.top : 0.0f) +
         (std::isfinite(node->layout.margin.bottom) ? node->layout.margin.bottom : 0.0f);
-    const float padH = std::max(0.0f, node->layout.padding.left) + std::max(0.0f, node->layout.padding.right);
-    const float padV = std::max(0.0f, node->layout.padding.top) + std::max(0.0f, node->layout.padding.bottom);
+    const Thickness effPad = node->EffectivePadding();
+    const float padH = std::max(0.0f, effPad.left) + std::max(0.0f, effPad.right);
+    const float padV = std::max(0.0f, effPad.top) + std::max(0.0f, effPad.bottom);
 
     const bool hasLayoutTx = !node->layout.layoutTransform2D.IsIdentity();
     float localAvailOuterW = availSize.width;
@@ -2053,10 +2054,11 @@ void ArrangeNode(
         world.MarkBindingPropDirty(id);
     }
 
-    const float pL = std::max(0.0f, node->layout.padding.left);
-    const float pT = std::max(0.0f, node->layout.padding.top);
-    const float pR = std::max(0.0f, node->layout.padding.right);
-    const float pB = std::max(0.0f, node->layout.padding.bottom);
+    const Thickness effPad = node->EffectivePadding();
+    const float pL = std::max(0.0f, effPad.left);
+    const float pT = std::max(0.0f, effPad.top);
+    const float pR = std::max(0.0f, effPad.right);
+    const float pB = std::max(0.0f, effPad.bottom);
     const Rect innerRect{
         posX + pL,
         posY + pT,

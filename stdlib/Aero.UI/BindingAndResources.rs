@@ -615,8 +615,7 @@ public class TriggerBase : DependencyObject {
 
     private static void AcquireBaseValue(UIElement dest, string prop) {
         if (dest == null || prop == null || prop.Length == 0) { return; }
-        if (dest._activeTriggerProps == null) { dest._activeTriggerProps = new string[0]; }
-        dest._activeTriggerProps.Push(prop);
+        dest.AddActiveTriggerProp(prop);
         BindingEngine.BumpStructEpoch();
         EnsureBaseTables();
         for (int i = _baseDests.Length - 1; i >= 0; i -= 1) {
@@ -634,15 +633,8 @@ public class TriggerBase : DependencyObject {
 
     private static void ReleaseBaseValue(UIElement dest, string prop) {
         if (dest == null || prop == null || prop.Length == 0 || _baseDests == null) { return; }
-        if (dest._activeTriggerProps != null) {
-            for (int ti = dest._activeTriggerProps.Length - 1; ti >= 0; ti -= 1) {
-                if (dest._activeTriggerProps[ti] == prop) {
-                    dest._activeTriggerProps.RemoveAt(ti);
-                    BindingEngine.BumpStructEpoch();
-                    break;
-                }
-            }
-        }
+        dest.RemoveActiveTriggerProp(prop);
+        BindingEngine.BumpStructEpoch();
         for (int i = _baseDests.Length - 1; i >= 0; i -= 1) {
             if (_baseDests[i] == dest && _baseProps[i] == prop) {
                 DependencyObject baseBox = _baseBoxes[i];
@@ -4520,7 +4512,7 @@ internal class BindingEntry : DependencyObject {
         if (Target == null && TargetInline == null && TargetEffect == null) { return true; }
         if (Mode == 2 && OneTimeDone) { return true; }
         if (!OneTimeDone) { return false; }
-        if (Target != null && Target._activeTriggerProps != null && Target._activeTriggerProps.Length > 0) {
+        if (Target != null && Target.HasActiveTriggerProps()) {
             return false;
         }
         if (_fastKind1VmClean && (Kind == 1 || Kind == 5)) {
@@ -5190,7 +5182,7 @@ internal class BindingEntry : DependencyObject {
         if (Target == null && TargetInline == null && TargetEffect == null) { return; }
         if (Mode == 2 && OneTimeDone) { return; }
         if (BindingEngine._inFlushPass && !BindingEngine._inSubtreeFlush && !BindingEngine._inPushWave && OneTimeDone &&
-            (Target == null || Target._activeTriggerProps == null || Target._activeTriggerProps.Length == 0)) {
+            (Target == null || !Target.HasActiveTriggerProps())) {
             if (_fastKind1VmClean && (Kind == 1 || Kind == 5) &&
                 BindingEngine._curNativeVmEpoch == _fastNativeVmEp &&
                 BindingEngine._curManagedVmEpoch == _fastManagedVmEp &&
@@ -5220,11 +5212,8 @@ internal class BindingEntry : DependencyObject {
             host.IsInsideCollapsedSubtree()) {
             return;
         }
-        if (!_isTriggerBinding && Target != null && Target._activeTriggerProps != null) {
-            string[] atp = Target._activeTriggerProps;
-            for (int ti = atp.Length - 1; ti >= 0; ti -= 1) {
-                if (atp[ti] == TargetProp) { return; }
-            }
+        if (!_isTriggerBinding && Target != null && Target.HasActiveTriggerProp(TargetProp)) {
+            return;
         }
 
         if (Kind == 0 && LambdaGetter != null) {

@@ -65,6 +65,17 @@ int __rs_native_Visual_SetBoxBrushOpacity(handle node, float bgOpacity) { return
 public void Visual_SetBoxBrushOpacity(handle node, float bgOpacity) { __rs_native_Visual_SetBoxBrushOpacity(node, bgOpacity); return; }
 int __rs_native_Visual_SetBoxShadow(handle node, bool isBoxShadow) { return 0; }
 public void Visual_SetBoxShadow(handle node, bool isBoxShadow) { __rs_native_Visual_SetBoxShadow(node, isBoxShadow); return; }
+int __rs_native_Visual_SetBoxColors(handle node, uint bgRgba, uint borderRgba) { return 0; }
+public void Visual_SetBoxColors(handle node, uint bgRgba, uint borderRgba) { __rs_native_Visual_SetBoxColors(node, bgRgba, borderRgba); return; }
+int __rs_native_Visual_SetBorderThickness(handle node, float l, float t, float r, float b) { return 0; }
+public void Visual_SetBorderThickness(handle node, float l, float t, float r, float b) { __rs_native_Visual_SetBorderThickness(node, l, t, r, b); return; }
+int __rs_native_Visual_SetCornerRadius(handle node, float tl, float tr, float br, float bl) { return 0; }
+public void Visual_SetCornerRadius(handle node, float tl, float tr, float br, float bl) { __rs_native_Visual_SetCornerRadius(node, tl, tr, br, bl); return; }
+int __rs_native_Visual_SetTransformOrigin(handle node, float ox, float oy) { return 0; }
+public void Visual_SetTransformOrigin(handle node, float ox, float oy) { __rs_native_Visual_SetTransformOrigin(node, ox, oy); return; }
+int __rs_native_Visual_SetNodeVisualFlags(handle node, bool suppressPadding, bool suppressBoxVisual, bool includeBorderInPadding) { return 0; }
+public void Visual_SetNodeVisualFlags(handle node, bool suppressPadding, bool suppressBoxVisual, bool includeBorderInPadding) { __rs_native_Visual_SetNodeVisualFlags(node, suppressPadding, suppressBoxVisual, includeBorderInPadding); return; }
+public float Visual_GetNodeFloat(handle node, int propCode) { return 0.0f; }
 public int Visual_RegisterLinearGradient(float x0, float y0, float x1, float y1, int spread, int mapping, string stopsSpec) { return 0; }
 public int Visual_RegisterMutableLinearGradient(int reuseId, float x0, float y0, float x1, float y1, int spread, int mapping, string stopsSpec) { return 0; }
 int __rs_native_Visual_ReleaseMutableGradient(int gradId) { return 0; }

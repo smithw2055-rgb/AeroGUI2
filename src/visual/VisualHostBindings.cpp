@@ -1411,6 +1411,29 @@ bool RegisterVisualHostBindings(
             ArgBool(args, 1, false));
         return rs_rt::Value{std::int64_t{0}};
     });
+    ok &= bindFn("Visual_SetBoxColors", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        (void)world.SetBoxColors(ArgNode(args, 0, world), ArgUInt(args, 1), ArgUInt(args, 2));
+        return rs_rt::Value{std::int64_t{0}};
+    });
+    ok &= bindFn("Visual_SetBorderThickness", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        (void)world.SetBorderThickness(ArgNode(args, 0, world), ArgFloat(args, 1), ArgFloat(args, 2), ArgFloat(args, 3), ArgFloat(args, 4));
+        return rs_rt::Value{std::int64_t{0}};
+    });
+    ok &= bindFn("Visual_SetCornerRadius", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        (void)world.SetCornerRadius(ArgNode(args, 0, world), ArgFloat(args, 1), ArgFloat(args, 2), ArgFloat(args, 3), ArgFloat(args, 4));
+        return rs_rt::Value{std::int64_t{0}};
+    });
+    ok &= bindFn("Visual_SetTransformOrigin", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        (void)world.SetTransformOrigin(ArgNode(args, 0, world), ArgFloat(args, 1, 0.5f), ArgFloat(args, 2, 0.5f));
+        return rs_rt::Value{std::int64_t{0}};
+    });
+    ok &= bindFn("Visual_SetNodeVisualFlags", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        (void)world.SetNodeVisualFlags(ArgNode(args, 0, world), ArgBool(args, 1, false), ArgBool(args, 2, false), ArgBool(args, 3, false));
+        return rs_rt::Value{std::int64_t{0}};
+    });
+    ok &= bindFn("Visual_GetNodeFloat", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        return MakeRtFloat(world.GetNodeGeometryFloat(ArgNode(args, 0, world), static_cast<std::int32_t>(ArgInt(args, 1, 0))));
+    });
     ok &= bindFn("Visual_RegisterLinearGradient", [&world, &domains](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         GradientBrushDesc desc{};
         desc.kind = GradientBrushKind::Linear;

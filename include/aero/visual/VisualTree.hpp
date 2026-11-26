@@ -336,7 +336,10 @@ struct VisualLayoutData {
         , hasValidArrange(false)
         , needsLayoutClip(false)
         , lastMeasureInnerInfW(false)
-        , lastMeasureInnerInfH(false) {}
+        , lastMeasureInnerInfH(false)
+        , suppressNativePadding(false)
+        , suppressNativeBoxVisual(false)
+        , includeBorderInPadding(false) {}
 
     float width = std::numeric_limits<float>::quiet_NaN();
     float height = std::numeric_limits<float>::quiet_NaN();
@@ -409,6 +412,9 @@ struct VisualLayoutData {
     bool needsLayoutClip : 1;
     bool lastMeasureInnerInfW : 1;
     bool lastMeasureInnerInfH : 1;
+    bool suppressNativePadding : 1;
+    bool suppressNativeBoxVisual : 1;
+    bool includeBorderInPadding : 1;
 };
 
 struct VisualSpatial3DData {
@@ -558,6 +564,17 @@ struct VisualNode {
     [[nodiscard]] const Matrix4x4& ModelMatrix3D() const noexcept {
         return HasSpatial3D() ? extras->spatial3D->modelMatrix3D : DefaultSpatial3D().modelMatrix3D;
     }
+    [[nodiscard]] Thickness EffectivePadding() const noexcept {
+        if (layout.suppressNativePadding) return Thickness{};
+        if (layout.includeBorderInPadding) {
+            return Thickness{
+                std::max(0.0f, layout.padding.left) + std::max(0.0f, box.borderThickness.left),
+                std::max(0.0f, layout.padding.top) + std::max(0.0f, box.borderThickness.top),
+                std::max(0.0f, layout.padding.right) + std::max(0.0f, box.borderThickness.right),
+                std::max(0.0f, layout.padding.bottom) + std::max(0.0f, box.borderThickness.bottom)};
+        }
+        return layout.padding;
+    }
     [[nodiscard]] const Matrix4x4& WorldMatrix3D() const noexcept {
         return HasSpatial3D() ? extras->spatial3D->worldMatrix3D : DefaultSpatial3D().worldMatrix3D;
     }
@@ -680,6 +697,16 @@ public:
     bool SetBoxGradients(VisualNodeId id, std::int32_t bgGradId, std::int32_t borderGradId) noexcept;
     bool SetBoxBrushOpacity(VisualNodeId id, float bgOpacity) noexcept;
     bool SetBoxShadow(VisualNodeId id, bool isBoxShadow) noexcept;
+    bool SetBoxColors(VisualNodeId id, std::uint32_t bgRgba, std::uint32_t borderRgba) noexcept;
+    bool SetBorderThickness(VisualNodeId id, float l, float t, float r, float b) noexcept;
+    bool SetCornerRadius(VisualNodeId id, float tl, float tr, float br, float bl) noexcept;
+    bool SetTransformOrigin(VisualNodeId id, float ox, float oy) noexcept;
+    bool SetNodeVisualFlags(
+        VisualNodeId id,
+        bool suppressPadding,
+        bool suppressBoxVisual,
+        bool includeBorderInPadding) noexcept;
+    [[nodiscard]] float GetNodeGeometryFloat(VisualNodeId id, std::int32_t propCode) const noexcept;
     bool SetTransform2D(
         VisualNodeId id,
         float tx,

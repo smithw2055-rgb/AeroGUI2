@@ -887,6 +887,128 @@ bool VisualWorld::SetBoxStyle(
     return true;
 }
 
+bool VisualWorld::SetBoxColors(
+    VisualNodeId id,
+    std::uint32_t bgRgba,
+    std::uint32_t borderRgba) noexcept {
+    VisualNode* node = GetNode(id);
+    if (!node) return false;
+    if (node->box.bgRgba == bgRgba && node->box.borderRgba == borderRgba) {
+        return true;
+    }
+    node->box.bgRgba = bgRgba;
+    node->box.borderRgba = borderRgba;
+    MarkDirty(id, VisualDirty_Visual);
+    return true;
+}
+
+bool VisualWorld::SetBorderThickness(
+    VisualNodeId id,
+    float l,
+    float t,
+    float r,
+    float b) noexcept {
+    VisualNode* node = GetNode(id);
+    if (!node) return false;
+    const Thickness next{l, t, r, b};
+    if (SameThicknessExact(node->box.borderThickness, next)) {
+        return true;
+    }
+    node->box.borderThickness = next;
+    MarkDirty(id, VisualDirty_Visual);
+    if (node->layout.includeBorderInPadding) {
+        MarkAncestorsDirty(id, VisualDirty_Layout);
+    }
+    return true;
+}
+
+bool VisualWorld::SetCornerRadius(
+    VisualNodeId id,
+    float tl,
+    float tr,
+    float br,
+    float bl) noexcept {
+    VisualNode* node = GetNode(id);
+    if (!node) return false;
+    const CornerRadius next{tl, tr, br, bl};
+    if (SameCornerRadiusExact(node->box.cornerRadius, next)) {
+        return true;
+    }
+    node->box.cornerRadius = next;
+    MarkDirty(id, VisualDirty_Visual);
+    return true;
+}
+
+bool VisualWorld::SetTransformOrigin(VisualNodeId id, float ox, float oy) noexcept {
+    VisualNode* node = GetNode(id);
+    if (!node) return false;
+    if (node->transform2D.originX == ox && node->transform2D.originY == oy) {
+        return true;
+    }
+    node->transform2D.originX = ox;
+    node->transform2D.originY = oy;
+    MarkDirty(id, static_cast<VisualDirtyFlags>(VisualDirty_Transform | VisualDirty_Visual));
+    return true;
+}
+
+bool VisualWorld::SetNodeVisualFlags(
+    VisualNodeId id,
+    bool suppressPadding,
+    bool suppressBoxVisual,
+    bool includeBorderInPadding) noexcept {
+    VisualNode* node = GetNode(id);
+    if (!node) return false;
+    const bool padChanged = (node->layout.suppressNativePadding != suppressPadding) ||
+                            (node->layout.includeBorderInPadding != includeBorderInPadding);
+    const bool boxChanged = (node->layout.suppressNativeBoxVisual != suppressBoxVisual);
+    if (!padChanged && !boxChanged) {
+        return true;
+    }
+    node->layout.suppressNativePadding = suppressPadding;
+    node->layout.suppressNativeBoxVisual = suppressBoxVisual;
+    node->layout.includeBorderInPadding = includeBorderInPadding;
+    if (padChanged) {
+        MarkAncestorsDirty(id, VisualDirty_Layout);
+    }
+    if (boxChanged) {
+        MarkDirty(id, VisualDirty_Visual);
+    }
+    return true;
+}
+
+float VisualWorld::GetNodeGeometryFloat(VisualNodeId id, std::int32_t propCode) const noexcept {
+    const VisualNode* node = GetNode(id);
+    if (!node) {
+        return (propCode == 16 || propCode == 17) ? 0.5f : 0.0f;
+    }
+    switch (propCode) {
+    case 0: return node->layout.margin.left;
+    case 1: return node->layout.margin.top;
+    case 2: return node->layout.margin.right;
+    case 3: return node->layout.margin.bottom;
+    case 4: return node->layout.padding.left;
+    case 5: return node->layout.padding.top;
+    case 6: return node->layout.padding.right;
+    case 7: return node->layout.padding.bottom;
+    case 8: return node->box.borderThickness.left;
+    case 9: return node->box.borderThickness.top;
+    case 10: return node->box.borderThickness.right;
+    case 11: return node->box.borderThickness.bottom;
+    case 12: return node->box.cornerRadius.topLeft;
+    case 13: return node->box.cornerRadius.topRight;
+    case 14: return node->box.cornerRadius.bottomRight;
+    case 15: return node->box.cornerRadius.bottomLeft;
+    case 16: return node->transform2D.originX;
+    case 17: return node->transform2D.originY;
+    case 18:
+        return (node->box.borderThickness.left > 0.0f ||
+                node->box.borderThickness.top > 0.0f ||
+                node->box.borderThickness.right > 0.0f ||
+                node->box.borderThickness.bottom > 0.0f) ? 1.0f : 0.0f;
+    default: return 0.0f;
+    }
+}
+
 bool VisualWorld::SetBoxGradients(VisualNodeId id, std::int32_t bgGradId, std::int32_t borderGradId) noexcept {
     VisualNode* node = GetNode(id);
     if (!node) return false;

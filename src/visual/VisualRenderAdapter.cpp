@@ -329,10 +329,11 @@ private:
         return false;
     }
 
-    const float padL = std::max(0.0f, node.layout.padding.left);
-    const float padT = std::max(0.0f, node.layout.padding.top);
-    const float padR = std::max(0.0f, node.layout.padding.right);
-    const float padB = std::max(0.0f, node.layout.padding.bottom);
+    const Thickness effPad = node.EffectivePadding();
+    const float padL = std::max(0.0f, effPad.left);
+    const float padT = std::max(0.0f, effPad.top);
+    const float padR = std::max(0.0f, effPad.right);
+    const float padB = std::max(0.0f, effPad.bottom);
     const Rect textRect{
         rect.x + padL,
         rect.y + padT,
@@ -965,6 +966,9 @@ std::size_t VisualRenderAdapter::EmitBoxVisual(
         const VisualWorld* optWorld,
         const DrawingCommandBuffer* optDrawBuffer) {
         const ScopedBlendMode blendGuard(tree.activeBlendMode_, blend);
+        if (node.layout.suppressNativeBoxVisual) {
+            return 0u;
+        }
         std::size_t count = 0u;
         const bool hasBorderThickness = HasPositiveThickness(node.box.borderThickness);
         Color borderColor = UnpackRgba32(node.box.borderRgba, effOpacity);
@@ -1129,10 +1133,11 @@ std::size_t VisualRenderAdapter::EmitTextVisual(
         bool forceSolidShadowColor) {
         const ScopedBlendMode blendGuard(tree.activeBlendMode_, blend);
         const VisualTextData& txt = node.Text();
-        const float padL = std::max(0.0f, node.layout.padding.left);
-        const float padT = std::max(0.0f, node.layout.padding.top);
-        const float padR = std::max(0.0f, node.layout.padding.right);
-        const float padB = std::max(0.0f, node.layout.padding.bottom);
+        const Thickness effPad = node.EffectivePadding();
+        const float padL = std::max(0.0f, effPad.left);
+        const float padT = std::max(0.0f, effPad.top);
+        const float padR = std::max(0.0f, effPad.right);
+        const float padB = std::max(0.0f, effPad.bottom);
         const Rect textRect{
             rect.x + padL,
             rect.y + padT,
@@ -2872,10 +2877,11 @@ std::size_t VisualRenderAdapter::EmitNodeRecursive(
 
         const bool isVisible = (node->layout.visibility == Visibility::Visible);
         const bool hasOwnBoxVisual =
-            (node->box.bgOpacity > 0.001f && (HasAlpha(node->box.bgRgba) || node->box.bgGradId > 0)) ||
-            (imgData.HasSource() && HasAlpha(imgData.tintRgba)) ||
-            (HasPositiveThickness(node->box.borderThickness) &&
-             (HasAlpha(node->box.borderRgba) || node->box.borderGradId > 0));
+            !node->layout.suppressNativeBoxVisual &&
+            ((node->box.bgOpacity > 0.001f && (HasAlpha(node->box.bgRgba) || node->box.bgGradId > 0)) ||
+             (imgData.HasSource() && HasAlpha(imgData.tintRgba)) ||
+             (HasPositiveThickness(node->box.borderThickness) &&
+              (HasAlpha(node->box.borderRgba) || node->box.borderGradId > 0)));
         const bool drawsSelf =
             (node->kind == VisualKind::Vector ||
              node->kind == VisualKind::Text ||
@@ -3319,10 +3325,11 @@ std::size_t VisualRenderAdapter::EmitDropShadowLeafSilhouette(
     }
     const VisualImageData& imgData = node.Image();
     const bool hasOwnBoxVisual =
-        (node.box.bgOpacity > 0.001f && (HasAlpha(node.box.bgRgba) || node.box.bgGradId > 0)) ||
-        (imgData.HasNonVisualBrushSource() && HasAlpha(imgData.tintRgba)) ||
-        (HasPositiveThickness(node.box.borderThickness) &&
-         (HasAlpha(node.box.borderRgba) || node.box.borderGradId > 0));
+        !node.layout.suppressNativeBoxVisual &&
+        ((node.box.bgOpacity > 0.001f && (HasAlpha(node.box.bgRgba) || node.box.bgGradId > 0)) ||
+         (imgData.HasNonVisualBrushSource() && HasAlpha(imgData.tintRgba)) ||
+         (HasPositiveThickness(node.box.borderThickness) &&
+          (HasAlpha(node.box.borderRgba) || node.box.borderGradId > 0)));
 
     Matrix2D shadowWorld2D = world2D;
     shadowWorld2D.tx += dx;
@@ -3387,7 +3394,7 @@ std::size_t VisualRenderAdapter::EmitDropShadowLeafSilhouette(
             VisualNode shadowTextNode{};
             shadowTextNode.id = node.id;
             shadowTextNode.kind = node.kind;
-            shadowTextNode.layout.padding = node.layout.padding;
+            shadowTextNode.layout.padding = node.EffectivePadding();
             auto& st = shadowTextNode.EnsureTextData();
             st = node.Text();
             st.fgRgba = dropShadow.colorRgba;

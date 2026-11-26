@@ -2413,15 +2413,18 @@ public class ComboBox : Selector {
             return;
         }
         if (ParseUtil.IsValidHandle(__nativeHandle)) {
-            Visual_SetPadding(__nativeHandle, 0.0f, 0.0f, 0.0f, 0.0f);
+            Visual_SetNodeVisualFlags(__nativeHandle, true, false, false);
         }
         if (_selectionDisplay != null) {
-            Thickness pad = Padding;
-            float l = pad.Left > 0.0f ? pad.Left : 8.0f;
-            float t = pad.Top > 0.0f ? pad.Top : 5.0f;
-            float r = pad.Right > 0.0f ? pad.Right : 6.0f;
-            float b = pad.Bottom > 0.0f ? pad.Bottom : 5.0f;
-            _selectionDisplay.Margin = new Thickness(l, t, r, b);
+            float pl = ParseUtil.IsValidHandle(__nativeHandle) ? Visual_GetNodeFloat(__nativeHandle, 4) : 0.0f;
+            float pt = ParseUtil.IsValidHandle(__nativeHandle) ? Visual_GetNodeFloat(__nativeHandle, 5) : 0.0f;
+            float pr = ParseUtil.IsValidHandle(__nativeHandle) ? Visual_GetNodeFloat(__nativeHandle, 6) : 0.0f;
+            float pb = ParseUtil.IsValidHandle(__nativeHandle) ? Visual_GetNodeFloat(__nativeHandle, 7) : 0.0f;
+            float l = pl > 0.0f ? pl : 8.0f;
+            float t = pt > 0.0f ? pt : 5.0f;
+            float r = pr > 0.0f ? pr : 6.0f;
+            float b = pb > 0.0f ? pb : 5.0f;
+            _selectionDisplay.SetMargin4(l, t, r, b);
         }
     }
 
@@ -2516,7 +2519,7 @@ public class TabItem : HeaderedContentControl {
     public event RoutedEventHandler Unselected;
 
     public TabItem() : base() {
-        Padding = new Thickness(12.0f, 5.0f, 12.0f, 5.0f);
+        SetPadding4(12.0f, 5.0f, 12.0f, 5.0f);
         Focusable = true;
     }
     public TabItem(string headerText, UIElement content = null) : this() {
@@ -2578,9 +2581,13 @@ public class TabItem : HeaderedContentControl {
 
     protected override void SyncPadding() {
         if (Template == null && _headerPresenter != null) {
-            _headerPresenter.Margin = Padding;
             if (ParseUtil.IsValidHandle(__nativeHandle)) {
-                Visual_SetPadding(__nativeHandle, 0.0f, 0.0f, 0.0f, 0.0f);
+                float pl = Visual_GetNodeFloat(__nativeHandle, 4);
+                float pt = Visual_GetNodeFloat(__nativeHandle, 5);
+                float pr = Visual_GetNodeFloat(__nativeHandle, 6);
+                float pb = Visual_GetNodeFloat(__nativeHandle, 7);
+                _headerPresenter.SetMargin4(pl, pt, pr, pb);
+                Visual_SetNodeVisualFlags(__nativeHandle, true, false, false);
             }
             return;
         }
@@ -2643,7 +2650,13 @@ public class TabItem : HeaderedContentControl {
         _headerPresenter.ContentSource = "Header";
         _headerPresenter.HorizontalAlignment = HorizontalAlignment.Center;
         _headerPresenter.VerticalAlignment = VerticalAlignment.Center;
-        _headerPresenter.Margin = Padding;
+        if (ParseUtil.IsValidHandle(__nativeHandle)) {
+            _headerPresenter.SetMargin4(
+                Visual_GetNodeFloat(__nativeHandle, 4),
+                Visual_GetNodeFloat(__nativeHandle, 5),
+                Visual_GetNodeFloat(__nativeHandle, 6),
+                Visual_GetNodeFloat(__nativeHandle, 7));
+        }
         _headerPresenter.ContentTemplate = HeaderTemplate;
         _headerPresenter.SetContentBox(HeaderBox);
 
@@ -2713,11 +2726,15 @@ public class TabControl : Selector {
     }
 
     protected override void SyncPadding() {
-        if (_contentFrame != null) {
-            _contentFrame.Padding = Padding;
+        if (_contentFrame != null && ParseUtil.IsValidHandle(__nativeHandle)) {
+            _contentFrame.SetPadding4(
+                Visual_GetNodeFloat(__nativeHandle, 4),
+                Visual_GetNodeFloat(__nativeHandle, 5),
+                Visual_GetNodeFloat(__nativeHandle, 6),
+                Visual_GetNodeFloat(__nativeHandle, 7));
         }
         if (ParseUtil.IsValidHandle(__nativeHandle)) {
-            Visual_SetPadding(__nativeHandle, 0.0f, 0.0f, 0.0f, 0.0f);
+            Visual_SetNodeVisualFlags(__nativeHandle, true, Template != null, false);
         }
     }
 

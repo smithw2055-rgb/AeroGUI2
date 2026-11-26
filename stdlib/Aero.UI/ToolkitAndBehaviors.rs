@@ -3028,12 +3028,12 @@ public static class DragDrop {
 
     public static void RefreshElementEmpty(UIElement el) {
         if (el == null || el._isDisposedTree) { return; }
-        if (el._ddInitialized && el._ddLastElemEpoch == el._propEpoch && !el._ddLastEmptyPath.Contains(".")) {
-            object cachedItem = DependencyObject.Unbox(el._ddLastItemBox);
+        if (el._rare != null && el._rare.DdInitialized && el._rare.DdLastElemEpoch == el._propEpoch && !el._rare.DdLastEmptyPath.Contains(".")) {
+            object cachedItem = DependencyObject.Unbox(el._rare.DdLastItemBox);
             int fastDm = (cachedItem != null && !(cachedItem is UIElement) && ParseUtil.IsNativeReady())
                 ? Reflect_GetDirtyMask(cachedItem)
                 : (cachedItem == null ? 0 : -1);
-            if (fastDm >= 0 && fastDm == el._ddLastItemVer) {
+            if (fastDm >= 0 && fastDm == el._rare.DdLastItemVer) {
                 return;
             }
         }
@@ -3043,17 +3043,18 @@ public static class DragDrop {
         int dm = (item != null && !(item is UIElement) && ParseUtil.IsNativeReady())
             ? Reflect_GetDirtyMask(item)
             : (item == null ? 0 : -1);
-        if (dm >= 0 && !emptyPath.Contains(".") && emptyPath == el._ddLastEmptyPath &&
-            el._ddLastItemVer == dm && el._ddLastItemBox == itemBox &&
+        UIElementRareData er = el.EnsureRare();
+        if (dm >= 0 && !emptyPath.Contains(".") && emptyPath == er.DdLastEmptyPath &&
+            er.DdLastItemVer == dm && er.DdLastItemBox == itemBox &&
             el.GetPropertyValue("DragDrop.IsContentEmpty") != null &&
             el.GetPropertyValue("DragDrop.IsDropCompatible") != null) {
-            el._ddInitialized = true;
-            el._ddLastElemEpoch = el._propEpoch;
+            er.DdInitialized = true;
+            er.DdLastElemEpoch = el._propEpoch;
             return;
         }
-        el._ddLastEmptyPath = emptyPath;
-        el._ddLastItemBox = itemBox;
-        el._ddLastItemVer = dm;
+        er.DdLastEmptyPath = emptyPath;
+        er.DdLastItemBox = itemBox;
+        er.DdLastItemVer = dm;
         bool empty = ComputeIsEmpty(el);
         DependencyObject cur = el.GetPropertyValue("DragDrop.IsContentEmpty");
         if (cur == null || DependencyObject.UnboxBool(cur, !empty) != empty) {
@@ -3062,8 +3063,8 @@ public static class DragDrop {
         if (el.GetPropertyValue("DragDrop.IsDropCompatible") == null) {
             el.SetPropertyValue("DragDrop.IsDropCompatible", DependencyObject.BoxBool(true));
         }
-        el._ddInitialized = true;
-        el._ddLastElemEpoch = el._propEpoch;
+        er.DdInitialized = true;
+        er.DdLastElemEpoch = el._propEpoch;
     }
 
     public static void RefreshAllContentEmpty() {

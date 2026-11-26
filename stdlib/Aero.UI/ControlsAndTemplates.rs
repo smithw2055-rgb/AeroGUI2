@@ -130,8 +130,6 @@ public class Control : FrameworkElement {
     private bool _hasExplicitForeground = false;
     private bool _isTabStop = true;
     private bool _templateHasVsm = false;
-    private bool _nativeBoxStyleZeroed = false;
-    private bool _nativePaddingZeroed = false;
 
     public Control() : base(VisualKind.Box) {
         if (_fontFamily == null || _fontFamily.Length == 0) { _fontFamily = "Segoe UI"; }
@@ -223,10 +221,6 @@ public class Control : FrameworkElement {
             ResourceDictionary.BumpGlobalMutationEpoch();
             _templateApplied = false;
             _templateHasVsm = false;
-            if (_template == null) {
-                _nativeBoxStyleZeroed = false;
-                _nativePaddingZeroed = false;
-            }
             if (UIElement._closedPopupBuildDepth > 0) { return; }
             ApplyTemplate();
         }
@@ -268,26 +262,20 @@ public class Control : FrameworkElement {
     protected override void SyncBoxStyleToNative() {
         if (!ParseUtil.IsValidHandle(__nativeHandle)) { return; }
         if (_template != null) {
-            if (_nativeBoxStyleZeroed) { return; }
-            _nativeBoxStyleZeroed = true;
-            Visual_SetBoxStyle(__nativeHandle, 0u, 0u, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
-            Visual_SetBoxGradients(__nativeHandle, -1, -1);
-            Visual_SetBoxBrushOpacity(__nativeHandle, 1.0f);
+            Visual_SetNodeVisualFlags(__nativeHandle, true, true, false);
             return;
         }
-        _nativeBoxStyleZeroed = false;
+        Visual_SetNodeVisualFlags(__nativeHandle, false, false, false);
         base.SyncBoxStyleToNative();
     }
 
     protected override void SyncPadding() {
         if (!ParseUtil.IsValidHandle(__nativeHandle)) { return; }
         if (_template != null) {
-            if (_nativePaddingZeroed) { return; }
-            _nativePaddingZeroed = true;
-            Visual_SetPadding(__nativeHandle, 0.0f, 0.0f, 0.0f, 0.0f);
+            Visual_SetNodeVisualFlags(__nativeHandle, true, true, false);
             return;
         }
-        _nativePaddingZeroed = false;
+        Visual_SetNodeVisualFlags(__nativeHandle, false, false, false);
         base.SyncPadding();
     }
 

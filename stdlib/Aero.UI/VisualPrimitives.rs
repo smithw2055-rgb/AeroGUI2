@@ -30,30 +30,16 @@ public class Decorator : FrameworkElement {
 }
 
 public class Border : Decorator {
-    public Border() : base() {}
+    public Border() : base() {
+        if (ParseUtil.IsValidHandle(__nativeHandle)) {
+            Visual_SetNodeVisualFlags(__nativeHandle, false, false, true);
+        }
+    }
     public override string GetTypeName() { return "Border"; }
 
     protected override bool IsSelfHitTestSolid() {
         if (Background != null) { return true; }
-        Thickness bt = BorderThickness;
-        return BorderBrush != null && (bt.Left > 0.0f || bt.Top > 0.0f || bt.Right > 0.0f || bt.Bottom > 0.0f);
-    }
-
-    protected override void SyncPadding() {
-        if (!ParseUtil.IsValidHandle(__nativeHandle)) { return; }
-        Thickness p = Padding;
-        Thickness b = BorderThickness;
-        Visual_SetPadding(
-            __nativeHandle,
-            p.Left + b.Left,
-            p.Top + b.Top,
-            p.Right + b.Right,
-            p.Bottom + b.Bottom);
-    }
-
-    protected override void OnBoxAppearanceChanged() {
-        base.OnBoxAppearanceChanged();
-        SyncPadding();
+        return BorderBrush != null && ParseUtil.IsValidHandle(__nativeHandle) && Visual_GetNodeFloat(__nativeHandle, 18) > 0.0f;
     }
 }
 

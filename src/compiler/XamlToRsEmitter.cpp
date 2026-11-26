@@ -289,6 +289,56 @@ struct XamlNode final {
     return !outValues.empty();
 }
 
+[[nodiscard]] std::string FormatThickness4Args(std::string_view raw) {
+    std::vector<float> vals;
+    if (!TryParseFloatList(raw, vals)) {
+        return "0.0f, 0.0f, 0.0f, 0.0f";
+    }
+    if (vals.size() == 1) {
+        const std::string v = FormatFloatLiteral(vals[0]);
+        return v + ", " + v + ", " + v + ", " + v;
+    }
+    if (vals.size() == 2) {
+        const std::string h = FormatFloatLiteral(vals[0]);
+        const std::string v = FormatFloatLiteral(vals[1]);
+        return h + ", " + v + ", " + h + ", " + v;
+    }
+    if (vals.size() >= 4) {
+        return FormatFloatLiteral(vals[0]) + ", " +
+               FormatFloatLiteral(vals[1]) + ", " +
+               FormatFloatLiteral(vals[2]) + ", " +
+               FormatFloatLiteral(vals[3]);
+    }
+    return "0.0f, 0.0f, 0.0f, 0.0f";
+}
+
+[[nodiscard]] std::string FormatCornerRadius4Args(std::string_view raw) {
+    std::vector<float> vals;
+    if (!TryParseFloatList(raw, vals)) {
+        return "0.0f, 0.0f, 0.0f, 0.0f";
+    }
+    if (vals.size() == 1) {
+        const std::string v = FormatFloatLiteral(vals[0]);
+        return v + ", " + v + ", " + v + ", " + v;
+    }
+    if (vals.size() >= 4) {
+        return FormatFloatLiteral(vals[0]) + ", " +
+               FormatFloatLiteral(vals[1]) + ", " +
+               FormatFloatLiteral(vals[2]) + ", " +
+               FormatFloatLiteral(vals[3]);
+    }
+    const std::string v = FormatFloatLiteral(vals[0]);
+    return v + ", " + v + ", " + v + ", " + v;
+}
+
+[[nodiscard]] std::string FormatOrigin2Args(std::string_view raw) {
+    std::vector<float> pts;
+    if (TryParseFloatList(raw, pts) && pts.size() >= 2) {
+        return FormatFloatLiteral(pts[0]) + ", " + FormatFloatLiteral(pts[1]);
+    }
+    return "0.5f, 0.5f";
+}
+
 [[nodiscard]] std::string FormatThicknessExpr(std::string_view raw) {
     std::vector<float> vals;
     if (!TryParseFloatList(raw, vals)) {
@@ -5841,6 +5891,32 @@ private:
                 out << targetVar << "." << propName << " = "
                     << FormatTypedValueLiteral(propName, rawVal, dictVar, targetType) << ";\n";
             }
+            return;
+        }
+
+        if (isUiElementTarget && propName == "Margin") {
+            Indent(out, indent);
+            out << targetVar << ".SetMargin4(" << FormatThickness4Args(rawVal) << ");\n";
+            return;
+        }
+        if (isUiElementTarget && propName == "Padding") {
+            Indent(out, indent);
+            out << targetVar << ".SetPadding4(" << FormatThickness4Args(rawVal) << ");\n";
+            return;
+        }
+        if (isUiElementTarget && propName == "BorderThickness") {
+            Indent(out, indent);
+            out << targetVar << ".SetBorderThickness4(" << FormatThickness4Args(rawVal) << ");\n";
+            return;
+        }
+        if (isUiElementTarget && propName == "CornerRadius") {
+            Indent(out, indent);
+            out << targetVar << ".SetCornerRadius4(" << FormatCornerRadius4Args(rawVal) << ");\n";
+            return;
+        }
+        if (isUiElementTarget && propName == "RenderTransformOrigin") {
+            Indent(out, indent);
+            out << targetVar << ".SetRenderTransformOrigin2(" << FormatOrigin2Args(rawVal) << ");\n";
             return;
         }
 
