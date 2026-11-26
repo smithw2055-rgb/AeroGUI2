@@ -1059,7 +1059,7 @@ std::size_t VisualRenderAdapter::EmitBoxVisual(
 
         const VisualImageData& boxImg = node.Image();
         if (node.kind == VisualKind::Box &&
-            (!boxImg.uri.empty() || boxImg.visualBrushSource.IsValid()) &&
+            boxImg.HasSource() &&
             HasAlpha(boxImg.tintRgba) &&
             bgRect.width > 0.0f && bgRect.height > 0.0f) {
             count += EmitImageVisual(tree, node, bgRect, effOpacity, world2D, world3D, has3D, blend, optWorld, optDrawBuffer);
@@ -1579,7 +1579,7 @@ std::size_t VisualRenderAdapter::EmitImageVisual(
     const DrawingCommandBuffer* optDrawBuffer) {
     const ScopedBlendMode blendGuard(tree.activeBlendMode_, blend);
     const VisualImageData& img = node.Image();
-    if ((img.uri.empty() && !img.visualBrushSource.IsValid()) || !HasAlpha(img.tintRgba) ||
+    if (!img.HasSource() || !HasAlpha(img.tintRgba) ||
         rect.width <= 0.0f || rect.height <= 0.0f) {
         return 0u;
     }
@@ -1590,6 +1590,29 @@ std::size_t VisualRenderAdapter::EmitImageVisual(
         if (RasterizeVisualBrushToEntry(store, optWorld, optDrawBuffer, img.visualBrushSource, vbTempEntry)) {
             entry = &vbTempEntry;
         }
+    }
+    if (!entry && img.plasma.active) {
+        PlasmaRenderParams p{};
+        p.sx = img.plasma.sx;
+        p.sy = img.plasma.sy;
+        p.timeSec = img.plasma.timeSec;
+        p.seed = img.plasma.seed;
+        p.vw = img.plasma.vw;
+        p.vh = img.plasma.vh;
+        p.colorRgba = img.plasma.colorRgba;
+        entry = store->Images().LoadOrGetPlasma(p);
+    }
+    if (!entry && img.rive.active) {
+        RiveRenderRequest req{};
+        req.assetPath = img.rive.assetPath;
+        req.instanceId = img.rive.instanceId;
+        req.tLoopSec = img.rive.tLoopSec;
+        req.tStateSec = img.rive.tStateSec;
+        req.reqW = img.rive.reqW;
+        req.reqH = img.rive.reqH;
+        req.inputs = img.rive.inputs.data();
+        req.inputCount = img.rive.inputs.size();
+        entry = store->Images().LoadOrGetRive(req, img.rive.inputsRevision);
     }
     if (!entry && !img.uri.empty()) {
         entry = store->Images().LoadOrGet(img.uri);
@@ -1804,7 +1827,34 @@ std::size_t VisualRenderAdapter::EmitVectorVisual(
                 return RasterizeVisualBrushToEntry(
                     store, optWorld, optDrawBuffer, fillImg.visualBrushSource, outEntry);
             }
-            if (!fillImg.uri.empty()) {
+            if (fillImg.plasma.active) {
+                PlasmaRenderParams p{};
+                p.sx = fillImg.plasma.sx;
+                p.sy = fillImg.plasma.sy;
+                p.timeSec = fillImg.plasma.timeSec;
+                p.seed = fillImg.plasma.seed;
+                p.vw = fillImg.plasma.vw;
+                p.vh = fillImg.plasma.vh;
+                p.colorRgba = fillImg.plasma.colorRgba;
+                if (const ImageAtlasEntry* loaded = store->Images().LoadOrGetPlasma(p)) {
+                    outEntry = *loaded;
+                    return (outEntry.width > 0u && outEntry.height > 0u);
+                }
+            } else if (fillImg.rive.active) {
+                RiveRenderRequest req{};
+                req.assetPath = fillImg.rive.assetPath;
+                req.instanceId = fillImg.rive.instanceId;
+                req.tLoopSec = fillImg.rive.tLoopSec;
+                req.tStateSec = fillImg.rive.tStateSec;
+                req.reqW = fillImg.rive.reqW;
+                req.reqH = fillImg.rive.reqH;
+                req.inputs = fillImg.rive.inputs.data();
+                req.inputCount = fillImg.rive.inputs.size();
+                if (const ImageAtlasEntry* loaded = store->Images().LoadOrGetRive(req, fillImg.rive.inputsRevision)) {
+                    outEntry = *loaded;
+                    return (outEntry.width > 0u && outEntry.height > 0u);
+                }
+            } else if (!fillImg.uri.empty()) {
                 if (const ImageAtlasEntry* loaded = store->Images().LoadOrGet(fillImg.uri)) {
                     outEntry = *loaded;
                     return (outEntry.width > 0u && outEntry.height > 0u);
@@ -1826,7 +1876,7 @@ std::size_t VisualRenderAdapter::EmitVectorVisual(
         switch (vec.shapeKind) {
             case VectorShapeKind::SvgPath: {
                 const float effFillOp = std::clamp(effOpacity * vec.fillOpacity, 0.0f, 1.0f);
-                const bool hasImageFill = (!fillImg.uri.empty() || fillImg.visualBrushSource.IsValid()) &&
+                const bool hasImageFill = fillImg.HasSource() &&
                                           effFillOp > 0.001f &&
                                           rect.width > 0.0f && rect.height > 0.0f;
                 if (hasImageFill) {
@@ -1901,7 +1951,7 @@ std::size_t VisualRenderAdapter::EmitVectorVisual(
             case VectorShapeKind::Ellipse: {
                 const float effFillOp = std::clamp(effOpacity * vec.fillOpacity, 0.0f, 1.0f);
                 const float effStrokeOp = std::clamp(effOpacity * vec.strokeOpacity, 0.0f, 1.0f);
-                const bool hasImageFill = (!fillImg.uri.empty() || fillImg.visualBrushSource.IsValid()) &&
+                const bool hasImageFill = fillImg.HasSource() &&
                                           effFillOp > 0.001f &&
                                           rect.width > 0.0f && rect.height > 0.0f;
                 const bool hasFill = (HasAlpha(vec.fillRgba) || vec.fillGradId > 0) && effFillOp > 0.001f;
@@ -2045,7 +2095,7 @@ std::size_t VisualRenderAdapter::EmitVectorVisual(
                     }
                 }
                 const CornerRadius cr{std::max(rx, ry)};
-                const bool hasImageFill = (!fillImg.uri.empty() || fillImg.visualBrushSource.IsValid()) &&
+                const bool hasImageFill = fillImg.HasSource() &&
                                           effFillOp > 0.001f &&
                                           rect.width > 0.0f && rect.height > 0.0f;
                 const bool hasFill = (HasAlpha(vec.fillRgba) || vec.fillGradId > 0) && effFillOp > 0.001f;
@@ -2823,7 +2873,7 @@ std::size_t VisualRenderAdapter::EmitNodeRecursive(
         const bool isVisible = (node->layout.visibility == Visibility::Visible);
         const bool hasOwnBoxVisual =
             (node->box.bgOpacity > 0.001f && (HasAlpha(node->box.bgRgba) || node->box.bgGradId > 0)) ||
-            ((!imgData.uri.empty() || imgData.visualBrushSource.IsValid()) && HasAlpha(imgData.tintRgba)) ||
+            (imgData.HasSource() && HasAlpha(imgData.tintRgba)) ||
             (HasPositiveThickness(node->box.borderThickness) &&
              (HasAlpha(node->box.borderRgba) || node->box.borderGradId > 0));
         const bool drawsSelf =
@@ -3270,7 +3320,7 @@ std::size_t VisualRenderAdapter::EmitDropShadowLeafSilhouette(
     const VisualImageData& imgData = node.Image();
     const bool hasOwnBoxVisual =
         (node.box.bgOpacity > 0.001f && (HasAlpha(node.box.bgRgba) || node.box.bgGradId > 0)) ||
-        (!imgData.uri.empty() && HasAlpha(imgData.tintRgba)) ||
+        (imgData.HasNonVisualBrushSource() && HasAlpha(imgData.tintRgba)) ||
         (HasPositiveThickness(node.box.borderThickness) &&
          (HasAlpha(node.box.borderRgba) || node.box.borderGradId > 0));
 
@@ -3309,7 +3359,7 @@ std::size_t VisualRenderAdapter::EmitDropShadowLeafSilhouette(
             auto& sv = shadowVecNode.EnsureVectorData();
             sv = srcVec;
             const bool hasSrcImg =
-                !imgData.uri.empty() && HasAlpha(imgData.tintRgba) && srcVec.fillOpacity > 0.001f;
+                imgData.HasNonVisualBrushSource() && HasAlpha(imgData.tintRgba) && srcVec.fillOpacity > 0.001f;
             if (hasSrcImg) {
                 auto& si = shadowVecNode.EnsureImageData();
                 si = imgData;
@@ -3366,7 +3416,7 @@ std::size_t VisualRenderAdapter::EmitDropShadowLeafSilhouette(
     }
     const bool hollowBorderOnly =
         !node.box.isBoxShadow &&
-        imgData.uri.empty() &&
+        !imgData.HasNonVisualBrushSource() &&
         !HasAlpha(node.box.bgRgba) &&
         node.box.bgGradId <= 0 &&
         HasPositiveThickness(node.box.borderThickness);
@@ -3622,8 +3672,7 @@ std::size_t VisualRenderAdapter::SyncPagedRenderTree(
                 node->box.isBoxShadow ||
                 node->box.bgGradId > 0 ||
                 HasPositiveThickness(node->box.borderThickness) ||
-                !node->Image().uri.empty() ||
-                node->Image().visualBrushSource.IsValid() ||
+                node->Image().HasSource() ||
                 node->Effect().kind != UIEffectKind::None ||
                 node->OpacityMask().enabled ||
                 node->layout.layoutRect.width <= 0.0f ||

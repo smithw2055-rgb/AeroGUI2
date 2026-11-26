@@ -17,6 +17,17 @@ namespace aero {
 
 class UIResourceStore;
 struct RasterizedPathMaskEntry;
+struct RiveRenderRequest;
+
+struct PlasmaRenderParams {
+    float sx = 64.0f;
+    float sy = 64.0f;
+    float seed = 100.0f;
+    float timeSec = 0.0f;
+    float vw = 300.0f;
+    float vh = 90.0f;
+    std::uint32_t colorRgba = 0xFFFFBC01u;
+};
 
 enum class ImageFormat : std::uint8_t {
     Unknown = 0,
@@ -260,6 +271,17 @@ public:
         std::string_view uri,
         std::string_view localBaseDir = {}) const noexcept;
 
+    // Zero-string-allocation numeric lookup/synthesis paths for animated PlasmaBrush & RiveControl
+    const ImageAtlasEntry* LoadOrGetPlasma(const PlasmaRenderParams& params);
+    const ImageAtlasEntry* LoadOrGetRive(
+        const RiveRenderRequest& request,
+        std::uint64_t inputsRevision,
+        std::string_view localBaseDir = {});
+    [[nodiscard]] const ImageAtlasEntry* FindLoadedRive(
+        std::uint32_t instanceId,
+        std::string_view assetPath,
+        std::string_view localBaseDir = {}) const noexcept;
+
     [[nodiscard]] std::string ResolveUriToPath(
         std::string_view uri,
         std::string_view localBaseDir = {}) const;
@@ -377,6 +399,14 @@ private:
         std::uint64_t lastUsedTick = 0u;
         std::uint64_t lastPoseHash = 0u;
         bool hasLastPoseHash = false;
+        bool hasNumericPlasma = false;
+        PlasmaRenderParams lastPlasma{};
+        bool hasNumericRive = false;
+        float lastRiveT = -1.0f;
+        float lastRiveTs = -1.0f;
+        float lastRiveW = -1.0f;
+        float lastRiveH = -1.0f;
+        std::uint64_t lastRiveInputsRev = 0u;
     };
 
     struct PackedMaskUvEntry {

@@ -10,6 +10,7 @@
 #include "aero/asset/GradientBrush.hpp"
 #include "aero/core/UIResourceStore.hpp"
 #include "aero/render/FontAtlas.hpp"
+#include "aero/render/RiveRenderer.hpp"
 #include "aero/visual/VisualAnimationEngine.hpp"
 
 namespace aero {
@@ -221,6 +222,7 @@ void VisualWorld::DestroySubtreeDetached(VisualNodeId id) noexcept {
     node->extras.reset();
     node->alive = false;
     SyncCanvasDrawRegistration(*node);
+    node->inDirtyBindingPropList = false;
     node->drawDirty = false;
     node->dirtyFlags = VisualDirty_Clean;
     freeIndices_.push_back(id.index);
@@ -1609,14 +1611,17 @@ bool VisualWorld::SetImage(
     if (!node) return false;
     const bool hadImg = node->HasImageData();
     auto& img = node->EnsureImageData();
-    if (hadImg &&
+    const bool hadSpecial = img.plasma.active || img.rive.active;
+    if (hadImg && !hadSpecial &&
         img.uri == uri &&
         img.stretch == stretch &&
         img.stretchDir == stretchDir &&
         img.tintRgba == tintRgba) {
         return true;
     }
-    const bool layoutChanged = !hadImg || (img.uri != uri) || (img.stretch != stretch) || (img.stretchDir != stretchDir);
+    const bool layoutChanged = !hadImg || hadSpecial || (img.uri != uri) || (img.stretch != stretch) || (img.stretchDir != stretchDir);
+    img.plasma.active = false;
+    img.rive.active = false;
     img.uri.assign(uri);
     img.stretch = stretch;
     img.stretchDir = stretchDir;
@@ -1624,6 +1629,155 @@ bool VisualWorld::SetImage(
     if (layoutChanged) {
         MarkAncestorsDirty(id, VisualDirty_All);
     } else {
+        MarkDirty(id, VisualDirty_Visual);
+    }
+    return true;
+}
+
+bool VisualWorld::SetPlasmaImage(
+    VisualNodeId id,
+    float sx,
+    float sy,
+    float timeSec,
+    float seed,
+    std::uint32_t colorRgba,
+    float vw,
+    float vh,
+    Stretch stretch,
+    StretchDirection stretchDir,
+    std::uint32_t tintRgba) {
+    VisualNode* node = GetNode(id);
+    if (!node) return false;
+    const bool hadImg = node->HasImageData();
+    auto& img = node->EnsureImageData();
+    const bool wasPlasma = img.plasma.active;
+    const float clSx = std::max(4.0f, sx);
+    const float clSy = std::max(4.0f, sy);
+    const float clVw = std::clamp(vw, 32.0f, 512.0f);
+    const float clVh = std::clamp(vh, 16.0f, 512.0f);
+    if (hadImg && wasPlasma &&
+        img.plasma.sx == clSx &&
+        img.plasma.sy == clSy &&
+        img.plasma.timeSec == timeSec &&
+        img.plasma.seed == seed &&
+        img.plasma.colorRgba == colorRgba &&
+        img.plasma.vw == clVw &&
+        img.plasma.vh == clVh &&
+        img.stretch == stretch &&
+        img.stretchDir == stretchDir &&
+        img.tintRgba == tintRgba) {
+        return true;
+    }
+    const bool layoutChanged =
+        !hadImg || !wasPlasma ||
+        img.stretch != stretch || img.stretchDir != stretchDir ||
+        img.plasma.vw != clVw || img.plasma.vh != clVh;
+    img.uri.clear();
+    img.rive.active = false;
+    img.plasma.active = true;
+    img.plasma.sx = clSx;
+    img.plasma.sy = clSy;
+    img.plasma.timeSec = timeSec;
+    img.plasma.seed = seed;
+    img.plasma.colorRgba = colorRgba;
+    img.plasma.vw = clVw;
+    img.plasma.vh = clVh;
+    img.stretch = stretch;
+    img.stretchDir = stretchDir;
+    img.tintRgba = tintRgba;
+    if (layoutChanged) {
+        MarkAncestorsDirty(id, VisualDirty_All);
+    } else {
+        MarkDirty(id, VisualDirty_Visual);
+    }
+    return true;
+}
+
+bool VisualWorld::SetRiveParams(
+    VisualNodeId id,
+    std::string_view assetPath,
+    std::uint32_t instanceId,
+    float tLoopSec,
+    float tStateSec,
+    float reqW,
+    float reqH,
+    Stretch stretch,
+    std::uint32_t tintRgba) {
+    VisualNode* node = GetNode(id);
+    if (!node) return false;
+    const bool hadImg = node->HasImageData();
+    auto& img = node->EnsureImageData();
+    const bool wasRive = img.rive.active;
+    if (hadImg && wasRive &&
+        img.rive.assetPath == assetPath &&
+        img.rive.instanceId == instanceId &&
+        img.rive.tLoopSec == tLoopSec &&
+        img.rive.tStateSec == tStateSec &&
+        img.rive.reqW == reqW &&
+        img.rive.reqH == reqH &&
+        img.stretch == stretch &&
+        img.tintRgba == tintRgba) {
+        return true;
+    }
+    const bool layoutChanged =
+        !hadImg || !wasRive ||
+        img.rive.assetPath != assetPath ||
+        img.stretch != stretch ||
+        img.rive.reqW != reqW ||
+        img.rive.reqH != reqH;
+    img.uri.clear();
+    img.plasma.active = false;
+    img.rive.active = true;
+    img.rive.assetPath.assign(assetPath);
+    img.rive.instanceId = instanceId;
+    img.rive.tLoopSec = tLoopSec;
+    img.rive.tStateSec = tStateSec;
+    img.rive.reqW = reqW;
+    img.rive.reqH = reqH;
+    img.stretch = stretch;
+    img.stretchDir = StretchDirection::Both;
+    img.tintRgba = tintRgba;
+    if (layoutChanged) {
+        MarkAncestorsDirty(id, VisualDirty_All);
+    } else {
+        MarkDirty(id, VisualDirty_Visual);
+    }
+    return true;
+}
+
+bool VisualWorld::ClearRiveInputs(VisualNodeId id) {
+    VisualNode* node = GetNode(id);
+    if (!node) return false;
+    auto& img = node->EnsureImageData();
+    if (!img.rive.inputs.empty()) {
+        img.rive.inputs.clear();
+        ++img.rive.inputsRevision;
+        if (img.rive.active) {
+            MarkDirty(id, VisualDirty_Visual);
+        }
+    }
+    return true;
+}
+
+bool VisualWorld::SetRiveInput(VisualNodeId id, std::string_view inputName, float value) {
+    VisualNode* node = GetNode(id);
+    if (!node || inputName.empty()) return false;
+    auto& img = node->EnsureImageData();
+    for (auto& kv : img.rive.inputs) {
+        if (kv.first == inputName) {
+            if (kv.second != value) {
+                kv.second = value;
+                ++img.rive.inputsRevision;
+                if (img.rive.active) {
+                    MarkDirty(id, VisualDirty_Visual);
+                }
+            }
+            return true;
+        }
+    }
+    img.rive.inputs.emplace_back(std::string(inputName), value);
+    ++img.rive.inputsRevision;
+    if (img.rive.active) {
         MarkDirty(id, VisualDirty_Visual);
     }
     return true;
@@ -2016,6 +2170,61 @@ void VisualWorld::MarkDirty(VisualNodeId id, VisualDirtyFlags flags) noexcept {
     }
 }
 
+void VisualWorld::MarkBindingPropDirty(VisualNodeId id) noexcept {
+    if (dirtyBindingPropOverflow_) {
+        return;
+    }
+    VisualNode* node = GetNode(id);
+    if (!node || !node->alive || !node->hasScriptOwner || !node->scriptOwner.valid() ||
+        node->inDirtyBindingPropList) {
+        return;
+    }
+    if (dirtyBindingPropNodes_.size() >= 512u) {
+        dirtyBindingPropOverflow_ = true;
+        for (const VisualNodeId prevId : dirtyBindingPropNodes_) {
+            if (VisualNode* prevNode = GetNode(prevId)) {
+                prevNode->inDirtyBindingPropList = false;
+            }
+        }
+        dirtyBindingPropNodes_.clear();
+        return;
+    }
+    node->inDirtyBindingPropList = true;
+    dirtyBindingPropNodes_.push_back(id);
+}
+
+std::int32_t VisualWorld::BeginConsumeDirtyBindingPropNodes() {
+    consumedDirtyBindingPropNodes_.clear();
+    if (dirtyBindingPropOverflow_) {
+        dirtyBindingPropOverflow_ = false;
+        for (const VisualNodeId id : dirtyBindingPropNodes_) {
+            if (VisualNode* node = GetNode(id)) {
+                node->inDirtyBindingPropList = false;
+            }
+        }
+        dirtyBindingPropNodes_.clear();
+        return -1;
+    }
+    for (const VisualNodeId id : dirtyBindingPropNodes_) {
+        if (VisualNode* node = GetNode(id)) {
+            node->inDirtyBindingPropList = false;
+        }
+    }
+    consumedDirtyBindingPropNodes_.swap(dirtyBindingPropNodes_);
+    return static_cast<std::int32_t>(consumedDirtyBindingPropNodes_.size());
+}
+
+ObjectRef VisualWorld::GetConsumedDirtyBindingPropOwner(std::size_t idx) const noexcept {
+    if (idx >= consumedDirtyBindingPropNodes_.size()) {
+        return ObjectRef{};
+    }
+    const VisualNode* node = GetNode(consumedDirtyBindingPropNodes_[idx]);
+    if (!node || !node->alive || !node->hasScriptOwner) {
+        return ObjectRef{};
+    }
+    return node->scriptOwner;
+}
+
 void VisualWorld::ClearDirtyFlags() noexcept {
     if (!structureDirty_ && !dirtyNodes_.empty() && dirtyNodes_.size() * 2u < nodes_.size()) {
         for (VisualNodeId id : dirtyNodes_) {
@@ -2046,6 +2255,7 @@ void VisualWorld::Clear() noexcept {
         node.pinnedOwnerRoot.reset();
         node.scriptOwner = ObjectRef{};
         node.hasScriptOwner = false;
+        node.inDirtyBindingPropList = false;
         if (node.nativeHandle.valid()) {
             (void)handleRegistry_->release(node.nativeHandle);
             node.nativeHandle = NativeHandle{};
@@ -2086,6 +2296,9 @@ void VisualWorld::Clear() noexcept {
     rootId_ = VisualNodeId{};
     liveCount_ = 0u;
     dirtyNodes_.clear();
+    dirtyBindingPropNodes_.clear();
+    consumedDirtyBindingPropNodes_.clear();
+    dirtyBindingPropOverflow_ = false;
     structureDirty_ = true;
     layoutOrTransformDirty_ = true;
     ++structureVersion_;

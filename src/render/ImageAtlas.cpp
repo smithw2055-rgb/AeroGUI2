@@ -3545,19 +3545,10 @@ float Perlin3D(float x, float y, float z, std::uint32_t seed) noexcept {
     return lerp(nxy0, nxy1, uz);
 }
 
-struct PlasmaShaderParams {
-    float sx = 64.0f;
-    float sy = 64.0f;
-    float seed = 100.0f;
-    float timeSec = 0.0f;
-    float vw = 300.0f;
-    float vh = 90.0f;
-    std::string colorHex = "#FF01BCFF";
-};
-
-bool ParsePlasmaShaderUri(std::string_view uri, PlasmaShaderParams& outParams, std::string& outSlotKey) {
+bool ParsePlasmaShaderUri(std::string_view uri, PlasmaRenderParams& outParams, std::string& outSlotKey) {
     if (uri.size() < 16u || uri.substr(0u, 16u) != "shader://plasma?") return false;
-    outParams = PlasmaShaderParams{};
+    outParams = PlasmaRenderParams{};
+    std::string colorHex = "#FF01BCFF";
     std::string_view q = uri.substr(16u);
     while (!q.empty()) {
         const std::size_t amp = q.find('&');
@@ -3571,11 +3562,18 @@ bool ParsePlasmaShaderUri(std::string_view uri, PlasmaShaderParams& outParams, s
             else if (k == "time") outParams.timeSec = std::strtof(v.c_str(), nullptr);
             else if (k == "vw") outParams.vw = std::clamp(std::strtof(v.c_str(), nullptr), 32.0f, 512.0f);
             else if (k == "vh") outParams.vh = std::clamp(std::strtof(v.c_str(), nullptr), 16.0f, 512.0f);
-            else if (k == "color") outParams.colorHex = v;
+            else if (k == "color") colorHex = v;
         }
         if (amp == std::string_view::npos) break;
         q.remove_prefix(amp + 1u);
     }
+
+    if (colorHex.size() >= 3u && colorHex.substr(0u, 3u) == "%23") {
+        colorHex = "#" + colorHex.substr(3u);
+    }
+    std::uint32_t rgba = colorHex.empty() ? 0xFFFFBC01u : ParseColorRgba32(colorHex);
+    if (rgba == 0u && !colorHex.empty()) { rgba = 0xFFFFBC01u; }
+    outParams.colorRgba = rgba;
 
     const std::uint32_t w = static_cast<std::uint32_t>(std::lround(outParams.vw));
     const std::uint32_t h = static_cast<std::uint32_t>(std::lround(outParams.vh));
@@ -3584,25 +3582,17 @@ bool ParsePlasmaShaderUri(std::string_view uri, PlasmaShaderParams& outParams, s
     const long syQ = std::lround(outParams.sy * 100.0f);
     outSlotKey = "shader://plasma_slot?seed=" + std::to_string(seedInt) +
                  "&sx=" + std::to_string(sxQ) + "&sy=" + std::to_string(syQ) +
-                 "&color=" + outParams.colorHex +
+                 "&rgba=" + std::to_string(rgba) +
                  "&w=" + std::to_string(w) + "&h=" + std::to_string(h);
     return true;
 }
 
-bool SynthesizePlasmaShaderImageFromParams(const PlasmaShaderParams& params, DecodedImage& outImg) {
-    float baseR = 0.004f, baseG = 0.737f, baseB = 1.0f, baseA = 1.0f;
-    std::string cleanCol = params.colorHex;
-    if (cleanCol.size() >= 3u && cleanCol.substr(0u, 3u) == "%23") {
-        cleanCol = "#" + cleanCol.substr(3u);
-    }
-    if (!cleanCol.empty()) {
-        std::uint32_t rgba = ParseColorRgba32(cleanCol);
-        if (rgba == 0u) { rgba = 0xFFFFBC01u; }
-        baseR = static_cast<float>(rgba & 0xFFu) / 255.0f;
-        baseG = static_cast<float>((rgba >> 8u) & 0xFFu) / 255.0f;
-        baseB = static_cast<float>((rgba >> 16u) & 0xFFu) / 255.0f;
-        baseA = static_cast<float>((rgba >> 24u) & 0xFFu) / 255.0f;
-    }
+bool SynthesizePlasmaShaderImageFromParams(const PlasmaRenderParams& params, DecodedImage& outImg) {
+    const std::uint32_t rgba = (params.colorRgba == 0u) ? 0xFFFFBC01u : params.colorRgba;
+    const float baseR = static_cast<float>(rgba & 0xFFu) / 255.0f;
+    const float baseG = static_cast<float>((rgba >> 8u) & 0xFFu) / 255.0f;
+    const float baseB = static_cast<float>((rgba >> 16u) & 0xFFu) / 255.0f;
+    const float baseA = static_cast<float>((rgba >> 24u) & 0xFFu) / 255.0f;
 
     const std::uint32_t w = static_cast<std::uint32_t>(std::lround(params.vw));
     const std::uint32_t h = static_cast<std::uint32_t>(std::lround(params.vh));
@@ -3701,6 +3691,259 @@ bool SynthesizePlasmaShaderImageFromParams(const PlasmaShaderParams& params, Dec
 
 } // namespace
 
+const ImageAtlasEntry* ImageAtlas::FindLoadedRive(
+    std::uint32_t instanceId,
+    std::string_view assetPath,
+    std::string_view localBaseDir) const noexcept {
+    if (assetPath.empty()) {
+        return nullptr;
+    }
+    std::string_view pathPart = assetPath;
+    if (pathPart.size() >= 7u && pathPart.substr(0u, 7u) == "rive://") {
+        pathPart.remove_prefix(7u);
+    }
+    if (const std::size_t q = pathPart.find('?'); q != std::string_view::npos) {
+        pathPart = pathPart.substr(0u, q);
+    }
+    const std::string instKey = std::to_string(instanceId);
+    const std::string riveKey = "rive_slot://" + std::string(localBaseDir) + "|" +
+        std::string(pathPart) + "|" + instKey;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (const auto it = riveSlots_.find(riveKey);
+        it != riveSlots_.end() && textureSlots_.find(it->second.entry.textureId) != textureSlots_.end()) {
+        return &it->second.entry;
+    }
+    if (localBaseDir.empty()) {
+        const std::string suffix = "|" + std::string(pathPart) + "|" + instKey;
+        for (const auto& [k, v] : riveSlots_) {
+            if (k.size() >= suffix.size() &&
+                k.compare(k.size() - suffix.size(), suffix.size(), suffix) == 0 &&
+                textureSlots_.find(v.entry.textureId) != textureSlots_.end()) {
+                return &v.entry;
+            }
+        }
+    }
+    return nullptr;
+}
+
+const ImageAtlasEntry* ImageAtlas::LoadOrGetPlasma(const PlasmaRenderParams& rawParams) {
+    constexpr std::size_t kMaxPlasmaSlotCache = 64u;
+    PlasmaRenderParams params = rawParams;
+    params.sx = std::max(4.0f, params.sx);
+    params.sy = std::max(4.0f, params.sy);
+    params.vw = std::clamp(params.vw, 32.0f, 512.0f);
+    params.vh = std::clamp(params.vh, 16.0f, 512.0f);
+    if (params.colorRgba == 0u) {
+        params.colorRgba = 0xFFFFBC01u;
+    }
+
+    const std::uint32_t w = static_cast<std::uint32_t>(std::lround(params.vw));
+    const std::uint32_t h = static_cast<std::uint32_t>(std::lround(params.vh));
+    const int seedInt = static_cast<int>(std::lround(params.seed));
+    const long sxQ = std::lround(params.sx * 100.0f);
+    const long syQ = std::lround(params.sy * 100.0f);
+    const std::string slotKey =
+        "shader://plasma_slot?seed=" + std::to_string(seedInt) +
+        "&sx=" + std::to_string(sxQ) + "&sy=" + std::to_string(syQ) +
+        "&rgba=" + std::to_string(params.colorRgba) +
+        "&w=" + std::to_string(w) + "&h=" + std::to_string(h);
+
+    std::uint32_t reuseSlotId = 0u;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (const auto it = plasmaSlots_.find(slotKey); it != plasmaSlots_.end()) {
+            it->second.lastUsedTick = ++dynamicSlotTick_;
+            if (it->second.hasNumericPlasma &&
+                it->second.lastPlasma.timeSec == params.timeSec &&
+                it->second.lastPlasma.sx == params.sx &&
+                it->second.lastPlasma.sy == params.sy &&
+                it->second.lastPlasma.seed == params.seed &&
+                it->second.lastPlasma.vw == params.vw &&
+                it->second.lastPlasma.vh == params.vh &&
+                it->second.lastPlasma.colorRgba == params.colorRgba &&
+                textureSlots_.find(it->second.entry.textureId) != textureSlots_.end()) {
+                return &it->second.entry;
+            }
+            reuseSlotId = it->second.entry.textureId;
+        }
+    }
+
+    DecodedImage plasmaImg{};
+    if (!SynthesizePlasmaShaderImageFromParams(params, plasmaImg)) {
+        return nullptr;
+    }
+    if (reuseSlotId == 0u) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (plasmaSlots_.size() >= kMaxPlasmaSlotCache) {
+            auto lruIt = plasmaSlots_.begin();
+            for (auto it = plasmaSlots_.begin(); it != plasmaSlots_.end(); ++it) {
+                if (it->second.lastUsedTick < lruIt->second.lastUsedTick) {
+                    lruIt = it;
+                }
+            }
+            reuseSlotId = lruIt->second.entry.textureId;
+            plasmaSlots_.erase(lruIt);
+        }
+    }
+    const std::uint32_t finalTexId = RegisterOrUpdateRgbaTextureSlot(
+        reuseSlotId, plasmaImg.width, plasmaImg.height, std::move(plasmaImg.rgbaPixels));
+    if (finalTexId == 0u) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    DynamicSlotCacheEntry& cached = plasmaSlots_[slotKey];
+    cached.slotKey = slotKey;
+    cached.currentExactUri = slotKey;
+    cached.lastUsedTick = ++dynamicSlotTick_;
+    cached.hasNumericPlasma = true;
+    cached.lastPlasma = params;
+    cached.entry.uriKey = slotKey;
+    cached.entry.textureId = finalTexId;
+    cached.entry.width = plasmaImg.width;
+    cached.entry.height = plasmaImg.height;
+    cached.entry.atlasX = 0u;
+    cached.entry.atlasY = 0u;
+    cached.entry.atlasWidth = plasmaImg.width;
+    cached.entry.atlasHeight = plasmaImg.height;
+    cached.entry.u0 = 0.0f;
+    cached.entry.v0 = 0.0f;
+    cached.entry.u1 = 1.0f;
+    cached.entry.v1 = 1.0f;
+    cached.entry.isStandalone = true;
+    return &cached.entry;
+}
+
+const ImageAtlasEntry* ImageAtlas::LoadOrGetRive(
+    const RiveRenderRequest& request,
+    std::uint64_t inputsRevision,
+    std::string_view localBaseDir) {
+    constexpr std::size_t kMaxRiveSlotCache = 16u;
+    if (request.assetPath.empty()) {
+        return nullptr;
+    }
+    std::string_view pathPart = request.assetPath;
+    if (pathPart.size() >= 7u && pathPart.substr(0u, 7u) == "rive://") {
+        pathPart.remove_prefix(7u);
+    }
+    if (const std::size_t q = pathPart.find('?'); q != std::string_view::npos) {
+        pathPart = pathPart.substr(0u, q);
+    }
+    if (pathPart.empty()) {
+        return nullptr;
+    }
+
+    const std::string riveKey = "rive_slot://" + std::string(localBaseDir) + "|" +
+        std::string(pathPart) + "|" + std::to_string(request.instanceId);
+    std::uint32_t reuseSlotId = 0u;
+    std::uint64_t prevPoseHash = 0u;
+    bool hasPrevPose = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (const auto it = riveSlots_.find(riveKey); it != riveSlots_.end()) {
+            it->second.lastUsedTick = ++dynamicSlotTick_;
+            const bool hasSlot =
+                textureSlots_.find(it->second.entry.textureId) != textureSlots_.end();
+            if (hasSlot &&
+                it->second.hasNumericRive &&
+                it->second.lastRiveT == request.tLoopSec &&
+                it->second.lastRiveTs == request.tStateSec &&
+                it->second.lastRiveW == request.reqW &&
+                it->second.lastRiveH == request.reqH &&
+                it->second.lastRiveInputsRev == inputsRevision) {
+                return &it->second.entry;
+            }
+            reuseSlotId = it->second.entry.textureId;
+            if (hasSlot && it->second.hasLastPoseHash) {
+                prevPoseHash = it->second.lastPoseHash;
+                hasPrevPose = true;
+            }
+        }
+    }
+
+    DecodedImage riveImg{};
+    std::uint64_t newPoseHash = 0u;
+    bool poseChanged = true;
+    if (!RenderRiveParamsToImageIfChanged(
+            request,
+            *this,
+            localBaseDir,
+            hasPrevPose ? &prevPoseHash : nullptr,
+            newPoseHash,
+            poseChanged,
+            riveImg)) {
+        return nullptr;
+    }
+    if (!poseChanged && hasPrevPose) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (const auto it = riveSlots_.find(riveKey);
+            it != riveSlots_.end() &&
+            textureSlots_.find(it->second.entry.textureId) != textureSlots_.end()) {
+            it->second.lastUsedTick = ++dynamicSlotTick_;
+            it->second.hasNumericRive = true;
+            it->second.lastRiveT = request.tLoopSec;
+            it->second.lastRiveTs = request.tStateSec;
+            it->second.lastRiveW = request.reqW;
+            it->second.lastRiveH = request.reqH;
+            it->second.lastRiveInputsRev = inputsRevision;
+            return &it->second.entry;
+        }
+        if (!RenderRiveParamsToImageIfChanged(
+                request, *this, localBaseDir, nullptr, newPoseHash, poseChanged, riveImg)) {
+            return nullptr;
+        }
+    }
+    if (!riveImg.Valid()) {
+        return nullptr;
+    }
+    if (reuseSlotId == 0u) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (const auto it = riveSlots_.find(riveKey); it != riveSlots_.end()) {
+            reuseSlotId = it->second.entry.textureId;
+        } else if (riveSlots_.size() >= kMaxRiveSlotCache) {
+            auto lruIt = riveSlots_.begin();
+            for (auto it = riveSlots_.begin(); it != riveSlots_.end(); ++it) {
+                if (it->second.lastUsedTick < lruIt->second.lastUsedTick) {
+                    lruIt = it;
+                }
+            }
+            reuseSlotId = lruIt->second.entry.textureId;
+            riveSlots_.erase(lruIt);
+        }
+    }
+    const std::uint32_t finalTexId = RegisterOrUpdateRgbaTextureSlot(
+        reuseSlotId, riveImg.width, riveImg.height, std::move(riveImg.rgbaPixels));
+    if (finalTexId == 0u) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    DynamicSlotCacheEntry& cached = riveSlots_[riveKey];
+    cached.slotKey = riveKey;
+    cached.currentExactUri = riveKey;
+    cached.lastUsedTick = ++dynamicSlotTick_;
+    cached.lastPoseHash = newPoseHash;
+    cached.hasLastPoseHash = true;
+    cached.hasNumericRive = true;
+    cached.lastRiveT = request.tLoopSec;
+    cached.lastRiveTs = request.tStateSec;
+    cached.lastRiveW = request.reqW;
+    cached.lastRiveH = request.reqH;
+    cached.lastRiveInputsRev = inputsRevision;
+    cached.entry.uriKey = riveKey;
+    cached.entry.textureId = finalTexId;
+    cached.entry.width = riveImg.width;
+    cached.entry.height = riveImg.height;
+    cached.entry.atlasX = 0u;
+    cached.entry.atlasY = 0u;
+    cached.entry.atlasWidth = riveImg.width;
+    cached.entry.atlasHeight = riveImg.height;
+    cached.entry.u0 = 0.0f;
+    cached.entry.v0 = 0.0f;
+    cached.entry.u1 = 1.0f;
+    cached.entry.v1 = 1.0f;
+    cached.entry.isStandalone = true;
+    return &cached.entry;
+}
+
 const ImageAtlasEntry* ImageAtlas::LoadOrGet(
     std::string_view uri,
     std::string_view localBaseDir) {
@@ -3796,7 +4039,7 @@ const ImageAtlasEntry* ImageAtlas::LoadOrGet(
     }
     if (uri.size() >= 16u && uri.substr(0u, 16u) == "shader://plasma?") {
         constexpr std::size_t kMaxPlasmaSlotCache = 64u;
-        PlasmaShaderParams params{};
+        PlasmaRenderParams params{};
         std::string slotKey;
         if (!ParsePlasmaShaderUri(uri, params, slotKey)) {
             return nullptr;

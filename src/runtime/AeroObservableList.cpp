@@ -49,10 +49,17 @@ struct FieldListenerEntry {
     void* context = nullptr;
 };
 
+struct OwnerDirtyListenerEntry {
+    void* ownerKey = nullptr;
+    ObservableListHelper::OwnerDirtyListenerFn callback = nullptr;
+    void* context = nullptr;
+};
+
 struct PerHeapState {
     bool hooksInstalled = false;
     std::size_t attachedDomainUsers = 0;
     std::vector<FieldListenerEntry> fieldListeners;
+    std::vector<OwnerDirtyListenerEntry> ownerDirtyListeners;
     std::unordered_map<std::uint64_t, ArrayTrackEntry> arrays;
     std::unordered_map<std::uint64_t, std::vector<std::uint64_t>> ownerArrays;
     std::unordered_map<std::uint64_t, std::uint32_t> uiObserverCounts;
@@ -207,6 +214,26 @@ void onHeapArrayMutated(
         ownersCopy = entry.owners;
     }
 
+    std::array<OwnerDirtyListenerEntry, 8> inlineListeners{};
+    std::size_t inlineListenerCount = 0u;
+    std::vector<OwnerDirtyListenerEntry> overflowListeners;
+    if (!ownersCopy.empty()) {
+        auto& reg = hookRegistry();
+        std::lock_guard<std::mutex> lock(reg.mutex);
+        const auto hIt = reg.heaps.find(heap.heapId());
+        if (hIt != reg.heaps.end()) {
+            const auto& src = hIt->second.ownerDirtyListeners;
+            if (src.size() <= inlineListeners.size()) {
+                inlineListenerCount = src.size();
+                for (std::size_t li = 0u; li < inlineListenerCount; ++li) {
+                    inlineListeners[li] = src[li];
+                }
+            } else {
+                overflowListeners = src;
+            }
+        }
+    }
+
     bool needPrune = false;
     for (const auto& binding : ownersCopy) {
         if (!heap.isAlive(binding.ownerRef)) {
@@ -215,6 +242,21 @@ void onHeapArrayMutated(
         }
         if (binding.bitIndex < 64u) {
             (void)heap.markDirtyBit(binding.ownerRef, binding.bitIndex);
+        }
+        if (inlineListenerCount > 0u) {
+            for (std::size_t li = 0u; li < inlineListenerCount; ++li) {
+                if (inlineListeners[li].callback) {
+                    inlineListeners[li].callback(
+                        inlineListeners[li].context, heap, binding.ownerRef, binding.bitIndex);
+                }
+            }
+        } else {
+            for (const auto& entryListener : overflowListeners) {
+                if (entryListener.callback) {
+                    entryListener.callback(
+                        entryListener.context, heap, binding.ownerRef, binding.bitIndex);
+                }
+            }
         }
     }
 
@@ -844,6 +886,48 @@ std::uint32_t ObservableListHelper::UiObserverCount(
     }
     const auto cIt = hIt->second.uiObserverCounts.find(slotKey(ref));
     return (cIt != hIt->second.uiObserverCounts.end()) ? cIt->second : 0u;
+}
+
+void ObservableListHelper::RegisterOwnerDirtyListener(
+    std::uint64_t heapId,
+    void* ownerKey,
+    OwnerDirtyListenerFn callback,
+    void* context) {
+    if (heapId == 0u || ownerKey == nullptr || callback == nullptr) {
+        return;
+    }
+    auto& reg = hookRegistry();
+    std::lock_guard<std::mutex> lock(reg.mutex);
+    auto& listeners = reg.heaps[heapId].ownerDirtyListeners;
+    for (auto& existing : listeners) {
+        if (existing.ownerKey == ownerKey) {
+            existing.callback = callback;
+            existing.context = context;
+            return;
+        }
+    }
+    listeners.push_back(OwnerDirtyListenerEntry{ownerKey, callback, context});
+}
+
+void ObservableListHelper::UnregisterOwnerDirtyListener(
+    std::uint64_t heapId,
+    void* ownerKey) noexcept {
+    if (heapId == 0u || ownerKey == nullptr) {
+        return;
+    }
+    auto& reg = hookRegistry();
+    std::lock_guard<std::mutex> lock(reg.mutex);
+    const auto hIt = reg.heaps.find(heapId);
+    if (hIt == reg.heaps.end()) {
+        return;
+    }
+    auto& listeners = hIt->second.ownerDirtyListeners;
+    listeners.erase(
+        std::remove_if(
+            listeners.begin(),
+            listeners.end(),
+            [ownerKey](const OwnerDirtyListenerEntry& e) { return e.ownerKey == ownerKey; }),
+        listeners.end());
 }
 
 std::uint64_t ObservableListHelper::GlobalMutationEpoch() noexcept {

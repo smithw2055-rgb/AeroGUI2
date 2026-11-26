@@ -1778,6 +1778,54 @@ bool TestStandaloneCpuEvictionAndLazyReload() {
     return true;
 }
 
+bool TestNumericPlasmaAndRiveAtlasPaths() {
+    aero::ImageAtlas atlas;
+    aero::PlasmaRenderParams p1{};
+    p1.sx = 64.0f;
+    p1.sy = 64.0f;
+    p1.seed = 42.0f;
+    p1.timeSec = 0.25f;
+    p1.vw = 128.0f;
+    p1.vh = 64.0f;
+    p1.colorRgba = 0xFF00FF88u;
+
+    const aero::ImageAtlasEntry* e1 = atlas.LoadOrGetPlasma(p1);
+    AERO_CHECK(e1 != nullptr && e1->textureId > 0u);
+    const std::uint32_t texId = e1->textureId;
+    const std::uint64_t rev1 = atlas.GetTextureSlotRevision(texId);
+    AERO_CHECK(rev1 > 0u);
+
+    std::uint32_t w = 0u, h = 0u;
+    std::shared_ptr<const std::vector<std::uint8_t>> snap1;
+    AERO_CHECK(atlas.TryGetTextureSlotSnapshot(texId, w, h, snap1) && snap1 != nullptr && !snap1->empty());
+    bool anyLit = false;
+    for (std::size_t i = 3u; i < snap1->size(); i += 4u) {
+        if ((*snap1)[i] > 0u) {
+            anyLit = true;
+            break;
+        }
+    }
+    AERO_CHECK(anyLit);
+    const std::vector<std::uint8_t> frame1Copy = *snap1;
+
+    // Identical params must hit cache without bumping revision
+    const aero::ImageAtlasEntry* e1Cached = atlas.LoadOrGetPlasma(p1);
+    AERO_CHECK(e1Cached != nullptr && e1Cached->textureId == texId);
+    AERO_CHECK(atlas.GetTextureSlotRevision(texId) == rev1);
+
+    // Mutating timeSec reuses the same texture slot and updates pixels
+    p1.timeSec = 1.50f;
+    const aero::ImageAtlasEntry* e2 = atlas.LoadOrGetPlasma(p1);
+    AERO_CHECK(e2 != nullptr && e2->textureId == texId);
+    AERO_CHECK(atlas.GetTextureSlotRevision(texId) > rev1);
+    std::shared_ptr<const std::vector<std::uint8_t>> snap2;
+    AERO_CHECK(atlas.TryGetTextureSlotSnapshot(texId, w, h, snap2) && snap2 != nullptr);
+    AERO_CHECK(*snap2 != frame1Copy);
+
+    AERO_CHECK(atlas.FindLoadedRive(77u, "nonexistent.riv") == nullptr);
+    return true;
+}
+
 } // namespace
 
 int main() {
@@ -1806,6 +1854,7 @@ int main() {
         {"LeafTextClipEliminationAndOverflowClip", &TestLeafTextClipEliminationAndOverflowClip},
         {"FractionalScissorPixelCenterAndNoOverflowSeam", &TestFractionalScissorPixelCenterAndNoOverflowSeam},
         {"StandaloneCpuEvictionAndLazyReload", &TestStandaloneCpuEvictionAndLazyReload},
+        {"NumericPlasmaAndRiveAtlasPaths", &TestNumericPlasmaAndRiveAtlasPaths},
     };
 
     int passed = 0;

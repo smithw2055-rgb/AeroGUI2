@@ -726,6 +726,39 @@ public class Image : FrameworkElement {
             tintCol);
     }
 
+    internal bool ApplyRiveDirect(
+        string assetPath, int instanceId, float tLoopSec, float tStateSec,
+        float reqW, float reqH, Stretch stretch, RiveInput[] inputs, bool inputsDirty) {
+        if (!ParseUtil.IsValidHandle(__nativeHandle)) { return false; }
+        _stretch = stretch;
+        uint tintCol = _tint != null ? _tint.ResolveRgba() : ParseUtil.PackArgb(255u, 255u, 255u, 255u);
+        Visual_SetRiveParams(
+            __nativeHandle,
+            assetPath,
+            instanceId,
+            tLoopSec,
+            tStateSec,
+            reqW,
+            reqH,
+            EnumConvert.ToInt(stretch),
+            tintCol);
+        if (inputsDirty) {
+            Visual_ClearRiveInputs(__nativeHandle);
+            if (inputs != null) {
+                for (int i = 0; i < inputs.Length; i += 1) {
+                    RiveInput ri = inputs[i];
+                    if (ri != null && ri.InputName != null && ri.InputName.Length > 0 && ri.InputValueBox != null) {
+                        float val = (ri.InputValueBox is BoxedBool)
+                            ? ((ri.InputValueBox as BoxedBool).Value ? 1.0f : 0.0f)
+                            : DependencyObject.UnboxFloat(ri.InputValueBox, 0.0f);
+                        Visual_SetRiveInput(__nativeHandle, ri.InputName, val);
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
     public override bool SetPropertyValue(string propName, DependencyObject value) {
         if (propName == "Source") { Source = DependencyObject.UnboxString(value, ""); return true; }
         if (propName == "Stretch") {

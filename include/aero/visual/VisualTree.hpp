@@ -242,8 +242,33 @@ struct VisualTextData {
     void InvalidateLayoutCache() noexcept { hasCachedLayout = false; }
 };
 
+struct VisualPlasmaState {
+    bool active = false;
+    float sx = 64.0f;
+    float sy = 64.0f;
+    float timeSec = 0.0f;
+    float seed = 100.0f;
+    float vw = 300.0f;
+    float vh = 90.0f;
+    std::uint32_t colorRgba = 0xFFFFBC01u;
+};
+
+struct VisualRiveState {
+    bool active = false;
+    std::uint32_t instanceId = 0u;
+    std::string assetPath;
+    float tLoopSec = 0.0f;
+    float tStateSec = 0.0f;
+    float reqW = 0.0f;
+    float reqH = 0.0f;
+    std::uint64_t inputsRevision = 1u;
+    std::vector<std::pair<std::string, float>> inputs;
+};
+
 struct VisualImageData {
     std::string uri;
+    VisualPlasmaState plasma{};
+    VisualRiveState rive{};
     Stretch stretch = Stretch::Uniform;
     StretchDirection stretchDir = StretchDirection::Both;
     std::uint32_t tintRgba = 0xFFFFFFFFu;
@@ -261,6 +286,13 @@ struct VisualImageData {
     bool hasExplicitViewport = false;
     bool viewportAbsolute = false;
     bool tileWrap = false;
+
+    [[nodiscard]] bool HasNonVisualBrushSource() const noexcept {
+        return !uri.empty() || plasma.active || rive.active;
+    }
+    [[nodiscard]] bool HasSource() const noexcept {
+        return HasNonVisualBrushSource() || visualBrushSource.IsValid();
+    }
 };
 
 struct VisualVectorData {
@@ -411,7 +443,8 @@ struct VisualNode {
         : alive(false)
         , hasScriptOwner(false)
         , drawDirty(false)
-        , inCanvasDrawList(false) {}
+        , inCanvasDrawList(false)
+        , inDirtyBindingPropList(false) {}
 
     VisualNodeId id{};
     VisualNodeId parent{};
@@ -434,6 +467,7 @@ struct VisualNode {
     bool hasScriptOwner : 1;
     bool drawDirty : 1;
     bool inCanvasDrawList : 1;
+    bool inDirtyBindingPropList : 1;
 
     [[nodiscard]] bool HasExtras() const noexcept { return extras != nullptr; }
     [[nodiscard]] bool HasSpatial3D() const noexcept { return extras && extras->spatial3D != nullptr; }
@@ -773,6 +807,30 @@ public:
         Stretch stretch,
         StretchDirection stretchDir,
         std::uint32_t tintRgba);
+    bool SetPlasmaImage(
+        VisualNodeId id,
+        float sx,
+        float sy,
+        float timeSec,
+        float seed,
+        std::uint32_t colorRgba,
+        float vw,
+        float vh,
+        Stretch stretch,
+        StretchDirection stretchDir,
+        std::uint32_t tintRgba);
+    bool SetRiveParams(
+        VisualNodeId id,
+        std::string_view assetPath,
+        std::uint32_t instanceId,
+        float tLoopSec,
+        float tStateSec,
+        float reqW,
+        float reqH,
+        Stretch stretch,
+        std::uint32_t tintRgba);
+    bool ClearRiveInputs(VisualNodeId id);
+    bool SetRiveInput(VisualNodeId id, std::string_view inputName, float value);
     bool SetImageViewbox(
         VisualNodeId id,
         float vx,
@@ -834,6 +892,9 @@ public:
     std::size_t FlushTrackB();
 
     void MarkDirty(VisualNodeId id, VisualDirtyFlags flags) noexcept;
+    void MarkBindingPropDirty(VisualNodeId id) noexcept;
+    [[nodiscard]] std::int32_t BeginConsumeDirtyBindingPropNodes();
+    [[nodiscard]] ObjectRef GetConsumedDirtyBindingPropOwner(std::size_t idx) const noexcept;
     [[nodiscard]] bool HasAnyDirty() const noexcept { return anyDirty_; }
     [[nodiscard]] bool HasLayoutOrTransformDirty() const noexcept { return layoutOrTransformDirty_; }
     [[nodiscard]] bool IsStructureDirty() const noexcept { return structureDirty_; }
@@ -904,6 +965,9 @@ private:
     bool layoutOrTransformDirty_ = true;
     bool structureDirty_ = true;
     std::vector<VisualNodeId> dirtyNodes_;
+    std::vector<VisualNodeId> dirtyBindingPropNodes_;
+    std::vector<VisualNodeId> consumedDirtyBindingPropNodes_;
+    bool dirtyBindingPropOverflow_ = false;
     std::vector<VisualEcsColumnBinding> ecsBindings_;
 
     Size lastViewportSize_{

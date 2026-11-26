@@ -684,6 +684,10 @@ ExecutionDomainContext::ExecutionDomainContext()
     detail::RetainHeapHookUser(*uiHeap_);
     detail::RegisterFieldMutationListener(*simHeap_, this, &onHeapFieldMutatedCallback, this);
     detail::RegisterFieldMutationListener(*uiHeap_, this, &onHeapFieldMutatedCallback, this);
+    ObservableListHelper::RegisterOwnerDirtyListener(
+        simHeapId_, this, &onObservableListOwnerDirtyCallback, this);
+    ObservableListHelper::RegisterOwnerDirtyListener(
+        uiHeapId_, this, &onObservableListOwnerDirtyCallback, this);
 }
 
 ExecutionDomainContext::ExecutionDomainContext(
@@ -701,13 +705,19 @@ ExecutionDomainContext::ExecutionDomainContext(
     detail::RetainHeapHookUser(*uiHeap_);
     detail::RegisterFieldMutationListener(*simHeap_, this, &onHeapFieldMutatedCallback, this);
     detail::RegisterFieldMutationListener(*uiHeap_, this, &onHeapFieldMutatedCallback, this);
+    ObservableListHelper::RegisterOwnerDirtyListener(
+        simHeapId_, this, &onObservableListOwnerDirtyCallback, this);
+    ObservableListHelper::RegisterOwnerDirtyListener(
+        uiHeapId_, this, &onObservableListOwnerDirtyCallback, this);
 }
 
 ExecutionDomainContext::~ExecutionDomainContext() {
     if (simHeapId_ != 0) {
+        ObservableListHelper::UnregisterOwnerDirtyListener(simHeapId_, this);
         detail::UnregisterFieldMutationListener(simHeapId_, this);
     }
     if (uiHeapId_ != 0) {
+        ObservableListHelper::UnregisterOwnerDirtyListener(uiHeapId_, this);
         detail::UnregisterFieldMutationListener(uiHeapId_, this);
     }
     detail::ReleaseHeapHookUser(simHeap_.get());
@@ -725,6 +735,45 @@ void ExecutionDomainContext::onHeapFieldMutatedCallback(
     }
 }
 
+void ExecutionDomainContext::onObservableListOwnerDirtyCallback(
+    void* context,
+    ManagedHeap& heap,
+    ObjectRef ownerRef,
+    std::uint8_t) {
+    if (auto* self = static_cast<ExecutionDomainContext*>(context)) {
+        self->globalObservableEpoch_.fetch_add(1u, std::memory_order_release);
+        self->noteSubscribedObjectMutated(heap, ownerRef);
+    }
+}
+
+void ExecutionDomainContext::noteSubscribedObjectMutated(
+    const ManagedHeap& heap,
+    ObjectRef object) {
+    if (!hasSubscribedTokens_.load(std::memory_order_acquire) ||
+        !object.valid() || object.kind != ObjectKind::Record) {
+        return;
+    }
+    const std::uint64_t tokKey = (heap.heapId() << 48) ^ refKey(object);
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (dirtyObservableOverflow_) {
+        return;
+    }
+    const auto it = objectTokensByRefKey_.find(tokKey);
+    if (it == objectTokensByRefKey_.end()) {
+        return;
+    }
+    if (dirtyObservableTokens_.size() >= 512u) {
+        dirtyObservableOverflow_ = true;
+        dirtyObservableTokens_.clear();
+        dirtyObservableTokenSet_.clear();
+        return;
+    }
+    const std::int32_t tok = it->second;
+    if (dirtyObservableTokenSet_.insert(tok).second) {
+        dirtyObservableTokens_.push_back(tok);
+    }
+}
+
 void ExecutionDomainContext::handleFieldMutated(
     ManagedHeap& heap,
     ObjectRef object,
@@ -734,6 +783,7 @@ void ExecutionDomainContext::handleFieldMutated(
         return;
     }
     globalObservableEpoch_.fetch_add(1u, std::memory_order_release);
+    noteSubscribedObjectMutated(heap, object);
 
     const std::uint64_t heapKey = heap.heapId();
     const std::uint64_t objKey = refKey(object);
@@ -896,6 +946,61 @@ std::optional<std::string_view> ExecutionDomainContext::stringViewAcrossDomains(
 std::uint64_t ExecutionDomainContext::globalObservableEpoch() const noexcept {
     return globalObservableEpoch_.load(std::memory_order_acquire) +
         ObservableListHelper::GlobalMutationEpoch();
+}
+
+std::int32_t ExecutionDomainContext::getOrAssignObservableToken(ObjectRef ref) {
+    if (!ref.valid() || ref.kind != ObjectKind::Record) {
+        return 0;
+    }
+    const ManagedHeap* heap = heapForObject(ref);
+    if (!heap || !heap->isAlive(ref)) {
+        return 0;
+    }
+    const std::uint64_t tokKey = (heap->heapId() << 48) ^ refKey(ref);
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (const auto it = objectTokensByRefKey_.find(tokKey); it != objectTokensByRefKey_.end()) {
+        return it->second;
+    }
+    if (objectTokensByRefKey_.size() >= 16384u) {
+        for (auto it = objectTokensByRefKey_.begin(); it != objectTokensByRefKey_.end();) {
+            const std::uint64_t hPart = (it->first >> 48) & 0xFFFFull;
+            const auto slot = static_cast<std::uint32_t>((it->first >> 32) & 0xFFFFull);
+            (void)hPart;
+            (void)slot;
+            ++it;
+        }
+    }
+    std::int32_t assigned = nextObjectToken_++;
+    if (nextObjectToken_ >= 1000000000) {
+        nextObjectToken_ = 1;
+    }
+    if (assigned <= 0) {
+        assigned = 1;
+    }
+    objectTokensByRefKey_.emplace(tokKey, assigned);
+    hasSubscribedTokens_.store(true, std::memory_order_release);
+    return assigned;
+}
+
+std::int32_t ExecutionDomainContext::beginConsumeDirtyObservableTokens() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    consumedDirtyTokens_.clear();
+    if (dirtyObservableOverflow_) {
+        dirtyObservableOverflow_ = false;
+        dirtyObservableTokens_.clear();
+        dirtyObservableTokenSet_.clear();
+        return -1;
+    }
+    consumedDirtyTokens_.swap(dirtyObservableTokens_);
+    dirtyObservableTokenSet_.clear();
+    return static_cast<std::int32_t>(consumedDirtyTokens_.size());
+}
+
+std::int32_t ExecutionDomainContext::getConsumedDirtyObservableToken(std::size_t idx) const noexcept {
+    if (idx >= consumedDirtyTokens_.size()) {
+        return 0;
+    }
+    return consumedDirtyTokens_[idx];
 }
 
 void ExecutionDomainContext::attachInterpreter(Interpreter& interpreter, DomainKind domain) {

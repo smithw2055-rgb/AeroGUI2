@@ -279,10 +279,14 @@ namespace {
     if (inside && node->layout.isHitTestVisible) {
         if (node->kind == VisualKind::Image) {
             const VisualImageData& img = node->Image();
-            if (img.uri.size() >= 7u && img.uri.substr(0u, 7u) == "rive://") {
+            const bool isRiveUri = img.uri.size() >= 7u && img.uri.substr(0u, 7u) == "rive://";
+            if (img.rive.active || isRiveUri) {
                 if (const UIResourceStore* store = world.ResourceStore()) {
                     const ImageAtlas& atlas = store->Images();
-                    if (const ImageAtlasEntry* entry = atlas.FindLoaded(img.uri)) {
+                    const ImageAtlasEntry* entry = img.rive.active
+                        ? atlas.FindLoadedRive(img.rive.instanceId, img.rive.assetPath)
+                        : atlas.FindLoaded(img.uri);
+                    if (entry != nullptr) {
                         const Rect localBox{0.0f, 0.0f, node->layout.layoutRect.width, node->layout.layoutRect.height};
                         const ImageStretchPlacement place = ComputeImageStretchPlacement(
                             localBox,

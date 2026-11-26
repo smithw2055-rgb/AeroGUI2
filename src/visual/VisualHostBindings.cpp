@@ -1635,6 +1635,45 @@ bool RegisterVisualHostBindings(
             ArgUInt(args, 4, 0xFFFFFFFFu));
         return rs_rt::Value{std::int64_t{0}};
     });
+    ok &= bindFn("Visual_SetPlasmaImage", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        (void)world.SetPlasmaImage(
+            ArgNode(args, 0, world),
+            ArgFloat(args, 1, 64.0f),
+            ArgFloat(args, 2, 64.0f),
+            ArgFloat(args, 3, 0.0f),
+            ArgFloat(args, 4, 100.0f),
+            ArgUInt(args, 5, 0xFFFFBC01u),
+            ArgFloat(args, 6, 300.0f),
+            ArgFloat(args, 7, 90.0f),
+            static_cast<Stretch>(ArgInt(args, 8, 1)),
+            static_cast<StretchDirection>(ArgInt(args, 9, 2)),
+            ArgUInt(args, 10, 0xFFFFFFFFu));
+        return rs_rt::Value{std::int64_t{0}};
+    });
+    ok &= bindFn("Visual_SetRiveParams", [&world, &domains](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        (void)world.SetRiveParams(
+            ArgNode(args, 0, world),
+            ArgStringView(domains, args, 1),
+            static_cast<std::uint32_t>(std::max<std::int64_t>(0, ArgInt(args, 2, 0))),
+            ArgFloat(args, 3, 0.0f),
+            ArgFloat(args, 4, 0.0f),
+            ArgFloat(args, 5, 0.0f),
+            ArgFloat(args, 6, 0.0f),
+            static_cast<Stretch>(ArgInt(args, 7, 2)),
+            ArgUInt(args, 8, 0xFFFFFFFFu));
+        return rs_rt::Value{std::int64_t{0}};
+    });
+    ok &= bindFn("Visual_ClearRiveInputs", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        (void)world.ClearRiveInputs(ArgNode(args, 0, world));
+        return rs_rt::Value{std::int64_t{0}};
+    });
+    ok &= bindFn("Visual_SetRiveInput", [&world, &domains](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        (void)world.SetRiveInput(
+            ArgNode(args, 0, world),
+            ArgStringView(domains, args, 1),
+            ArgFloat(args, 2, 0.0f));
+        return rs_rt::Value{std::int64_t{0}};
+    });
     ok &= bindFn("Visual_SetImageViewbox", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         (void)world.SetImageViewbox(
             ArgNode(args, 0, world),
@@ -2427,6 +2466,45 @@ bool RegisterVisualHostBindings(
         }
         const std::uint64_t raw = reflectEnv.domains->globalObservableEpoch();
         return rs_rt::Value{static_cast<std::int64_t>((raw % 1000000000ULL) + 1ULL)};
+    });
+    ok &= bindFn("Reflect_GetObjectToken", [reflectEnv](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        if (!reflectEnv.domains) {
+            return rs_rt::Value{static_cast<std::int64_t>(0)};
+        }
+        const rs_rt::ObjectRef target = ArgObject(args, 0);
+        return rs_rt::Value{static_cast<std::int64_t>(
+            reflectEnv.domains->getOrAssignObservableToken(target))};
+    });
+    ok &= bindFn("Reflect_BeginConsumeDirtyTokens", [reflectEnv](const rs_bc::FunctionReference&, rs_rt::ValueSpan, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        if (!reflectEnv.domains) {
+            return rs_rt::Value{static_cast<std::int64_t>(-1)};
+        }
+        return rs_rt::Value{static_cast<std::int64_t>(
+            reflectEnv.domains->beginConsumeDirtyObservableTokens())};
+    });
+    ok &= bindFn("Reflect_GetConsumedDirtyToken", [reflectEnv](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        if (!reflectEnv.domains) {
+            return rs_rt::Value{static_cast<std::int64_t>(0)};
+        }
+        const std::int64_t idx = ArgInt(args, 0, -1);
+        if (idx < 0) {
+            return rs_rt::Value{static_cast<std::int64_t>(0)};
+        }
+        return rs_rt::Value{static_cast<std::int64_t>(
+            reflectEnv.domains->getConsumedDirtyObservableToken(static_cast<std::size_t>(idx)))};
+    });
+    ok &= bindFn("Visual_BeginConsumeDirtyPropNodes", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        return rs_rt::Value{static_cast<std::int64_t>(world.BeginConsumeDirtyBindingPropNodes())};
+    });
+    ok &= bindFn("Visual_GetConsumedDirtyPropOwner", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        const std::int64_t idx = ArgInt(args, 0, -1);
+        if (idx < 0) {
+            return rs_rt::Value{rs_rt::NullObject{}};
+        }
+        const rs_rt::ObjectRef obj = world.GetConsumedDirtyBindingPropOwner(static_cast<std::size_t>(idx));
+        return (obj.valid() && obj.kind == rs_rt::ObjectKind::Record)
+            ? rs_rt::Value{obj}
+            : rs_rt::Value{rs_rt::NullObject{}};
     });
     ok &= bindFn("Color_ParseRgba", [reflectEnv](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         std::string rawColorScratch;

@@ -3287,7 +3287,7 @@ public class TimelineAnimation : DependencyObject {
             if (dest is Control) { (dest as Control).Foreground = new SolidColorBrush(rgba); return; }
         }
         if (builtinPropId == 18) { dest.BorderBrush = new SolidColorBrush(rgba); return; }
-        dest.SetPropertyValue(propName, DependencyObject.BoxString(ParseUtil.FormatArgbHex(rgba)));
+        dest.SetPropertyValue(propName, DependencyObject.BoxColor(rgba));
     }
 
     internal bool HasAnimatedDuration() {
@@ -4472,6 +4472,49 @@ internal class BindingEntry : DependencyObject {
     private int _fastUiPropEp = -1;
     private int _fastLayoutEp = -1;
     private int _fastDispEp = -1;
+    internal int TargetPropId = 0;
+    internal int SourcePropId = 0;
+    internal bool _inPollOnly = false;
+    internal int _dirtyEnqueuedGen = 0;
+    internal int _lastEvalWaveGen = 0;
+    private UIElement _subscribedUiSrc;
+    private int _subscribedVmToken = 0;
+    private int _subscribedMidVmToken = 0;
+
+    internal void BindUiSourceSub(UIElement el) {
+        if (_subscribedUiSrc == el) { return; }
+        if (_subscribedUiSrc != null) { _subscribedUiSrc.RemovePropSubscriber(this); }
+        _subscribedUiSrc = el;
+        if (el != null && !el._isDisposedTree) { el.AddPropSubscriber(this); }
+    }
+
+    internal void BindVmSourceSub(int tok0, int tok1) {
+        if (_subscribedVmToken != tok0) {
+            if (_subscribedVmToken > 0) { BindingEngine.UnsubscribeVmToken(_subscribedVmToken, this); }
+            _subscribedVmToken = tok0;
+            if (tok0 > 0) { BindingEngine.SubscribeVmToken(tok0, this); }
+        }
+        if (_subscribedMidVmToken != tok1) {
+            if (_subscribedMidVmToken > 0) { BindingEngine.UnsubscribeVmToken(_subscribedMidVmToken, this); }
+            _subscribedMidVmToken = tok1;
+            if (tok1 > 0) { BindingEngine.SubscribeVmToken(tok1, this); }
+        }
+    }
+
+    internal void ClearSourceSubscriptions() {
+        BindUiSourceSub(null);
+        BindVmSourceSub(0, 0);
+    }
+
+    internal bool IsDead() {
+        if (Target != null && Target._isDisposedTree) { return true; }
+        if (ContextHost != null && ContextHost._isDisposedTree) { return true; }
+        if (Target == null && TargetEffect == null && TargetInline != null &&
+            (TargetInline.OwnerTextBlock == null || TargetInline.OwnerTextBlock._isDisposedTree)) {
+            return true;
+        }
+        return false;
+    }
 
     internal bool IsEpochFastClean() {
         if (Target == null && TargetInline == null && TargetEffect == null) { return true; }
@@ -4481,7 +4524,9 @@ internal class BindingEntry : DependencyObject {
             return false;
         }
         if (_fastKind1VmClean && (Kind == 1 || Kind == 5)) {
-            return BindingEngine._curNativeVmEpoch == _fastNativeVmEp &&
+            return _subscribedVmToken > 0 &&
+                   (IsSingleHopPath || _subscribedMidVmToken > 0) &&
+                   BindingEngine._curNativeVmEpoch == _fastNativeVmEp &&
                    BindingEngine._curManagedVmEpoch == _fastManagedVmEp &&
                    UIElement._dataContextEpoch == _fastDcEp &&
                    UIElement._treeParentEpoch == _fastTreeEp &&
@@ -4489,7 +4534,9 @@ internal class BindingEntry : DependencyObject {
                    UIElement._disposeEpoch == _fastDispEp;
         }
         if (_fastElemClean) {
-            return UIElement._globalPropEpoch == _fastUiPropEp &&
+            return _subscribedUiSrc != null &&
+                   !_subscribedUiSrc._isDisposedTree &&
+                   UIElement._globalPropEpoch == _fastUiPropEp &&
                    BindingEngine._curLayoutSizeEpoch == _fastLayoutEp &&
                    UIElement._treeParentEpoch == _fastTreeEp &&
                    UIElement._dataContextEpoch == _fastDcEp &&
@@ -5056,7 +5103,17 @@ internal class BindingEntry : DependencyObject {
         bool prev = _isApplying;
         _isApplying = true;
         if (Target != null) {
-            Target.SetPropertyValue(TargetProp, valBox);
+            if (TargetPropId > 0) {
+                if (valBox is BoxedFloat && Target.TryWriteFloatById(TargetPropId, (valBox as BoxedFloat).Value)) {
+                    // written via zero-dispatch float slot
+                } else if (valBox is BoxedColor && Target.TryWriteColorById(TargetPropId, (valBox as BoxedColor).Value)) {
+                    // written via zero-dispatch color slot
+                } else {
+                    Target.SetPropertyById(TargetPropId, TargetProp, valBox);
+                }
+            } else {
+                Target.SetPropertyValue(TargetProp, valBox);
+            }
         } else if (TargetInline != null) {
             TargetInline.SetPropertyValue(TargetProp, valBox);
         } else if (TargetEffect != null) {
@@ -5132,7 +5189,7 @@ internal class BindingEntry : DependencyObject {
     public void Evaluate() {
         if (Target == null && TargetInline == null && TargetEffect == null) { return; }
         if (Mode == 2 && OneTimeDone) { return; }
-        if (BindingEngine._inFlushPass && !BindingEngine._inSubtreeFlush && OneTimeDone &&
+        if (BindingEngine._inFlushPass && !BindingEngine._inSubtreeFlush && !BindingEngine._inPushWave && OneTimeDone &&
             (Target == null || Target._activeTriggerProps == null || Target._activeTriggerProps.Length == 0)) {
             if (_fastKind1VmClean && (Kind == 1 || Kind == 5) &&
                 BindingEngine._curNativeVmEpoch == _fastNativeVmEp &&
@@ -5189,6 +5246,7 @@ internal class BindingEntry : DependencyObject {
             int snapVisEp = UIElement._visibilityEpoch;
             int snapDispEp = UIElement._disposeEpoch;
             if (SourceElement != null && SourceElement._isDisposedTree) {
+                ClearSourceSubscriptions();
                 SourceElement = null;
                 _lastFindNameRoot = null;
                 LastDirtyMask = -1;
@@ -5210,19 +5268,20 @@ internal class BindingEntry : DependencyObject {
                 bool canFastElem = elemDm >= 0;
                 if (OneTimeDone && _elemPropResolvedOnSelf && elemDm >= 0 && elemDm == LastDirtyMask) {
                     if (IsSingleHopPath) {
-                        _fastElemClean = true;
-                        _fastUiPropEp = snapUiPropEp;
-                        _fastLayoutEp = snapLayoutEp;
-                        _fastTreeEp = snapTreeEp;
-                        _fastDcEp = snapDcEp;
-                        _fastVisEp = snapVisEp;
-                        _fastDispEp = snapDispEp;
+                        MarkElemFastClean(snapUiPropEp, snapLayoutEp, snapTreeEp, snapDcEp, snapVisEp, snapDispEp);
+                        if (_subscribedUiSrc != SourceElement || _subscribedVmToken != 0 || _subscribedMidVmToken != 0) {
+                            BindUiSourceSub(SourceElement);
+                            BindVmSourceSub(0, 0);
+                        }
                     } else {
                         _fastElemClean = false;
+                        ClearSourceSubscriptions();
                     }
                     return;
                 }
-                DependencyObject selfVal = canFastElem ? SourceElement.GetPropertyValue(SourcePath) : null;
+                DependencyObject selfVal = canFastElem
+                    ? (SourcePropId > 0 ? SourceElement.GetPropertyById(SourcePropId, SourcePath) : SourceElement.GetPropertyValue(SourcePath))
+                    : null;
                 bool explicitNull = (selfVal == null) && SourceElement.IsExplicitNullProperty(SourcePath);
                 _elemPropResolvedOnSelf = canFastElem && (selfVal != null || explicitNull || SourceElement.DataContext == null);
                 DependencyObject ev = (selfVal != null || explicitNull)
@@ -5230,29 +5289,33 @@ internal class BindingEntry : DependencyObject {
                     : ReadElementOrDcPathBox(SourceElement, SourcePath);
                 if (ev == null && !explicitNull && HasFallback) { ev = FallbackBox; }
                 bool isDirectUi = ev != null && (ev.UnboxObject() is UIElement);
-                string sig = isDirectUi ? "<ui>" : (ev != null ? DependencyObject.UnboxString(ev, "") : "<null>");
+                bool colorSame = OneTimeDone && (ev is BoxedColor) && (_lastTemplateValBox is BoxedColor) &&
+                                 ((ev as BoxedColor).Value == (_lastTemplateValBox as BoxedColor).Value);
                 bool boxDiff = (ev is Brush || ev is UIElement || _lastTemplateValBox is Brush || _lastTemplateValBox is UIElement)
                     && (ev != _lastTemplateValBox);
                 LastDirtyMask = _elemPropResolvedOnSelf ? elemDm : -1;
-                if (!OneTimeDone || boxDiff || (!isDirectUi && sig != LastHash)) {
+                if (!colorSame) {
+                    string sig = isDirectUi ? "<ui>" : (ev != null ? DependencyObject.UnboxString(ev, "") : "<null>");
+                    if (!OneTimeDone || boxDiff || (!isDirectUi && sig != LastHash)) {
+                        _lastTemplateValBox = ev;
+                        LastHash = sig;
+                        OneTimeDone = true;
+                        ApplyConverted(ev);
+                    }
+                } else {
                     _lastTemplateValBox = ev;
-                    LastHash = sig;
-                    OneTimeDone = true;
-                    ApplyConverted(ev);
                 }
                 if (OneTimeDone && _elemPropResolvedOnSelf && IsSingleHopPath) {
-                    _fastElemClean = true;
-                    _fastUiPropEp = snapUiPropEp;
-                    _fastLayoutEp = snapLayoutEp;
-                    _fastTreeEp = snapTreeEp;
-                    _fastDcEp = snapDcEp;
-                    _fastVisEp = snapVisEp;
-                    _fastDispEp = snapDispEp;
+                    MarkElemFastClean(snapUiPropEp, snapLayoutEp, snapTreeEp, snapDcEp, snapVisEp, snapDispEp);
+                    BindUiSourceSub(SourceElement);
+                    BindVmSourceSub(0, 0);
                 } else {
                     _fastElemClean = false;
+                    ClearSourceSubscriptions();
                 }
             } else {
                 _fastElemClean = false;
+                ClearSourceSubscriptions();
                 if (HasFallback && host != null && !OneTimeDone) {
                     OneTimeDone = true;
                     ApplyRawBox(FallbackBox);
@@ -5271,42 +5334,53 @@ internal class BindingEntry : DependencyObject {
             int tpEpoch = IsSingleHopPath ? TryGetCachedFastElementEpoch(SourceElement) : -1;
             bool canFastTp = tpEpoch >= 0;
             if (OneTimeDone && _elemPropResolvedOnSelf && canFastTp && tpEpoch == LastDirtyMask) {
-                _fastElemClean = true;
-                _fastUiPropEp = snapUiPropEp;
-                _fastLayoutEp = snapLayoutEp;
-                _fastTreeEp = snapTreeEp;
-                _fastDcEp = snapDcEp;
-                _fastVisEp = snapVisEp;
-                _fastDispEp = snapDispEp;
+                MarkElemFastClean(snapUiPropEp, snapLayoutEp, snapTreeEp, snapDcEp, snapVisEp, snapDispEp);
+                if (IsSingleHopPath) {
+                    if (_subscribedUiSrc != SourceElement || _subscribedVmToken != 0 || _subscribedMidVmToken != 0) {
+                        BindUiSourceSub(SourceElement);
+                        BindVmSourceSub(0, 0);
+                    }
+                } else {
+                    ClearSourceSubscriptions();
+                }
                 return;
             }
-            DependencyObject tv = SourceElement.GetPropertyValue(SourcePath);
+            DependencyObject tv = SourcePropId > 0
+                ? SourceElement.GetPropertyById(SourcePropId, SourcePath)
+                : SourceElement.GetPropertyValue(SourcePath);
             bool explicitNull = (tv == null) && SourceElement.IsExplicitNullProperty(SourcePath);
             _elemPropResolvedOnSelf = canFastTp && (tv != null || explicitNull || SourceElement.DataContext == null);
             if (tv == null && !explicitNull) {
                 tv = BindingEngine.ReadPathBox(SourceElement, SourcePath);
             }
             if (tv == null && !explicitNull && HasFallback) { tv = FallbackBox; }
-            string sig = tv != null ? DependencyObject.UnboxString(tv, "") : "<null>";
+            bool colorSame = OneTimeDone && (tv is BoxedColor) && (_lastTemplateValBox is BoxedColor) &&
+                             ((tv as BoxedColor).Value == (_lastTemplateValBox as BoxedColor).Value);
             bool boxDiff = (tv is Brush || tv is UIElement || _lastTemplateValBox is Brush || _lastTemplateValBox is UIElement)
                 && (tv != _lastTemplateValBox);
             LastDirtyMask = _elemPropResolvedOnSelf ? tpEpoch : -1;
-            if (boxDiff || sig != LastHash || !OneTimeDone) {
+            if (!colorSame) {
+                string sig = tv != null ? DependencyObject.UnboxString(tv, "") : "<null>";
+                if (boxDiff || sig != LastHash || !OneTimeDone) {
+                    _lastTemplateValBox = tv;
+                    LastHash = sig;
+                    OneTimeDone = true;
+                    ApplyConverted(tv);
+                }
+            } else {
                 _lastTemplateValBox = tv;
-                LastHash = sig;
-                OneTimeDone = true;
-                ApplyConverted(tv);
             }
             if (OneTimeDone && _elemPropResolvedOnSelf) {
-                _fastElemClean = true;
-                _fastUiPropEp = snapUiPropEp;
-                _fastLayoutEp = snapLayoutEp;
-                _fastTreeEp = snapTreeEp;
-                _fastDcEp = snapDcEp;
-                _fastVisEp = snapVisEp;
-                _fastDispEp = snapDispEp;
+                MarkElemFastClean(snapUiPropEp, snapLayoutEp, snapTreeEp, snapDcEp, snapVisEp, snapDispEp);
+                if (IsSingleHopPath) {
+                    BindUiSourceSub(SourceElement);
+                    BindVmSourceSub(0, 0);
+                } else {
+                    ClearSourceSubscriptions();
+                }
             } else {
                 _fastElemClean = false;
+                ClearSourceSubscriptions();
             }
             return;
         }
@@ -5412,19 +5486,19 @@ internal class BindingEntry : DependencyObject {
             object srcObj = DependencyObject.Unbox(srcBox);
             if (srcObj == null) {
                 _fastKind1VmClean = false;
+                ClearSourceSubscriptions();
                 return;
             }
             int dm = ParseUtil.IsNativeReady() ? Reflect_GetDirtyMask(srcObj) : -1;
             bool sameSrc = DependencyObject.SameValueBox(srcBox, _lastSrcBox);
             bool canKind5VmFast = !(srcObj is UIElement) && dm >= 0;
             if (OneTimeDone && sameSrc && canKind5VmFast && dm == LastDirtyMask) {
-                _fastKind1VmClean = true;
-                _fastNativeVmEp = snapNativeVmEp;
-                _fastManagedVmEp = snapManagedVmEp;
-                _fastDcEp = snapDcEp;
-                _fastTreeEp = snapTreeEp;
-                _fastVisEp = snapVisEp;
-                _fastDispEp = snapDispEp;
+                MarkVmFastClean(snapNativeVmEp, snapManagedVmEp, snapDcEp, snapTreeEp, snapVisEp, snapDispEp);
+                if (_subscribedVmToken == 0 || _subscribedMidVmToken != 0 || _subscribedUiSrc != null) {
+                    int tok0 = ParseUtil.IsNativeReady() ? Reflect_GetObjectToken(srcObj) : 0;
+                    BindUiSourceSub(null);
+                    BindVmSourceSub(tok0, 0);
+                }
                 return;
             }
             _lastSrcBox = srcBox;
@@ -5432,14 +5506,14 @@ internal class BindingEntry : DependencyObject {
             OneTimeDone = true;
             CompiledUpdater(Target, srcObj);
             BindingEngine.MarkFlushDirty();
-            _fastKind1VmClean = canKind5VmFast;
             if (canKind5VmFast) {
-                _fastNativeVmEp = snapNativeVmEp;
-                _fastManagedVmEp = snapManagedVmEp;
-                _fastDcEp = snapDcEp;
-                _fastTreeEp = snapTreeEp;
-                _fastVisEp = snapVisEp;
-                _fastDispEp = snapDispEp;
+                MarkVmFastClean(snapNativeVmEp, snapManagedVmEp, snapDcEp, snapTreeEp, snapVisEp, snapDispEp);
+                int tok0 = ParseUtil.IsNativeReady() ? Reflect_GetObjectToken(srcObj) : 0;
+                BindUiSourceSub(null);
+                BindVmSourceSub(tok0, 0);
+            } else {
+                _fastKind1VmClean = false;
+                ClearSourceSubscriptions();
             }
             return;
         }
@@ -5461,6 +5535,7 @@ internal class BindingEntry : DependencyObject {
                 _lastMidDirtyMask = -1;
                 _fastKind1VmClean = false;
                 _fastElemClean = false;
+                ClearSourceSubscriptions();
                 if (HasFallback) { ApplyRawBox(FallbackBox); }
                 return;
             }
@@ -5475,21 +5550,15 @@ internal class BindingEntry : DependencyObject {
             if (OneTimeDone && sameSrc && dm >= 0 && dm == LastDirtyMask) {
                 if (IsSingleHopPath) {
                     if (!srcIsUi) {
-                        _fastKind1VmClean = true;
-                        _fastNativeVmEp = snapNativeVmEp;
-                        _fastManagedVmEp = snapManagedVmEp;
-                        _fastDcEp = snapDcEp;
-                        _fastTreeEp = snapTreeEp;
-                        _fastVisEp = snapVisEp;
-                        _fastDispEp = snapDispEp;
+                        MarkVmFastClean(snapNativeVmEp, snapManagedVmEp, snapDcEp, snapTreeEp, snapVisEp, snapDispEp);
+                        if (_subscribedVmToken == 0 || _subscribedMidVmToken != 0 || _subscribedUiSrc != null) {
+                            UpdateKind1Subscriptions(true, false, srcObj);
+                        }
                     } else if (_elemPropResolvedOnSelf) {
-                        _fastElemClean = true;
-                        _fastUiPropEp = snapUiPropEp;
-                        _fastLayoutEp = snapLayoutEp;
-                        _fastTreeEp = snapTreeEp;
-                        _fastDcEp = snapDcEp;
-                        _fastVisEp = snapVisEp;
-                        _fastDispEp = snapDispEp;
+                        MarkElemFastClean(snapUiPropEp, snapLayoutEp, snapTreeEp, snapDcEp, snapVisEp, snapDispEp);
+                        if (_subscribedUiSrc != (srcObj as UIElement) || _subscribedVmToken != 0 || _subscribedMidVmToken != 0) {
+                            UpdateKind1Subscriptions(false, true, srcObj);
+                        }
                     }
                     return;
                 }
@@ -5506,13 +5575,13 @@ internal class BindingEntry : DependencyObject {
                     }
                     if (midDm >= 0 && midDm == _lastMidDirtyMask) {
                         if (!srcIsUi && cachedMid != null && !(cachedMid is UIElement)) {
-                            _fastKind1VmClean = true;
-                            _fastNativeVmEp = snapNativeVmEp;
-                            _fastManagedVmEp = snapManagedVmEp;
-                            _fastDcEp = snapDcEp;
-                            _fastTreeEp = snapTreeEp;
-                            _fastVisEp = snapVisEp;
-                            _fastDispEp = snapDispEp;
+                            MarkVmFastClean(snapNativeVmEp, snapManagedVmEp, snapDcEp, snapTreeEp, snapVisEp, snapDispEp);
+                            if (_subscribedVmToken == 0 || _subscribedMidVmToken == 0 || _subscribedUiSrc != null) {
+                                int tok0 = ParseUtil.IsNativeReady() ? Reflect_GetObjectToken(srcObj) : 0;
+                                int tok1 = ParseUtil.IsNativeReady() ? Reflect_GetObjectToken(cachedMid) : 0;
+                                BindUiSourceSub(null);
+                                BindVmSourceSub(tok0, tok1);
+                            }
                         }
                         return;
                     }
@@ -5522,7 +5591,7 @@ internal class BindingEntry : DependencyObject {
             bool explicitNull = false;
             if (srcIsUi && IsSingleHopPath) {
                 UIElement srcEl = srcObj as UIElement;
-                valBox = srcEl.GetPropertyValue(SourcePath);
+                valBox = SourcePropId > 0 ? srcEl.GetPropertyById(SourcePropId, SourcePath) : srcEl.GetPropertyValue(SourcePath);
                 explicitNull = (valBox == null) && srcEl.IsExplicitNullProperty(SourcePath);
                 _elemPropResolvedOnSelf = (dm >= 0) && (valBox != null || explicitNull || srcEl.DataContext == null);
             } else {
@@ -5568,51 +5637,25 @@ internal class BindingEntry : DependencyObject {
             bool canKind1VmFast = !srcIsUi && dm >= 0 && (IsSingleHopPath || midIsNonUiObservable);
             bool canKind1ElemFast = srcIsUi && IsSingleHopPath && _elemPropResolvedOnSelf;
             if (!boxDiff && OneTimeDone && sameSrc &&
-                (valBox == _lastPathValBox || valBox is BoxedInt || valBox is BoxedFloat || valBox is BoxedBool || valBox is BoxedString)) {
+                (valBox == _lastPathValBox || valBox is BoxedInt || valBox is BoxedFloat || valBox is BoxedBool || valBox is BoxedString || valBox is BoxedColor)) {
                 _lastSrcBox = srcBox;
                 LastDirtyMask = dm;
-                _fastKind1VmClean = canKind1VmFast;
-                if (canKind1VmFast) {
-                    _fastNativeVmEp = snapNativeVmEp;
-                    _fastManagedVmEp = snapManagedVmEp;
-                    _fastDcEp = snapDcEp;
-                    _fastTreeEp = snapTreeEp;
-                    _fastVisEp = snapVisEp;
-                    _fastDispEp = snapDispEp;
-                }
-                _fastElemClean = canKind1ElemFast;
-                if (canKind1ElemFast) {
-                    _fastUiPropEp = snapUiPropEp;
-                    _fastLayoutEp = snapLayoutEp;
-                    _fastTreeEp = snapTreeEp;
-                    _fastDcEp = snapDcEp;
-                    _fastVisEp = snapVisEp;
-                    _fastDispEp = snapDispEp;
-                }
+                if (canKind1VmFast) { MarkVmFastClean(snapNativeVmEp, snapManagedVmEp, snapDcEp, snapTreeEp, snapVisEp, snapDispEp); }
+                else { _fastKind1VmClean = false; }
+                if (canKind1ElemFast) { MarkElemFastClean(snapUiPropEp, snapLayoutEp, snapTreeEp, snapDcEp, snapVisEp, snapDispEp); }
+                else { _fastElemClean = false; }
+                UpdateKind1Subscriptions(canKind1VmFast, canKind1ElemFast, srcObj);
                 return;
             }
             string sig = valBox != null ? DependencyObject.UnboxString(valBox, "") : "<null>";
             if (!boxDiff && sig == LastHash && OneTimeDone && sameSrc) {
                 _lastSrcBox = srcBox;
                 LastDirtyMask = dm;
-                _fastKind1VmClean = canKind1VmFast;
-                if (canKind1VmFast) {
-                    _fastNativeVmEp = snapNativeVmEp;
-                    _fastManagedVmEp = snapManagedVmEp;
-                    _fastDcEp = snapDcEp;
-                    _fastTreeEp = snapTreeEp;
-                    _fastVisEp = snapVisEp;
-                    _fastDispEp = snapDispEp;
-                }
-                _fastElemClean = canKind1ElemFast;
-                if (canKind1ElemFast) {
-                    _fastUiPropEp = snapUiPropEp;
-                    _fastLayoutEp = snapLayoutEp;
-                    _fastTreeEp = snapTreeEp;
-                    _fastDcEp = snapDcEp;
-                    _fastVisEp = snapVisEp;
-                    _fastDispEp = snapDispEp;
-                }
+                if (canKind1VmFast) { MarkVmFastClean(snapNativeVmEp, snapManagedVmEp, snapDcEp, snapTreeEp, snapVisEp, snapDispEp); }
+                else { _fastKind1VmClean = false; }
+                if (canKind1ElemFast) { MarkElemFastClean(snapUiPropEp, snapLayoutEp, snapTreeEp, snapDcEp, snapVisEp, snapDispEp); }
+                else { _fastElemClean = false; }
+                UpdateKind1Subscriptions(canKind1VmFast, canKind1ElemFast, srcObj);
                 return;
             }
             _lastSrcBox = srcBox;
@@ -5623,24 +5666,11 @@ internal class BindingEntry : DependencyObject {
                 OneTimeDone = true;
                 ApplyConverted(valBox);
             }
-            _fastKind1VmClean = OneTimeDone && canKind1VmFast;
-            if (_fastKind1VmClean) {
-                _fastNativeVmEp = snapNativeVmEp;
-                _fastManagedVmEp = snapManagedVmEp;
-                _fastDcEp = snapDcEp;
-                _fastTreeEp = snapTreeEp;
-                _fastVisEp = snapVisEp;
-                _fastDispEp = snapDispEp;
-            }
-            _fastElemClean = OneTimeDone && canKind1ElemFast;
-            if (_fastElemClean) {
-                _fastUiPropEp = snapUiPropEp;
-                _fastLayoutEp = snapLayoutEp;
-                _fastTreeEp = snapTreeEp;
-                _fastDcEp = snapDcEp;
-                _fastVisEp = snapVisEp;
-                _fastDispEp = snapDispEp;
-            }
+            if (OneTimeDone && canKind1VmFast) { MarkVmFastClean(snapNativeVmEp, snapManagedVmEp, snapDcEp, snapTreeEp, snapVisEp, snapDispEp); }
+            else { _fastKind1VmClean = false; }
+            if (OneTimeDone && canKind1ElemFast) { MarkElemFastClean(snapUiPropEp, snapLayoutEp, snapTreeEp, snapDcEp, snapVisEp, snapDispEp); }
+            else { _fastElemClean = false; }
+            UpdateKind1Subscriptions(_fastKind1VmClean, _fastElemClean, srcObj);
             return;
         }
 
@@ -5673,6 +5703,46 @@ internal class BindingEntry : DependencyObject {
                 ApplyTargetBox(DependencyObject.BoxString(txt));
             }
             return;
+        }
+    }
+
+    private void MarkVmFastClean(int navEp, int manEp, int dcEp, int trEp, int visEp, int dispEp) {
+        _fastKind1VmClean = true;
+        _fastNativeVmEp = navEp;
+        _fastManagedVmEp = manEp;
+        _fastDcEp = dcEp;
+        _fastTreeEp = trEp;
+        _fastVisEp = visEp;
+        _fastDispEp = dispEp;
+    }
+
+    private void MarkElemFastClean(int uiEp, int layEp, int trEp, int dcEp, int visEp, int dispEp) {
+        _fastElemClean = true;
+        _fastUiPropEp = uiEp;
+        _fastLayoutEp = layEp;
+        _fastTreeEp = trEp;
+        _fastDcEp = dcEp;
+        _fastVisEp = visEp;
+        _fastDispEp = dispEp;
+    }
+
+    private void UpdateKind1Subscriptions(bool canVm, bool canElem, object srcObj) {
+        if (canVm) {
+            int tok0 = ParseUtil.IsNativeReady() ? Reflect_GetObjectToken(srcObj) : 0;
+            int tok1 = 0;
+            if (!IsSingleHopPath && _lastMidBox != null) {
+                object midObj2 = DependencyObject.Unbox(_lastMidBox);
+                if (midObj2 != null && ParseUtil.IsNativeReady()) {
+                    tok1 = Reflect_GetObjectToken(midObj2);
+                }
+            }
+            BindUiSourceSub(null);
+            BindVmSourceSub(tok0, tok1);
+        } else if (canElem) {
+            BindUiSourceSub(srcObj as UIElement);
+            BindVmSourceSub(0, 0);
+        } else {
+            ClearSourceSubscriptions();
         }
     }
 
@@ -5737,6 +5807,11 @@ internal class BindingEntry : DependencyObject {
     }
 }
 
+internal class VmSubBucket {
+    public BindingEntry[] Items;
+    public VmSubBucket() { Items = new BindingEntry[0]; }
+}
+
 internal class ElementBindingList : DependencyObject {
     public BindingEntry[] Items;
     public ElementBindingList() { Items = new BindingEntry[0]; }
@@ -5760,6 +5835,7 @@ public static class BindingEngine {
     internal static int _curManagedVmEpoch = 1;
     internal static bool _inFlushPass = false;
     internal static bool _inSubtreeFlush = false;
+    internal static bool _inPushWave = false;
     private static int _lastCompactDisposeEpoch = -1;
     private static int _structEpoch = 1;
     private static bool _hasFlushSnapshot = false;
@@ -5773,7 +5849,12 @@ public static class BindingEngine {
     private static int _snapVisEp = -1;
     private static int _snapDispEp = -1;
     private static BindingEntry[] _pollOnlyEntries;
+    private static VmSubBucket[] _vmSubs;
+    private static BindingEntry[] _dirtyQueue;
+    private static int _dirtyWaveGen = 1;
+    private static bool _pendingPushWave = false;
     private static int _debugShortCircuitFlushCount = 0;
+    private static int _debugPushFlushCount = 0;
     private static int _debugEvaluatedEntryCount = 0;
 
     internal static void BumpStructEpoch() {
@@ -5785,13 +5866,112 @@ public static class BindingEngine {
         return _debugShortCircuitFlushCount;
     }
 
+    public static int DebugPushFlushCount() {
+        return _debugPushFlushCount;
+    }
+
     public static int DebugEvaluatedEntryCount() {
         return _debugEvaluatedEntryCount;
     }
 
     public static void DebugResetFlushStats() {
         _debugShortCircuitFlushCount = 0;
+        _debugPushFlushCount = 0;
         _debugEvaluatedEntryCount = 0;
+    }
+
+    internal static void SubscribeVmToken(int tok, BindingEntry entry) {
+        if (tok <= 0 || entry == null) { return; }
+        if (_vmSubs == null) { _vmSubs = new VmSubBucket[0]; }
+        while (_vmSubs.Length <= tok) { _vmSubs.Push(null); }
+        VmSubBucket bucket = _vmSubs[tok];
+        if (bucket == null) {
+            bucket = new VmSubBucket();
+            _vmSubs[tok] = bucket;
+        }
+        BindingEntry[] arr = bucket.Items;
+        for (int i = 0; i < arr.Length; i += 1) {
+            if (arr[i] == entry) { return; }
+        }
+        arr.Push(entry);
+    }
+
+    internal static void UnsubscribeVmToken(int tok, BindingEntry entry) {
+        if (tok <= 0 || entry == null || _vmSubs == null || tok >= _vmSubs.Length) { return; }
+        VmSubBucket bucket = _vmSubs[tok];
+        if (bucket == null || bucket.Items == null) { return; }
+        BindingEntry[] arr = bucket.Items;
+        for (int i = arr.Length - 1; i >= 0; i -= 1) {
+            if (arr[i] == null || arr[i] == entry) {
+                arr.RemoveAt(i);
+            }
+        }
+        if (arr.Length == 0) {
+            _vmSubs[tok] = null;
+        }
+    }
+
+    internal static void EnqueueDirtyEntry(BindingEntry entry) {
+        if (entry == null || entry.IsDead()) { return; }
+        if (entry._dirtyEnqueuedGen == _dirtyWaveGen) { return; }
+        entry._dirtyEnqueuedGen = _dirtyWaveGen;
+        if (_dirtyQueue == null) { _dirtyQueue = new BindingEntry[0]; }
+        _dirtyQueue.Push(entry);
+        _pendingPushWave = true;
+    }
+
+    private static bool StructEpochsMatch() {
+        return _structEpoch == _snapStructEpoch &&
+               _curManagedVmEpoch == _snapManagedVmEp &&
+               UIElement._dataContextEpoch == _snapDcEp &&
+               UIElement._treeParentEpoch == _snapTreeEp &&
+               UIElement._visibilityEpoch == _snapVisEp &&
+               UIElement._disposeEpoch == _snapDispEp;
+    }
+
+    private static void ClearDirtyQueue() {
+        _dirtyQueue = new BindingEntry[0];
+        _pendingPushWave = false;
+        _dirtyWaveGen = _dirtyWaveGen >= 1000000000 ? 1 : (_dirtyWaveGen + 1);
+    }
+
+    private static int DrainCppDirtyQueues() {
+        if (!ParseUtil.IsNativeReady()) { return 0; }
+        int vmCnt = Reflect_BeginConsumeDirtyTokens();
+        int uiCnt = Visual_BeginConsumeDirtyPropNodes();
+        if (vmCnt >= 0 && _vmSubs != null) {
+            for (int i = 0; i < vmCnt; i += 1) {
+                int tok = Reflect_GetConsumedDirtyToken(i);
+                if (tok > 0 && tok < _vmSubs.Length) {
+                    VmSubBucket bucket = _vmSubs[tok];
+                    if (bucket != null && bucket.Items != null) {
+                        BindingEntry[] items = bucket.Items;
+                        for (int j = items.Length - 1; j >= 0; j -= 1) {
+                            BindingEntry e = items[j];
+                            if (e == null || e.IsDead()) {
+                                items.RemoveAt(j);
+                                continue;
+                            }
+                            EnqueueDirtyEntry(e);
+                        }
+                        if (items.Length == 0) { _vmSubs[tok] = null; }
+                    }
+                }
+            }
+        }
+        if (uiCnt > 0) {
+            for (int i = 0; i < uiCnt; i += 1) {
+                object owner = Visual_GetConsumedDirtyPropOwner(i);
+                if (owner is UIElement) {
+                    UIElement el = owner as UIElement;
+                    if (el.HasUiFlag(16384)) {
+                        el.BumpPropEpoch();
+                    }
+                }
+            }
+        }
+        if (vmCnt < 0 || uiCnt < 0) { return -1; }
+        return vmCnt + uiCnt;
     }
 
     internal static void BumpManagedVmEpoch() {
@@ -5813,7 +5993,6 @@ public static class BindingEngine {
 
     internal static void MarkFlushDirty() {
         _flushPassDirty = true;
-        BumpStructEpoch();
     }
 
     public static void BeginBatch() {
@@ -5904,6 +6083,10 @@ public static class BindingEngine {
     private static void RegisterEntry(BindingEntry entry) {
         EnsureInit();
         BumpStructEpoch();
+        if (entry != null) {
+            entry.TargetPropId = (entry.Target != null && entry.TargetProp != null) ? AeroPropId.Resolve(entry.TargetProp) : 0;
+            entry.SourcePropId = (entry.SourcePath != null) ? AeroPropId.Resolve(entry.SourcePath) : 0;
+        }
         _entries.Push(entry);
         if (entry != null && entry.Target != null) {
             ElementBindingList list = null;
@@ -5956,6 +6139,7 @@ public static class BindingEngine {
             for (int i = _entries.Length - 1; i >= 0; i -= 1) {
                 BindingEntry e = _entries[i];
                 if (e == null || (e.Target == target && e.TargetProp == propertyName)) {
+                    if (e != null) { e.ClearSourceSubscriptions(); }
                     _entries.RemoveAt(i);
                 }
             }
@@ -6260,22 +6444,13 @@ public static class BindingEngine {
         if (_entries == null) { return; }
         for (int i = _entries.Length - 1; i >= 0; i -= 1) {
             BindingEntry e = _entries[i];
-            if (e == null) {
-                _entries.RemoveAt(i);
-                continue;
-            }
-            bool dead = false;
-            if (e.Target != null && e.Target._isDisposedTree) { dead = true; }
-            else if (e.ContextHost != null && e.ContextHost._isDisposedTree) { dead = true; }
-            else if (e.Target == null && e.TargetEffect == null && e.TargetInline != null &&
-                (e.TargetInline.OwnerTextBlock == null || e.TargetInline.OwnerTextBlock._isDisposedTree)) {
-                dead = true;
-            }
-            if (dead) {
+            if (e == null || e.IsDead()) {
+                if (e != null) { e.ClearSourceSubscriptions(); }
                 _entries.RemoveAt(i);
                 continue;
             }
             if (e.SourceElement != null && e.SourceElement._isDisposedTree) {
+                e.ClearSourceSubscriptions();
                 e.SourceElement = null;
             }
         }
@@ -6309,6 +6484,7 @@ public static class BindingEngine {
             for (int i = _entries.Length - 1; i >= 0; i -= 1) {
                 BindingEntry e = _entries[i];
                 if (e != null && e._isTriggerBinding && e.Target == target && e.TargetProp == prop) {
+                    e.ClearSourceSubscriptions();
                     _entries.RemoveAt(i);
                 }
             }
@@ -6322,6 +6498,7 @@ public static class BindingEngine {
         if (_entries == null) { return; }
         for (int i = _entries.Length - 1; i >= 0; i -= 1) {
             if (_entries[i].Target == target) {
+                _entries[i].ClearSourceSubscriptions();
                 _entries.RemoveAt(i);
             }
         }
@@ -6393,10 +6570,8 @@ public static class BindingEngine {
                 int write = 0;
                 for (int i = 0; i < _entries.Length; i += 1) {
                     BindingEntry e = _entries[i];
-                    if (e.Target != null && e.Target._isDisposedTree) { continue; }
-                    if (e.ContextHost != null && e.ContextHost._isDisposedTree) { continue; }
-                    if (e.Target == null && e.TargetEffect == null && e.TargetInline != null &&
-                        (e.TargetInline.OwnerTextBlock == null || e.TargetInline.OwnerTextBlock._isDisposedTree)) {
+                    if (e == null || e.IsDead()) {
+                        if (e != null) { e.ClearSourceSubscriptions(); }
                         continue;
                     }
                     if (write != i) { _entries[write] = e; }
@@ -6408,17 +6583,13 @@ public static class BindingEngine {
             }
             RefreshLayoutEpoch();
             RefreshVmEpochs();
+            int drainState = DrainCppDirtyQueues();
+            bool structClean = _hasFlushSnapshot && drainState >= 0 && StructEpochsMatch();
             bool shortCircuited = false;
-            if (_hasFlushSnapshot &&
-                _structEpoch == _snapStructEpoch &&
+            if (structClean && !_pendingPushWave && drainState == 0 &&
                 _curNativeVmEpoch == _snapNativeVmEp &&
-                _curManagedVmEpoch == _snapManagedVmEp &&
                 UIElement._globalPropEpoch == _snapUiPropEp &&
-                _curLayoutSizeEpoch == _snapLayoutEp &&
-                UIElement._dataContextEpoch == _snapDcEp &&
-                UIElement._treeParentEpoch == _snapTreeEp &&
-                UIElement._visibilityEpoch == _snapVisEp &&
-                UIElement._disposeEpoch == _snapDispEp) {
+                _curLayoutSizeEpoch == _snapLayoutEp) {
                 _flushPassDirty = false;
                 if (_pollOnlyEntries != null && _pollOnlyEntries.Length > 0) {
                     for (int pi = 0; pi < _pollOnlyEntries.Length; pi += 1) {
@@ -6426,14 +6597,81 @@ public static class BindingEngine {
                         _debugEvaluatedEntryCount += 1;
                     }
                 }
-                if (!_flushPassDirty) {
+                if (!_flushPassDirty && !_pendingPushWave && _structEpoch == _snapStructEpoch) {
                     shortCircuited = true;
                     _debugShortCircuitFlushCount += 1;
                 } else {
                     _hasFlushSnapshot = false;
                 }
+            } else if (structClean) {
+                bool pushConverged = false;
+                bool prevInPush = _inPushWave;
+                _inPushWave = true;
+                for (int wave = 0; wave < 4; wave += 1) {
+                    RefreshLayoutEpoch();
+                    RefreshVmEpochs();
+                    _flushPassDirty = false;
+                    _dirtyWaveGen = _dirtyWaveGen >= 1000000000 ? 1 : (_dirtyWaveGen + 1);
+                    int evalStamp = _dirtyWaveGen;
+                    BindingEntry[] batch = _dirtyQueue;
+                    _dirtyQueue = new BindingEntry[0];
+                    _pendingPushWave = false;
+                    if (batch != null) {
+                        for (int bi = 0; bi < batch.Length; bi += 1) {
+                            BindingEntry de = batch[bi];
+                            if (de == null || de.IsDead()) { continue; }
+                            de.Evaluate();
+                            de._lastEvalWaveGen = evalStamp;
+                            _debugEvaluatedEntryCount += 1;
+                            if (!de._inPollOnly && !de.IsEpochFastClean()) {
+                                if (_pollOnlyEntries == null) { _pollOnlyEntries = new BindingEntry[0]; }
+                                _pollOnlyEntries.Push(de);
+                                de._inPollOnly = true;
+                            }
+                        }
+                    }
+                    if ((wave == 0 || _flushPassDirty) && _pollOnlyEntries != null && _pollOnlyEntries.Length > 0) {
+                        for (int pi = 0; pi < _pollOnlyEntries.Length; pi += 1) {
+                            BindingEntry pe = _pollOnlyEntries[pi];
+                            if (pe != null && pe._lastEvalWaveGen != evalStamp) {
+                                pe.Evaluate();
+                                pe._lastEvalWaveGen = evalStamp;
+                                _debugEvaluatedEntryCount += 1;
+                            }
+                        }
+                    }
+                    RefreshLayoutEpoch();
+                    RefreshVmEpochs();
+                    if (!StructEpochsMatch()) {
+                        pushConverged = false;
+                        break;
+                    }
+                    int moreDrained = DrainCppDirtyQueues();
+                    if (moreDrained < 0) {
+                        pushConverged = false;
+                        break;
+                    }
+                    if (!_pendingPushWave && (_dirtyQueue == null || _dirtyQueue.Length == 0)) {
+                        pushConverged = true;
+                        break;
+                    }
+                }
+                _inPushWave = prevInPush;
+                if (pushConverged) {
+                    RefreshLayoutEpoch();
+                    RefreshVmEpochs();
+                    _snapNativeVmEp = _curNativeVmEpoch;
+                    _snapUiPropEp = UIElement._globalPropEpoch;
+                    _snapLayoutEp = _curLayoutSizeEpoch;
+                    _hasFlushSnapshot = true;
+                    shortCircuited = true;
+                    _debugPushFlushCount += 1;
+                } else {
+                    _hasFlushSnapshot = false;
+                }
             }
             if (!shortCircuited) {
+                ClearDirtyQueue();
                 bool converged = false;
                 for (int pass = 0; pass < 3; pass += 1) {
                     RefreshLayoutEpoch();
@@ -6449,8 +6687,6 @@ public static class BindingEngine {
                     }
                 }
                 if (converged) {
-                    RefreshLayoutEpoch();
-                    RefreshVmEpochs();
                     if (_pollOnlyEntries == null) {
                         _pollOnlyEntries = new BindingEntry[0];
                     } else {
@@ -6460,10 +6696,18 @@ public static class BindingEngine {
                     }
                     for (int i = 0; i < _entries.Length; i += 1) {
                         BindingEntry pe = _entries[i];
-                        if (pe != null && !pe.IsEpochFastClean()) {
-                            _pollOnlyEntries.Push(pe);
+                        if (pe != null) {
+                            pe._inPollOnly = false;
+                            if (!pe.IsEpochFastClean()) {
+                                _pollOnlyEntries.Push(pe);
+                                pe._inPollOnly = true;
+                            }
                         }
                     }
+                    int postDrain = DrainCppDirtyQueues();
+                    ClearDirtyQueue();
+                    RefreshLayoutEpoch();
+                    RefreshVmEpochs();
                     _snapStructEpoch = _structEpoch;
                     _snapNativeVmEp = _curNativeVmEpoch;
                     _snapManagedVmEp = _curManagedVmEpoch;
@@ -6473,8 +6717,9 @@ public static class BindingEngine {
                     _snapTreeEp = UIElement._treeParentEpoch;
                     _snapVisEp = UIElement._visibilityEpoch;
                     _snapDispEp = UIElement._disposeEpoch;
-                    _hasFlushSnapshot = true;
+                    _hasFlushSnapshot = (postDrain >= 0);
                 } else {
+                    ClearDirtyQueue();
                     _hasFlushSnapshot = false;
                 }
             }

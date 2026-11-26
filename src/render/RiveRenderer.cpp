@@ -2536,8 +2536,8 @@ bool IsRiveAssetUri(std::string_view uri) noexcept {
     return false;
 }
 
-bool RenderRiveUriToImageIfChanged(
-    std::string_view uri,
+bool RenderRiveParamsToImageIfChanged(
+    const RiveRenderRequest& request,
     const ImageAtlas& atlas,
     std::string_view localBaseDir,
     const std::uint64_t* prevPoseHash,
@@ -2547,77 +2547,26 @@ bool RenderRiveUriToImageIfChanged(
     outPoseHash = 0u;
     outChanged = true;
 
-    std::string_view rest = uri;
-    if (rest.size() >= 7u && rest.substr(0u, 7u) == "rive://") {
-        rest.remove_prefix(7u);
+    std::string_view filePart = request.assetPath;
+    if (filePart.size() >= 7u && filePart.substr(0u, 7u) == "rive://") {
+        filePart.remove_prefix(7u);
     }
-    std::string_view filePart = rest;
-    std::string_view queryPart;
-    if (const std::size_t q = rest.find('?'); q != std::string_view::npos) {
-        filePart = rest.substr(0u, q);
-        queryPart = rest.substr(q + 1u);
+    if (const std::size_t q = filePart.find('?'); q != std::string_view::npos) {
+        filePart = filePart.substr(0u, q);
     }
     if (filePart.empty()) return false;
 
     RivInputPairs inputs;
-    float tLoopSec = 0.0f;
-    float tStateSec = 0.0f;
-    bool hasTs = false;
-    float reqW = 0.0f;
-    float reqH = 0.0f;
-    while (!queryPart.empty()) {
-        const std::size_t amp = queryPart.find('&');
-        const std::string_view kv = (amp != std::string_view::npos) ? queryPart.substr(0u, amp) : queryPart;
-        if (const std::size_t eq = kv.find('='); eq != std::string_view::npos) {
-            const std::string_view kView = kv.substr(0u, eq);
-            const std::string_view vView = kv.substr(eq + 1u);
-            float parsedVal = 0.0f;
-            bool okNum = false;
-            if (vView == "true" || vView == "True") {
-                parsedVal = 1.0f;
-                okNum = true;
-            } else if (vView == "false" || vView == "False") {
-                parsedVal = 0.0f;
-                okNum = true;
-            } else if (!vView.empty() && vView.size() < 63u) {
-                char numBuf[64];
-                std::memcpy(numBuf, vView.data(), vView.size());
-                numBuf[vView.size()] = '\0';
-                char* endp = nullptr;
-                parsedVal = std::strtof(numBuf, &endp);
-                okNum = (endp != numBuf);
-            }
-            if (okNum) {
-                if (kView == "__t") {
-                    tLoopSec = std::max(0.0f, parsedVal);
-                } else if (kView == "__ts") {
-                    tStateSec = std::max(0.0f, parsedVal);
-                    hasTs = true;
-                } else if (kView == "__w") {
-                    reqW = parsedVal;
-                } else if (kView == "__h") {
-                    reqH = parsedVal;
-                } else if (kView != "__inst") {
-                    bool replaced = false;
-                    for (auto& kvIn : inputs) {
-                        if (kvIn.first == kView) {
-                            kvIn.second = parsedVal;
-                            replaced = true;
-                            break;
-                        }
-                    }
-                    if (!replaced) {
-                        inputs.emplace_back(kView, parsedVal);
-                    }
-                }
-            }
+    if (request.inputs != nullptr && request.inputCount > 0u) {
+        inputs.reserve(request.inputCount);
+        for (std::size_t i = 0u; i < request.inputCount; ++i) {
+            inputs.emplace_back(request.inputs[i].first, request.inputs[i].second);
         }
-        if (amp == std::string_view::npos) break;
-        queryPart.remove_prefix(amp + 1u);
     }
-    if (!hasTs) {
-        tStateSec = tLoopSec;
-    }
+    const float tLoopSec = std::max(0.0f, request.tLoopSec);
+    const float tStateSec = std::max(0.0f, request.tStateSec);
+    const float reqW = request.reqW;
+    const float reqH = request.reqH;
 
     const std::string resolvedPath = atlas.ResolveUriToPath(filePart, localBaseDir);
     if (resolvedPath.empty()) return false;
@@ -2744,6 +2693,105 @@ bool RenderRiveUriToImageIfChanged(
     }
     outChanged = true;
     return true;
+}
+
+bool RenderRiveUriToImageIfChanged(
+    std::string_view uri,
+    const ImageAtlas& atlas,
+    std::string_view localBaseDir,
+    const std::uint64_t* prevPoseHash,
+    std::uint64_t& outPoseHash,
+    bool& outChanged,
+    DecodedImage& outImage) {
+    outPoseHash = 0u;
+    outChanged = true;
+
+    std::string_view rest = uri;
+    if (rest.size() >= 7u && rest.substr(0u, 7u) == "rive://") {
+        rest.remove_prefix(7u);
+    }
+    std::string_view filePart = rest;
+    std::string_view queryPart;
+    if (const std::size_t q = rest.find('?'); q != std::string_view::npos) {
+        filePart = rest.substr(0u, q);
+        queryPart = rest.substr(q + 1u);
+    }
+    if (filePart.empty()) return false;
+
+    std::vector<std::pair<std::string, float>> parsedInputs;
+    float tLoopSec = 0.0f;
+    float tStateSec = 0.0f;
+    bool hasTs = false;
+    float reqW = 0.0f;
+    float reqH = 0.0f;
+    std::uint32_t instanceId = 0u;
+    while (!queryPart.empty()) {
+        const std::size_t amp = queryPart.find('&');
+        const std::string_view kv = (amp != std::string_view::npos) ? queryPart.substr(0u, amp) : queryPart;
+        if (const std::size_t eq = kv.find('='); eq != std::string_view::npos) {
+            const std::string_view kView = kv.substr(0u, eq);
+            const std::string_view vView = kv.substr(eq + 1u);
+            float parsedVal = 0.0f;
+            bool okNum = false;
+            if (vView == "true" || vView == "True") {
+                parsedVal = 1.0f;
+                okNum = true;
+            } else if (vView == "false" || vView == "False") {
+                parsedVal = 0.0f;
+                okNum = true;
+            } else if (!vView.empty() && vView.size() < 63u) {
+                char numBuf[64];
+                std::memcpy(numBuf, vView.data(), vView.size());
+                numBuf[vView.size()] = '\0';
+                char* endp = nullptr;
+                parsedVal = std::strtof(numBuf, &endp);
+                okNum = (endp != numBuf);
+            }
+            if (okNum) {
+                if (kView == "__t") {
+                    tLoopSec = std::max(0.0f, parsedVal);
+                } else if (kView == "__ts") {
+                    tStateSec = std::max(0.0f, parsedVal);
+                    hasTs = true;
+                } else if (kView == "__w") {
+                    reqW = parsedVal;
+                } else if (kView == "__h") {
+                    reqH = parsedVal;
+                } else if (kView == "__inst") {
+                    instanceId = static_cast<std::uint32_t>(std::max(0, static_cast<int>(parsedVal)));
+                } else {
+                    bool replaced = false;
+                    for (auto& kvIn : parsedInputs) {
+                        if (kvIn.first == kView) {
+                            kvIn.second = parsedVal;
+                            replaced = true;
+                            break;
+                        }
+                    }
+                    if (!replaced) {
+                        parsedInputs.emplace_back(std::string(kView), parsedVal);
+                    }
+                }
+            }
+        }
+        if (amp == std::string_view::npos) break;
+        queryPart.remove_prefix(amp + 1u);
+    }
+    if (!hasTs) {
+        tStateSec = tLoopSec;
+    }
+
+    RiveRenderRequest req{};
+    req.assetPath = filePart;
+    req.instanceId = instanceId;
+    req.tLoopSec = tLoopSec;
+    req.tStateSec = tStateSec;
+    req.reqW = reqW;
+    req.reqH = reqH;
+    req.inputs = parsedInputs.data();
+    req.inputCount = parsedInputs.size();
+    return RenderRiveParamsToImageIfChanged(
+        req, atlas, localBaseDir, prevPoseHash, outPoseHash, outChanged, outImage);
 }
 
 bool RenderRiveUriToImage(

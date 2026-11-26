@@ -107,6 +107,14 @@ public float Visual_MeasureText(string text, string fontFamily, float fontSize, 
 public int Visual_HitTestTextCp(handle node, float localX, float localY) { return 0; }
 int __rs_native_Visual_SetImage(handle node, string uri, int stretch, int stretchDir, uint tintRgba) { return 0; }
 public void Visual_SetImage(handle node, string uri, int stretch, int stretchDir, uint tintRgba) { __rs_native_Visual_SetImage(node, uri, stretch, stretchDir, tintRgba); return; }
+int __rs_native_Visual_SetPlasmaImage(handle node, float sx, float sy, float timeSec, float seed, uint colorRgba, float vw, float vh, int stretch, int stretchDir, uint tintRgba) { return 0; }
+public void Visual_SetPlasmaImage(handle node, float sx, float sy, float timeSec, float seed, uint colorRgba, float vw, float vh, int stretch, int stretchDir, uint tintRgba) { __rs_native_Visual_SetPlasmaImage(node, sx, sy, timeSec, seed, colorRgba, vw, vh, stretch, stretchDir, tintRgba); return; }
+int __rs_native_Visual_SetRiveParams(handle node, string assetPath, int instanceId, float tLoopSec, float tStateSec, float reqW, float reqH, int stretch, uint tintRgba) { return 0; }
+public void Visual_SetRiveParams(handle node, string assetPath, int instanceId, float tLoopSec, float tStateSec, float reqW, float reqH, int stretch, uint tintRgba) { __rs_native_Visual_SetRiveParams(node, assetPath, instanceId, tLoopSec, tStateSec, reqW, reqH, stretch, tintRgba); return; }
+int __rs_native_Visual_ClearRiveInputs(handle node) { return 0; }
+public void Visual_ClearRiveInputs(handle node) { __rs_native_Visual_ClearRiveInputs(node); return; }
+int __rs_native_Visual_SetRiveInput(handle node, string inputName, float value) { return 0; }
+public void Visual_SetRiveInput(handle node, string inputName, float value) { __rs_native_Visual_SetRiveInput(node, inputName, value); return; }
 int __rs_native_Visual_SetImageViewbox(handle node, float vx, float vy, float vw, float vh) { return 0; }
 public void Visual_SetImageViewbox(handle node, float vx, float vy, float vw, float vh) { __rs_native_Visual_SetImageViewbox(node, vx, vy, vw, vh); return; }
 int __rs_native_Visual_SetImageViewport(handle node, float vpx, float vpy, float vpw, float vph, bool hasExplicit, bool isAbsolute) { return 0; }
@@ -236,6 +244,11 @@ public bool Reflect_ListRemoveAt(object list, int index) { return false; }
 public bool Reflect_InvokeCommand(object target, string propPath, string param) { return false; }
 public int Reflect_GetDirtyMask(object target) { return 0; }
 public int Reflect_GetGlobalObservableEpoch() { return 1; }
+public int Reflect_GetObjectToken(object target) { return 0; }
+public int Reflect_BeginConsumeDirtyTokens() { return -1; }
+public int Reflect_GetConsumedDirtyToken(int idx) { return 0; }
+public int Visual_BeginConsumeDirtyPropNodes() { return -1; }
+public object Visual_GetConsumedDirtyPropOwner(int idx) { return null; }
 public uint Color_ParseRgba(string hexOrNamed) { return 0u; }
 public string Host_ReadTextAsset(string uri) { return ""; }
 public int Utf8_CodePointCount(string text) { return 0; }

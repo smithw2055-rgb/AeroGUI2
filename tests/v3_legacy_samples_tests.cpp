@@ -4577,15 +4577,21 @@ void TestInteractiveRive(aero::rs_comp::CompilerSession&) {
     Require(logoImgId.IsValid(), "Rive logo internal Image node missing");
     const aero::VisualNode* logoImg = host.World().GetNode(logoImgId);
     Require(logoImg != nullptr, "Rive logo Image node resolved to null");
-    const std::string uriBeforeZero = logoImg->Image().uri;
-    Require(uriBeforeZero.rfind("rive://", 0) == 0u,
-        "Rive logo Image URI should use rive:// scheme (got: '" + uriBeforeZero + "')");
+    Require(logoImg->Image().rive.active &&
+        logoImg->Image().rive.assetPath.find(".riv") != std::string::npos &&
+        logoImg->Image().uri.empty(),
+        "Rive logo Image should use zero-string numeric Rive state (asset='" +
+            logoImg->Image().rive.assetPath + "', uri='" + logoImg->Image().uri + "')");
+    const float tBeforeZero = logoImg->Image().rive.tLoopSec;
+    const float tsBeforeZero = logoImg->Image().rive.tStateSec;
 
     // dt == 0.0f layout/render sync must not advance Rive playback time
     host.StepFrame(0.0f, true);
     logoImg = host.World().GetNode(logoImgId);
-    Require(logoImg && logoImg->Image().uri == uriBeforeZero,
-        "Rive dt == 0.0f StepFrame must not advance animation URI");
+    Require(logoImg &&
+        logoImg->Image().rive.tLoopSec == tBeforeZero &&
+        logoImg->Image().rive.tStateSec == tsBeforeZero,
+        "Rive dt == 0.0f StepFrame must not advance animation time");
 
     std::vector<std::uint8_t> frame0;
     Require(host.RenderHeadlessRgba(1280u, 720u, frame0), "Rive frame0 render failed");
@@ -4595,8 +4601,8 @@ void TestInteractiveRive(aero::rs_comp::CompilerSession&) {
     std::vector<std::uint8_t> frame1;
     Require(host.RenderHeadlessRgba(1280u, 720u, frame1), "Rive frame1 render failed");
     logoImg = host.World().GetNode(logoImgId);
-    Require(logoImg && logoImg->Image().uri != uriBeforeZero,
-        "Rive logo Image URI should advance over 0.5s");
+    Require(logoImg && logoImg->Image().rive.tLoopSec > tBeforeZero + 0.2f,
+        "Rive logo numeric time should advance over 0.5s");
     Require(CountChangedPixels(frame0, frame1) > 50u,
         "Rive animation frames should change rendered pixels over 0.5s");
 
@@ -4604,6 +4610,17 @@ void TestInteractiveRive(aero::rs_comp::CompilerSession&) {
     Require(bgId.IsValid(), "Rive background element missing");
     const aero::VisualNodeId bgImgId = findFirstImageDescendant(bgId);
     Require(bgImgId.IsValid(), "Rive background internal Image node missing");
+
+    auto findRiveInput = [](const aero::VisualNode* n, std::string_view key, float& outVal) -> bool {
+        if (!n || !n->Image().rive.active) { return false; }
+        for (const auto& kv : n->Image().rive.inputs) {
+            if (kv.first == key) {
+                outVal = kv.second;
+                return true;
+            }
+        }
+        return false;
+    };
 
     aero::VisualNodeId startId{};
     aero::VisualNodeId rewardsId{};
@@ -4625,9 +4642,10 @@ void TestInteractiveRive(aero::rs_comp::CompilerSession&) {
     Require(readStartFocusOk && startFocused,
         "Rive clicking start button through transparent leaves overlay should set IsFocused=true");
     const aero::VisualNode* bgImg = host.World().GetNode(bgImgId);
-    Require(bgImg && bgImg->Image().uri.find("States=1") != std::string::npos,
-        "Rive focusing start should drive background RiveInput States=1 (got: '" +
-            (bgImg ? bgImg->Image().uri : std::string("<null>")) + "')");
+    float statesVal = -1.0f;
+    Require(findRiveInput(bgImg, "States", statesVal) && std::fabs(statesVal - 1.0f) < 0.01f,
+        "Rive focusing start should drive background RiveInput States=1 (got: " +
+            std::to_string(statesVal) + ")");
 
     // Hover rewards button -> MouseEnter SetFocusAction sets focus and switches background States=2
     host.InjectPointerMove(rewardsCx, rewardsCy);
@@ -4639,9 +4657,10 @@ void TestInteractiveRive(aero::rs_comp::CompilerSession&) {
     Require(readRewardsFocusOk && rewardsFocused,
         "Rive hovering rewards button should set IsFocused=true");
     bgImg = host.World().GetNode(bgImgId);
-    Require(bgImg && bgImg->Image().uri.find("States=2") != std::string::npos,
-        "Rive hovering rewards should drive background RiveInput States=2 (got: '" +
-            (bgImg ? bgImg->Image().uri : std::string("<null>")) + "')");
+    statesVal = -1.0f;
+    Require(findRiveInput(bgImg, "States", statesVal) && std::fabs(statesVal - 2.0f) < 0.01f,
+        "Rive hovering rewards should drive background RiveInput States=2 (got: " +
+            std::to_string(statesVal) + ")");
 }
 
 void TestInteractiveCustomRender(aero::rs_comp::CompilerSession&) {
