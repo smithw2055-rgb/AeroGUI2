@@ -256,12 +256,14 @@ namespace {
     const std::string& key,
     StdlibDllCacheState& state,
     std::string* outError,
-    bool decodeFrontendPack = true) {
+    bool decodeFrontendPack = true,
+    bool decodeLazyBundle = true) {
 #ifdef __EMSCRIPTEN__
     (void)resolved;
     (void)key;
     (void)state;
     (void)decodeFrontendPack;
+    (void)decodeLazyBundle;
     if (outError) {
         *outError = "aerogui_stdlib dynamic loading is not supported on Emscripten";
     }
@@ -356,25 +358,28 @@ namespace {
         }
     }
 
-    auto lazyBundle = std::make_shared<rs_bc::LazyBytecodeBundle>();
-    rs_diag::DiagnosticBag bundleDiag;
-    if (!rs_bc::decodeLazyBytecodeBundleHeader(
-            hdr->lazyBytecodeBytes,
-            static_cast<std::size_t>(hdr->lazyBytecodeSize),
-            *lazyBundle,
-            /*copyBlob=*/false,
-            bundleDiag,
-            /*skipChecksum=*/false) ||
-        bundleDiag.hasErrors()) {
-        if (outError) {
-            std::ostringstream oss;
-            oss << "Failed to decode LazyBytecodeBundle header from stdlib DLL:";
-            for (const auto& d : bundleDiag.items()) {
-                oss << "\n  " << d.message;
+    std::shared_ptr<rs_bc::LazyBytecodeBundle> lazyBundle;
+    if (decodeLazyBundle) {
+        lazyBundle = std::make_shared<rs_bc::LazyBytecodeBundle>();
+        rs_diag::DiagnosticBag bundleDiag;
+        if (!rs_bc::decodeLazyBytecodeBundleHeader(
+                hdr->lazyBytecodeBytes,
+                static_cast<std::size_t>(hdr->lazyBytecodeSize),
+                *lazyBundle,
+                /*copyBlob=*/false,
+                bundleDiag,
+                /*skipChecksum=*/false) ||
+            bundleDiag.hasErrors()) {
+            if (outError) {
+                std::ostringstream oss;
+                oss << "Failed to decode LazyBytecodeBundle header from stdlib DLL:";
+                for (const auto& d : bundleDiag.items()) {
+                    oss << "\n  " << d.message;
+                }
+                *outError = oss.str();
             }
-            *outError = oss.str();
+            return nullptr;
         }
-        return nullptr;
     }
 
     const auto t1 = std::chrono::steady_clock::now();
@@ -492,7 +497,40 @@ std::shared_ptr<LoadedStdlibDll> LoadStdlibDllLazyOnly(
     const std::string key = CanonicalCacheKey(resolved);
     auto& state = GetStdlibDllCacheState();
     std::lock_guard<std::mutex> lock(state.mutex);
-    return LoadAndDecodeStdlibDllLocked(resolved, key, state, outError, false);
+    return LoadAndDecodeStdlibDllLocked(resolved, key, state, outError, false, true);
+#endif
+}
+
+std::shared_ptr<LoadedStdlibDll> LoadStdlibDllFrontendOnly(
+    std::string_view explicitPath,
+    std::string* outError) {
+#ifdef __EMSCRIPTEN__
+    (void)explicitPath;
+    if (outError) {
+        *outError = "aerogui_stdlib dynamic loading is not supported on Emscripten";
+    }
+    return nullptr;
+#else
+    const std::filesystem::path resolved = ResolveStdlibDllPath(explicitPath);
+    if (resolved.empty()) {
+        if (outError) {
+            *outError = std::string("Unable to locate ") + kStdlibDllFilename +
+                        (explicitPath.empty() ? std::string{} : (" (requested: " + std::string(explicitPath) + ")"));
+        }
+        return nullptr;
+    }
+    std::error_code existEc;
+    if (!std::filesystem::is_regular_file(resolved, existEc)) {
+        if (outError) {
+            *outError = "Stdlib DLL not found: " + resolved.generic_string();
+        }
+        return nullptr;
+    }
+
+    const std::string key = CanonicalCacheKey(resolved);
+    auto& state = GetStdlibDllCacheState();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    return LoadAndDecodeStdlibDllLocked(resolved, key, state, outError, true, false);
 #endif
 }
 
@@ -534,6 +572,46 @@ bool DecodeStdlibDllFrontendPack(
     }
     const auto t1 = std::chrono::steady_clock::now();
     loaded.frontendPack = std::move(decodedPack);
+    loaded.loadAndDecodeMs += std::chrono::duration<double, std::milli>(t1 - t0).count();
+    return true;
+}
+
+bool DecodeStdlibDllLazyBundle(
+    LoadedStdlibDll& loaded,
+    std::string* outError) {
+    if (loaded.lazyBundle != nullptr) {
+        return true;
+    }
+    const AeroStdlibDllHeader* hdr = loaded.header;
+    if (!hdr || !hdr->lazyBytecodeBytes || hdr->lazyBytecodeSize == 0u) {
+        if (outError) {
+            *outError = "Stdlib DLL header has no lazy bytecode bundle payload";
+        }
+        return false;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    auto lazyBundle = std::make_shared<rs_bc::LazyBytecodeBundle>();
+    rs_diag::DiagnosticBag bundleDiag;
+    if (!rs_bc::decodeLazyBytecodeBundleHeader(
+            hdr->lazyBytecodeBytes,
+            static_cast<std::size_t>(hdr->lazyBytecodeSize),
+            *lazyBundle,
+            /*copyBlob=*/false,
+            bundleDiag,
+            /*skipChecksum=*/false) ||
+        bundleDiag.hasErrors()) {
+        if (outError) {
+            std::ostringstream oss;
+            oss << "Failed to decode LazyBytecodeBundle header from stdlib DLL:";
+            for (const auto& d : bundleDiag.items()) {
+                oss << "\n  " << d.message;
+            }
+            *outError = oss.str();
+        }
+        return false;
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+    loaded.lazyBundle = std::move(lazyBundle);
     loaded.loadAndDecodeMs += std::chrono::duration<double, std::milli>(t1 - t0).count();
     return true;
 }

@@ -292,6 +292,9 @@ void TestAbiAndErrorHandling() {
         "moduleListCsv missing expected stdlib modules: " + csv);
     Require(loaded->frontendPack != nullptr && loaded->lazyBundle != nullptr,
         "Decoded frontendPack and lazyBundle must be non-null");
+    Require(loaded->lazyBundle->hasZeroCopyStrings() &&
+            loaded->lazyBundle->hasZeroCopyFunctionLocs(),
+        "Expected stdlib DLL LazyBytecodeBundle to use RSLB v4 zero-copy .rodata views");
 
     std::cout << std::fixed << std::setprecision(2)
               << "[STDLIB_DLL] path=" << dllPath.generic_string()
@@ -520,10 +523,26 @@ void TestStdlibDllUserArbcDiskCache() {
         if (lazyOnly) {
             Require(lazyOnly->lazyBundle != nullptr && lazyOnly->frontendPack == nullptr,
                 "LoadStdlibDllLazyOnly must leave frontendPack == nullptr");
+            Require(lazyOnly->lazyBundle->hasZeroCopyStrings() &&
+                    lazyOnly->lazyBundle->hasZeroCopyFunctionLocs(),
+                "LoadStdlibDllLazyOnly must preserve RSLB v4 zero-copy views");
             Require(aero::DecodeStdlibDllFrontendPack(*lazyOnly, &err),
                 "DecodeStdlibDllFrontendPack failed: " + err);
             Require(lazyOnly->frontendPack != nullptr,
                 "DecodeStdlibDllFrontendPack must populate frontendPack");
+        }
+
+        auto frontOnly = aero::LoadStdlibDllFrontendOnly(AERO_STDLIB_DLL_PATH, &err);
+        Require(frontOnly != nullptr, "LoadStdlibDllFrontendOnly failed: " + err);
+        if (frontOnly) {
+            Require(frontOnly->frontendPack != nullptr && frontOnly->lazyBundle == nullptr,
+                "LoadStdlibDllFrontendOnly must leave lazyBundle == nullptr");
+            Require(aero::DecodeStdlibDllLazyBundle(*frontOnly, &err),
+                "DecodeStdlibDllLazyBundle failed: " + err);
+            Require(frontOnly->lazyBundle != nullptr &&
+                    frontOnly->lazyBundle->hasZeroCopyStrings() &&
+                    frontOnly->lazyBundle->hasZeroCopyFunctionLocs(),
+                "DecodeStdlibDllLazyBundle must populate RSLB v4 zero-copy lazyBundle");
         }
     }
 

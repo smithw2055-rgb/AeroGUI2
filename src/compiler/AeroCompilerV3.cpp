@@ -1420,11 +1420,13 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
             oneShotLoadedDll = LoadStdlibDllLazyOnly(input.stdlibDllPath, &dllErr);
             loadedDll = oneShotLoadedDll;
         } else {
-            oneShotLoadedDll = LoadStdlibDllOneShot(input.stdlibDllPath, &dllErr);
+            oneShotLoadedDll = LoadStdlibDllFrontendOnly(input.stdlibDllPath, &dllErr);
             loadedDll = oneShotLoadedDll;
         }
         const bool needFrontendNow = !canUseRawProgramCache || input.retainStdlibDllCache;
-        if (!loadedDll || !loadedDll->header || !loadedDll->lazyBundle ||
+        const bool needLazyNow = canUseRawProgramCache || input.retainStdlibDllCache;
+        if (!loadedDll || !loadedDll->header ||
+            (needLazyNow && !loadedDll->lazyBundle) ||
             (needFrontendNow && !loadedDll->frontendPack)) {
             result.diagnostics.emplace_back(
                 dllErr.empty()
@@ -1984,6 +1986,19 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
     std::vector<std::uint8_t> encodedProgramBytes;
     if (needEncodedBundle) {
         encodedProgramBytes = EncodeProgramBundle(result.bytecodeModules);
+    }
+
+    if (useDllMode && oneShotLoadedDll && !oneShotLoadedDll->lazyBundle) {
+        CompactProcessHeapAfterCompile();
+        std::string lazyErr;
+        if (!DecodeStdlibDllLazyBundle(*oneShotLoadedDll, &lazyErr)) {
+            result.diagnostics.emplace_back(
+                lazyErr.empty()
+                    ? std::string("StdlibDllLoader: failed to decode LazyBytecodeBundle")
+                    : ("StdlibDllLoader: " + lazyErr));
+            return result;
+        }
+        result.stdlibDllLoadMs = oneShotLoadedDll->loadAndDecodeMs;
     }
 
     // Link ProgramImage (modules above already passed rs_bc::verifyModule or cached verification)

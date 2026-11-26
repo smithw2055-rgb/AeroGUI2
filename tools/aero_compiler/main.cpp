@@ -140,7 +140,7 @@ void AppendWordArrayDefinition(
     const char* varName,
     const std::vector<std::uint8_t>& bytes) {
     const std::size_t wordCount = (bytes.size() + 7u) / 8u;
-    out << "alignas(8) static const std::uint64_t " << varName << "["
+    out << "alignas(64) static const std::uint64_t " << varName << "["
         << (wordCount > 0u ? wordCount : 1u) << "] = {";
     if (wordCount == 0u) {
         out << "0ULL";
