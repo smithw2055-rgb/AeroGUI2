@@ -617,6 +617,7 @@ public class TriggerBase : DependencyObject {
         if (dest == null || prop == null || prop.Length == 0) { return; }
         if (dest._activeTriggerProps == null) { dest._activeTriggerProps = new string[0]; }
         dest._activeTriggerProps.Push(prop);
+        BindingEngine.BumpStructEpoch();
         EnsureBaseTables();
         for (int i = _baseDests.Length - 1; i >= 0; i -= 1) {
             if (_baseDests[i] == dest && _baseProps[i] == prop) {
@@ -635,7 +636,11 @@ public class TriggerBase : DependencyObject {
         if (dest == null || prop == null || prop.Length == 0 || _baseDests == null) { return; }
         if (dest._activeTriggerProps != null) {
             for (int ti = dest._activeTriggerProps.Length - 1; ti >= 0; ti -= 1) {
-                if (dest._activeTriggerProps[ti] == prop) { dest._activeTriggerProps.RemoveAt(ti); break; }
+                if (dest._activeTriggerProps[ti] == prop) {
+                    dest._activeTriggerProps.RemoveAt(ti);
+                    BindingEngine.BumpStructEpoch();
+                    break;
+                }
             }
         }
         for (int i = _baseDests.Length - 1; i >= 0; i -= 1) {
@@ -4468,6 +4473,32 @@ internal class BindingEntry : DependencyObject {
     private int _fastLayoutEp = -1;
     private int _fastDispEp = -1;
 
+    internal bool IsEpochFastClean() {
+        if (Target == null && TargetInline == null && TargetEffect == null) { return true; }
+        if (Mode == 2 && OneTimeDone) { return true; }
+        if (!OneTimeDone) { return false; }
+        if (Target != null && Target._activeTriggerProps != null && Target._activeTriggerProps.Length > 0) {
+            return false;
+        }
+        if (_fastKind1VmClean && (Kind == 1 || Kind == 5)) {
+            return BindingEngine._curNativeVmEpoch == _fastNativeVmEp &&
+                   BindingEngine._curManagedVmEpoch == _fastManagedVmEp &&
+                   UIElement._dataContextEpoch == _fastDcEp &&
+                   UIElement._treeParentEpoch == _fastTreeEp &&
+                   UIElement._visibilityEpoch == _fastVisEp &&
+                   UIElement._disposeEpoch == _fastDispEp;
+        }
+        if (_fastElemClean) {
+            return UIElement._globalPropEpoch == _fastUiPropEp &&
+                   BindingEngine._curLayoutSizeEpoch == _fastLayoutEp &&
+                   UIElement._treeParentEpoch == _fastTreeEp &&
+                   UIElement._dataContextEpoch == _fastDcEp &&
+                   UIElement._visibilityEpoch == _fastVisEp &&
+                   UIElement._disposeEpoch == _fastDispEp;
+        }
+        return false;
+    }
+
     internal static bool CanUseFastElementPropEpoch(UIElement el, string prop) {
         if (el == null || prop == null || prop.Length == 0) {
             return false;
@@ -5100,6 +5131,28 @@ internal class BindingEntry : DependencyObject {
 
     public void Evaluate() {
         if (Target == null && TargetInline == null && TargetEffect == null) { return; }
+        if (Mode == 2 && OneTimeDone) { return; }
+        if (BindingEngine._inFlushPass && !BindingEngine._inSubtreeFlush && OneTimeDone &&
+            (Target == null || Target._activeTriggerProps == null || Target._activeTriggerProps.Length == 0)) {
+            if (_fastKind1VmClean && (Kind == 1 || Kind == 5) &&
+                BindingEngine._curNativeVmEpoch == _fastNativeVmEp &&
+                BindingEngine._curManagedVmEpoch == _fastManagedVmEp &&
+                UIElement._dataContextEpoch == _fastDcEp &&
+                UIElement._treeParentEpoch == _fastTreeEp &&
+                UIElement._visibilityEpoch == _fastVisEp &&
+                UIElement._disposeEpoch == _fastDispEp) {
+                return;
+            }
+            if (_fastElemClean &&
+                UIElement._globalPropEpoch == _fastUiPropEp &&
+                BindingEngine._curLayoutSizeEpoch == _fastLayoutEp &&
+                UIElement._treeParentEpoch == _fastTreeEp &&
+                UIElement._dataContextEpoch == _fastDcEp &&
+                UIElement._visibilityEpoch == _fastVisEp &&
+                UIElement._disposeEpoch == _fastDispEp) {
+                return;
+            }
+        }
         UIElement host = Target != null ? Target : (ContextHost != null ? ContextHost : (TargetInline != null ? TargetInline.OwnerTextBlock : null));
         if (!BindingEngine._inSubtreeFlush && host != null && host.IsInsideClosedPopup() && TargetProp != "IsOpen") {
             return;
@@ -5114,26 +5167,6 @@ internal class BindingEntry : DependencyObject {
             string[] atp = Target._activeTriggerProps;
             for (int ti = atp.Length - 1; ti >= 0; ti -= 1) {
                 if (atp[ti] == TargetProp) { return; }
-            }
-        }
-        if (Mode == 2 && OneTimeDone) { return; }
-        if (BindingEngine._inFlushPass && !BindingEngine._inSubtreeFlush && OneTimeDone) {
-            if (_fastKind1VmClean && Kind == 1 &&
-                BindingEngine._curNativeVmEpoch == _fastNativeVmEp &&
-                BindingEngine._curManagedVmEpoch == _fastManagedVmEp &&
-                UIElement._dataContextEpoch == _fastDcEp &&
-                UIElement._treeParentEpoch == _fastTreeEp &&
-                UIElement._visibilityEpoch == _fastVisEp) {
-                return;
-            }
-            if (_fastElemClean &&
-                UIElement._globalPropEpoch == _fastUiPropEp &&
-                BindingEngine._curLayoutSizeEpoch == _fastLayoutEp &&
-                UIElement._treeParentEpoch == _fastTreeEp &&
-                UIElement._dataContextEpoch == _fastDcEp &&
-                UIElement._visibilityEpoch == _fastVisEp &&
-                UIElement._disposeEpoch == _fastDispEp) {
-                return;
             }
         }
 
@@ -5369,12 +5402,29 @@ internal class BindingEntry : DependencyObject {
 
         if (Kind == 5 && CompiledUpdater != null) {
             if (Target == null) { return; }
+            int snapNativeVmEp = BindingEngine._curNativeVmEpoch;
+            int snapManagedVmEp = BindingEngine._curManagedVmEpoch;
+            int snapDcEp = UIElement._dataContextEpoch;
+            int snapTreeEp = UIElement._treeParentEpoch;
+            int snapVisEp = UIElement._visibilityEpoch;
+            int snapDispEp = UIElement._disposeEpoch;
             DependencyObject srcBox = ResolveSourceBox();
             object srcObj = DependencyObject.Unbox(srcBox);
-            if (srcObj == null) { return; }
+            if (srcObj == null) {
+                _fastKind1VmClean = false;
+                return;
+            }
             int dm = ParseUtil.IsNativeReady() ? Reflect_GetDirtyMask(srcObj) : -1;
             bool sameSrc = DependencyObject.SameValueBox(srcBox, _lastSrcBox);
-            if (OneTimeDone && sameSrc && !(srcObj is UIElement) && dm >= 0 && dm == LastDirtyMask) {
+            bool canKind5VmFast = !(srcObj is UIElement) && dm >= 0;
+            if (OneTimeDone && sameSrc && canKind5VmFast && dm == LastDirtyMask) {
+                _fastKind1VmClean = true;
+                _fastNativeVmEp = snapNativeVmEp;
+                _fastManagedVmEp = snapManagedVmEp;
+                _fastDcEp = snapDcEp;
+                _fastTreeEp = snapTreeEp;
+                _fastVisEp = snapVisEp;
+                _fastDispEp = snapDispEp;
                 return;
             }
             _lastSrcBox = srcBox;
@@ -5382,6 +5432,15 @@ internal class BindingEntry : DependencyObject {
             OneTimeDone = true;
             CompiledUpdater(Target, srcObj);
             BindingEngine.MarkFlushDirty();
+            _fastKind1VmClean = canKind5VmFast;
+            if (canKind5VmFast) {
+                _fastNativeVmEp = snapNativeVmEp;
+                _fastManagedVmEp = snapManagedVmEp;
+                _fastDcEp = snapDcEp;
+                _fastTreeEp = snapTreeEp;
+                _fastVisEp = snapVisEp;
+                _fastDispEp = snapDispEp;
+            }
             return;
         }
 
@@ -5422,6 +5481,7 @@ internal class BindingEntry : DependencyObject {
                         _fastDcEp = snapDcEp;
                         _fastTreeEp = snapTreeEp;
                         _fastVisEp = snapVisEp;
+                        _fastDispEp = snapDispEp;
                     } else if (_elemPropResolvedOnSelf) {
                         _fastElemClean = true;
                         _fastUiPropEp = snapUiPropEp;
@@ -5452,6 +5512,7 @@ internal class BindingEntry : DependencyObject {
                             _fastDcEp = snapDcEp;
                             _fastTreeEp = snapTreeEp;
                             _fastVisEp = snapVisEp;
+                            _fastDispEp = snapDispEp;
                         }
                         return;
                     }
@@ -5517,6 +5578,7 @@ internal class BindingEntry : DependencyObject {
                     _fastDcEp = snapDcEp;
                     _fastTreeEp = snapTreeEp;
                     _fastVisEp = snapVisEp;
+                    _fastDispEp = snapDispEp;
                 }
                 _fastElemClean = canKind1ElemFast;
                 if (canKind1ElemFast) {
@@ -5540,6 +5602,7 @@ internal class BindingEntry : DependencyObject {
                     _fastDcEp = snapDcEp;
                     _fastTreeEp = snapTreeEp;
                     _fastVisEp = snapVisEp;
+                    _fastDispEp = snapDispEp;
                 }
                 _fastElemClean = canKind1ElemFast;
                 if (canKind1ElemFast) {
@@ -5567,6 +5630,7 @@ internal class BindingEntry : DependencyObject {
                 _fastDcEp = snapDcEp;
                 _fastTreeEp = snapTreeEp;
                 _fastVisEp = snapVisEp;
+                _fastDispEp = snapDispEp;
             }
             _fastElemClean = OneTimeDone && canKind1ElemFast;
             if (_fastElemClean) {
@@ -5697,6 +5761,38 @@ public static class BindingEngine {
     internal static bool _inFlushPass = false;
     internal static bool _inSubtreeFlush = false;
     private static int _lastCompactDisposeEpoch = -1;
+    private static int _structEpoch = 1;
+    private static bool _hasFlushSnapshot = false;
+    private static int _snapStructEpoch = -1;
+    private static int _snapNativeVmEp = -1;
+    private static int _snapManagedVmEp = -1;
+    private static int _snapUiPropEp = -1;
+    private static int _snapLayoutEp = -1;
+    private static int _snapDcEp = -1;
+    private static int _snapTreeEp = -1;
+    private static int _snapVisEp = -1;
+    private static int _snapDispEp = -1;
+    private static BindingEntry[] _pollOnlyEntries;
+    private static int _debugShortCircuitFlushCount = 0;
+    private static int _debugEvaluatedEntryCount = 0;
+
+    internal static void BumpStructEpoch() {
+        _structEpoch = _structEpoch >= 1000000000 ? 1 : (_structEpoch + 1);
+        _hasFlushSnapshot = false;
+    }
+
+    public static int DebugShortCircuitFlushCount() {
+        return _debugShortCircuitFlushCount;
+    }
+
+    public static int DebugEvaluatedEntryCount() {
+        return _debugEvaluatedEntryCount;
+    }
+
+    public static void DebugResetFlushStats() {
+        _debugShortCircuitFlushCount = 0;
+        _debugEvaluatedEntryCount = 0;
+    }
 
     internal static void BumpManagedVmEpoch() {
         _managedVmNotifyEpoch = _managedVmNotifyEpoch >= 1000000000 ? 1 : (_managedVmNotifyEpoch + 1);
@@ -5717,6 +5813,7 @@ public static class BindingEngine {
 
     internal static void MarkFlushDirty() {
         _flushPassDirty = true;
+        BumpStructEpoch();
     }
 
     public static void BeginBatch() {
@@ -5728,6 +5825,7 @@ public static class BindingEngine {
         if (_batchDepth <= 0) { return; }
         _batchDepth -= 1;
         if (_batchDepth > 0 || _batchPending == null || _batchPending.Length == 0) { return; }
+        BumpStructEpoch();
         RefreshLayoutEpoch();
         RefreshVmEpochs();
         bool prevInFlush = _inFlushPass;
@@ -5805,6 +5903,7 @@ public static class BindingEngine {
 
     private static void RegisterEntry(BindingEntry entry) {
         EnsureInit();
+        BumpStructEpoch();
         _entries.Push(entry);
         if (entry != null && entry.Target != null) {
             ElementBindingList list = null;
@@ -5861,6 +5960,7 @@ public static class BindingEngine {
                 }
             }
         }
+        BumpStructEpoch();
     }
 
     public static void BindCompiledAction(
@@ -6179,6 +6279,7 @@ public static class BindingEngine {
                 e.SourceElement = null;
             }
         }
+        BumpStructEpoch();
     }
 
     public static bool HasTriggerBinding(UIElement target, string prop) {
@@ -6212,6 +6313,7 @@ public static class BindingEngine {
                 }
             }
         }
+        BumpStructEpoch();
     }
 
     public static void UnbindTarget(UIElement target) {
@@ -6223,6 +6325,7 @@ public static class BindingEngine {
                 _entries.RemoveAt(i);
             }
         }
+        BumpStructEpoch();
     }
 
     public static void FlushInlinesFor(TextBlock tb) {
@@ -6270,6 +6373,7 @@ public static class BindingEngine {
             }
         }
         _inSubtreeFlush = prevSub;
+        BumpStructEpoch();
     }
 
     private static void FlushCleanupOnly() {
@@ -6285,6 +6389,7 @@ public static class BindingEngine {
         if (_entries != null) {
             if (_lastCompactDisposeEpoch != UIElement._disposeEpoch) {
                 _lastCompactDisposeEpoch = UIElement._disposeEpoch;
+                BumpStructEpoch();
                 int write = 0;
                 for (int i = 0; i < _entries.Length; i += 1) {
                     BindingEntry e = _entries[i];
@@ -6301,13 +6406,77 @@ public static class BindingEngine {
                     _entries.RemoveAt(_entries.Length - 1);
                 }
             }
-            for (int pass = 0; pass < 3; pass += 1) {
-                RefreshVmEpochs();
+            RefreshLayoutEpoch();
+            RefreshVmEpochs();
+            bool shortCircuited = false;
+            if (_hasFlushSnapshot &&
+                _structEpoch == _snapStructEpoch &&
+                _curNativeVmEpoch == _snapNativeVmEp &&
+                _curManagedVmEpoch == _snapManagedVmEp &&
+                UIElement._globalPropEpoch == _snapUiPropEp &&
+                _curLayoutSizeEpoch == _snapLayoutEp &&
+                UIElement._dataContextEpoch == _snapDcEp &&
+                UIElement._treeParentEpoch == _snapTreeEp &&
+                UIElement._visibilityEpoch == _snapVisEp &&
+                UIElement._disposeEpoch == _snapDispEp) {
                 _flushPassDirty = false;
-                for (int i = 0; i < _entries.Length; i += 1) {
-                    _entries[i].Evaluate();
+                if (_pollOnlyEntries != null && _pollOnlyEntries.Length > 0) {
+                    for (int pi = 0; pi < _pollOnlyEntries.Length; pi += 1) {
+                        _pollOnlyEntries[pi].Evaluate();
+                        _debugEvaluatedEntryCount += 1;
+                    }
                 }
-                if (!_flushPassDirty) { break; }
+                if (!_flushPassDirty) {
+                    shortCircuited = true;
+                    _debugShortCircuitFlushCount += 1;
+                } else {
+                    _hasFlushSnapshot = false;
+                }
+            }
+            if (!shortCircuited) {
+                bool converged = false;
+                for (int pass = 0; pass < 3; pass += 1) {
+                    RefreshLayoutEpoch();
+                    RefreshVmEpochs();
+                    _flushPassDirty = false;
+                    for (int i = 0; i < _entries.Length; i += 1) {
+                        _entries[i].Evaluate();
+                        _debugEvaluatedEntryCount += 1;
+                    }
+                    if (!_flushPassDirty) {
+                        converged = true;
+                        break;
+                    }
+                }
+                if (converged) {
+                    RefreshLayoutEpoch();
+                    RefreshVmEpochs();
+                    if (_pollOnlyEntries == null) {
+                        _pollOnlyEntries = new BindingEntry[0];
+                    } else {
+                        while (_pollOnlyEntries.Length > 0) {
+                            _pollOnlyEntries.RemoveAt(_pollOnlyEntries.Length - 1);
+                        }
+                    }
+                    for (int i = 0; i < _entries.Length; i += 1) {
+                        BindingEntry pe = _entries[i];
+                        if (pe != null && !pe.IsEpochFastClean()) {
+                            _pollOnlyEntries.Push(pe);
+                        }
+                    }
+                    _snapStructEpoch = _structEpoch;
+                    _snapNativeVmEp = _curNativeVmEpoch;
+                    _snapManagedVmEp = _curManagedVmEpoch;
+                    _snapUiPropEp = UIElement._globalPropEpoch;
+                    _snapLayoutEp = _curLayoutSizeEpoch;
+                    _snapDcEp = UIElement._dataContextEpoch;
+                    _snapTreeEp = UIElement._treeParentEpoch;
+                    _snapVisEp = UIElement._visibilityEpoch;
+                    _snapDispEp = UIElement._disposeEpoch;
+                    _hasFlushSnapshot = true;
+                } else {
+                    _hasFlushSnapshot = false;
+                }
             }
         }
         if (!_inPostFlush && _postFlushHooks != null && _postFlushHooks.Length > 0) {
@@ -6318,10 +6487,12 @@ public static class BindingEngine {
                 if (fn != null) { fn(); }
             }
             if (_flushPassDirty && _entries != null) {
+                _hasFlushSnapshot = false;
                 RefreshVmEpochs();
                 _flushPassDirty = false;
                 for (int i = 0; i < _entries.Length; i += 1) {
                     _entries[i].Evaluate();
+                    _debugEvaluatedEntryCount += 1;
                 }
             }
             _inPostFlush = false;

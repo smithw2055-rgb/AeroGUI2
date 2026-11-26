@@ -1713,6 +1713,71 @@ bool TestFractionalScissorPixelCenterAndNoOverflowSeam() {
     return true;
 }
 
+bool TestStandaloneCpuEvictionAndLazyReload() {
+    aero::ImageAtlas atlas;
+    // Construct an uncompressed 24-bit BMP larger than kDefaultMaxPackableExtent (256)
+    constexpr std::uint32_t kW = 300u;
+    constexpr std::uint32_t kH = 300u;
+    constexpr std::uint32_t rowBytes = kW * 3u; // 900 is multiple of 4
+    constexpr std::uint32_t pixelBytes = rowBytes * kH;
+    constexpr std::uint32_t fileBytes = 54u + pixelBytes;
+    std::vector<std::uint8_t> bmp(fileBytes, 0u);
+    bmp[0] = 'B';
+    bmp[1] = 'M';
+    bmp[2] = static_cast<std::uint8_t>(fileBytes & 0xFFu);
+    bmp[3] = static_cast<std::uint8_t>((fileBytes >> 8u) & 0xFFu);
+    bmp[4] = static_cast<std::uint8_t>((fileBytes >> 16u) & 0xFFu);
+    bmp[5] = static_cast<std::uint8_t>((fileBytes >> 24u) & 0xFFu);
+    bmp[10] = 54u;
+    bmp[14] = 40u;
+    bmp[18] = static_cast<std::uint8_t>(kW & 0xFFu);
+    bmp[19] = static_cast<std::uint8_t>((kW >> 8u) & 0xFFu);
+    bmp[22] = static_cast<std::uint8_t>(kH & 0xFFu);
+    bmp[23] = static_cast<std::uint8_t>((kH >> 8u) & 0xFFu);
+    bmp[26] = 1u;
+    bmp[28] = 24u;
+    for (std::size_t i = 54u; i + 2u < bmp.size(); i += 3u) {
+        bmp[i + 0u] = 0x33u; // B
+        bmp[i + 1u] = 0x99u; // G
+        bmp[i + 2u] = 0xCCu; // R
+    }
+
+    AERO_CHECK(atlas.RegisterEncodedMemoryAsset("mem://big_bmp.bmp", bmp.data(), bmp.size()));
+    const aero::ImageAtlasEntry* entry = atlas.LoadOrGet("mem://big_bmp.bmp");
+    AERO_CHECK(entry != nullptr && entry->isStandalone && entry->textureId > 0u);
+    const std::uint32_t texId = entry->textureId;
+    const std::size_t bytesBefore = atlas.EstimatedMemoryBytes();
+    const std::size_t rgbaSize = static_cast<std::size_t>(kW) * kH * 4u;
+    AERO_CHECK(bytesBefore >= rgbaSize);
+
+    std::uint32_t knownRev = static_cast<std::uint32_t>(atlas.GetTextureSlotRevision(texId));
+    AERO_CHECK(knownRev != 0u);
+    AERO_CHECK(atlas.EvictStandaloneCpuPixelsAfterGpuUpload(texId, knownRev));
+
+    const std::size_t bytesAfterEvict = atlas.EstimatedMemoryBytes();
+    AERO_CHECK(bytesAfterEvict + rgbaSize <= bytesBefore + 64u);
+
+    // Matching revision upload check must short-circuit WITHOUT reloading CPU pixels
+    std::uint32_t sw = 0u, sh = 0u, dx = 0u, dy = 0u, dw = 0u, dh = 0u;
+    std::shared_ptr<const std::vector<std::uint8_t>> fullSnap;
+    std::vector<std::uint8_t> scratch;
+    bool wasUpdated = true;
+    AERO_CHECK(atlas.AcquireTextureSlotUploadIfModified(
+        texId, knownRev, sw, sh, dx, dy, dw, dh, fullSnap, scratch, wasUpdated));
+    AERO_CHECK(!wasUpdated && !fullSnap && sw == kW && sh == kH);
+    AERO_CHECK(atlas.EstimatedMemoryBytes() == bytesAfterEvict);
+
+    // Software sampler / snapshot access transparently reloads the evicted pixels
+    const aero::Color sampled = atlas.SampleBilinearRgba(texId, 0.5f, 0.5f);
+    AERO_CHECK(std::fabs(sampled.r - (0xCC / 255.0f)) < 0.02f);
+    AERO_CHECK(std::fabs(sampled.g - (0x99 / 255.0f)) < 0.02f);
+    AERO_CHECK(std::fabs(sampled.b - (0x33 / 255.0f)) < 0.02f);
+    std::shared_ptr<const std::vector<std::uint8_t>> reloadedSnap;
+    AERO_CHECK(atlas.TryGetTextureSlotSnapshot(texId, sw, sh, reloadedSnap) && reloadedSnap != nullptr);
+    AERO_CHECK(reloadedSnap->size() == rgbaSize);
+    return true;
+}
+
 } // namespace
 
 int main() {
@@ -1740,6 +1805,7 @@ int main() {
         {"SharedAtlasMaskQuotaNoLeak", &TestSharedAtlasMaskQuotaNoLeak},
         {"LeafTextClipEliminationAndOverflowClip", &TestLeafTextClipEliminationAndOverflowClip},
         {"FractionalScissorPixelCenterAndNoOverflowSeam", &TestFractionalScissorPixelCenterAndNoOverflowSeam},
+        {"StandaloneCpuEvictionAndLazyReload", &TestStandaloneCpuEvictionAndLazyReload},
     };
 
     int passed = 0;

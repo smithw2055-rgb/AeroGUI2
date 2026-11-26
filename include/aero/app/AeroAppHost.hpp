@@ -313,6 +313,8 @@ private:
     bool scriptWakeRequested_ = false;
     bool renderWakeRequested_ = false;
     mutable bool pendingScriptSync_ = true;
+    bool hasFlushedBindings_ = false;
+    std::uint64_t lastFlushedObservableEpoch_ = 0u;
     bool closeRequested_ = false;
     bool inStepFrame_ = false;
     bool initialized_ = false;

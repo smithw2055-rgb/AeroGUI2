@@ -2503,6 +2503,11 @@ AeroGLuint OpenGlDeviceBackend::ResolveBatchImageTexture(
         }
     }
     fullSnapshot.reset();
+    if (needsAlloc &&
+        textureId != ImageAtlas::kSharedUiAtlasTextureId &&
+        !slot.isExternal) {
+        (void)imageAtlas.EvictStandaloneCpuPixelsAfterGpuUpload(textureId, slot.slotRevision);
+    }
     if (imageUploadScratchRgba8_.capacity() > 256u * 1024u) {
         std::vector<std::uint8_t>().swap(imageUploadScratchRgba8_);
     }

@@ -79,9 +79,12 @@ struct TextureSlotBuffer {
     bool isExternalGpuHandle = false;
     bool isAlpha8 = false;
     std::uint32_t externalGpuHandle = 0u;
-    std::vector<std::uint8_t> rgbaPixels;
+    mutable std::vector<std::uint8_t> rgbaPixels;
     mutable std::shared_ptr<const std::vector<std::uint8_t>> pixelSnapshot;
     std::shared_ptr<std::vector<std::uint8_t>> cowAtlasPixels;
+    std::string reloadableFilePath;
+    std::string reloadableMemAssetKey;
+    mutable bool cpuPixelsEvicted = false;
 };
 
 // Pure C++17 zero-dependency RFC1951 DEFLATE & RFC1950 zlib decompression (100% Wasm-ready)
@@ -308,6 +311,9 @@ public:
     [[nodiscard]] std::size_t LoadedEntryCount() const noexcept;
     [[nodiscard]] std::size_t StandaloneTextureCount() const noexcept;
     [[nodiscard]] std::size_t EstimatedMemoryBytes() const noexcept;
+    bool EvictStandaloneCpuPixelsAfterGpuUpload(
+        std::uint32_t textureId,
+        std::uint32_t uploadedRevision) const noexcept;
 
     void Clear() noexcept;
 
@@ -342,7 +348,10 @@ private:
         std::uint32_t width,
         std::uint32_t height,
         std::shared_ptr<const std::vector<std::uint8_t>> pixels,
-        bool forceStandalone);
+        bool forceStandalone,
+        std::string reloadableFilePath = {},
+        std::string reloadableMemAssetKey = {});
+    [[nodiscard]] bool TryReloadEvictedSlotPixels(std::uint32_t textureId) const noexcept;
     [[nodiscard]] std::string ResolveExistingFileLocked(
         std::string_view cleanRelOrAbs,
         std::string_view localBaseDir) const;

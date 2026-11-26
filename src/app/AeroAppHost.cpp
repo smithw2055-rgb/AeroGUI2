@@ -1160,6 +1160,8 @@ void AeroAppHost::ResetLoadedProgramState() noexcept {
     inStepFrame_ = false;
     renderWakeRequested_ = false;
     pendingScriptSync_ = true;
+    hasFlushedBindings_ = false;
+    lastFlushedObservableEpoch_ = 0u;
     scheduledWakeAt_.reset();
     simObjectPin_.reset();
     simObject_ = ObjectRef{};
@@ -2541,10 +2543,14 @@ void AeroAppHost::HandleCustomArrange(
 void AeroAppHost::FlushBindings() {
     pendingScriptSync_ = false;
     if (symbols_.bindingFlush == 0u) {
+        hasFlushedBindings_ = true;
+        lastFlushedObservableEpoch_ = domains_.globalObservableEpoch();
         return;
     }
     domains_.setActiveDomain(DomainKind::UiPresentation);
     (void)InvokeSymbol(symbols_.bindingFlush, rs_rt::ValueSpan{}, nullptr, DomainKind::UiPresentation);
+    hasFlushedBindings_ = true;
+    lastFlushedObservableEpoch_ = domains_.globalObservableEpoch();
 }
 
 void AeroAppHost::FlushBindingsPostLayout() {
@@ -2773,8 +2779,10 @@ void AeroAppHost::StepFrameInternal(float dtSeconds, bool forceRenderSync, bool 
     // 5. Declarative BindingEngine synchronization (OneWay / TwoWay / Multi)
     const bool hadScriptWake = scriptWakeRequested_;
     bool ranFlushThisFrame = false;
+    const bool observableChanged =
+        !hasFlushedBindings_ || (domains_.globalObservableEpoch() != lastFlushedObservableEpoch_);
     const bool needsPreAnimFlush =
-        !animEngine_.HasActiveAnimations() ||
+        observableChanged ||
         pendingScriptSync_ ||
         hadScriptWake ||
         simUpdated ||
@@ -2805,11 +2813,22 @@ void AeroAppHost::StepFrameInternal(float dtSeconds, bool forceRenderSync, bool 
         const bool stillActive = animEngine_.HasActiveAnimations();
         desktopHost_.SetActiveAnimations(stillActive);
         if (!stillActive) {
+            pendingScriptSync_ = true;
+            if (!ranFlushThisFrame) {
+                logTrace("FlushBindings");
+                FlushBindings();
+                ranFlushThisFrame = true;
+            }
             desktopHost_.NotifyDirtyObjects();
             desktopHost_.NotifyDirtyLayout();
         }
     } else {
         desktopHost_.SetActiveAnimations(false);
+        if (uiTasksStepped > 0u || pendingScriptSync_ || scriptWakeRequested_) {
+            logTrace("FlushBindings");
+            FlushBindings();
+            ranFlushThisFrame = true;
+        }
     }
 
     // 7. Depth-bucket layout pass (measure/arrange/3D world transforms)

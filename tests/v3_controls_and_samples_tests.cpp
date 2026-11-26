@@ -1644,6 +1644,194 @@ public static Window CreateMainWindow() {
     Require(callStr("GetInnerText") == "Updated42", "InnerText did not catch up after PanelBox transitioned Collapsed -> Visible");
 }
 
+void TestPhase0MemoryAndBindingShortCircuit(aero::rs_comp::CompilerSession&) {
+    std::cout << "[v3_controls_and_samples_tests] TestPhase0MemoryAndBindingShortCircuit...\n";
+    const std::string xaml = R"XAML(
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="Phase0Reg.MainWindow"
+        Width="640" Height="480" Title="Phase0">
+    <StackPanel>
+        <TextBlock x:Name="TitleText" Text="{Binding Title}" />
+        <TextBlock x:Name="SrcText" Text="InitElem" />
+        <TextBlock x:Name="MirrorText" Text="{Binding Text, ElementName=SrcText}" />
+    </StackPanel>
+</Window>
+)XAML";
+
+    const std::string rs = R"RS(
+module Phase0Reg;
+import Aero.UI;
+
+[Observable]
+public class Phase0Vm {
+    public string Title { get; set; } = "InitTitle";
+    public int Count { get; set; } = 1;
+}
+
+public partial class MainWindow : Window {
+    public Phase0Vm Vm;
+    private BoxedFloat _heldBoxedFloat;
+    private Thickness _heldThickness;
+
+    public MainWindow() {
+        InitializeComponent();
+        Vm = new Phase0Vm();
+        DataContext = Vm;
+        _heldBoxedFloat = new BoxedFloat(42.5f);
+        _heldThickness = new Thickness(1.0f, 2.0f, 3.0f, 4.0f);
+    }
+
+    public void ResetFlushStats() { BindingEngine.DebugResetFlushStats(); }
+    public int GetShortCircuitCount() { return BindingEngine.DebugShortCircuitFlushCount(); }
+    public int GetEvaluatedCount() { return BindingEngine.DebugEvaluatedEntryCount(); }
+    public string GetTitleText() { return TitleText != null ? TitleText.Text : ""; }
+    public string GetMirrorText() { return MirrorText != null ? MirrorText.Text : ""; }
+
+    public void MutateTitle(string nextTitle) {
+        Vm.Title = nextTitle;
+    }
+
+    public void MutateSourceElement(string nextText) {
+        if (SrcText != null) {
+            SrcText.Text = nextText;
+        }
+    }
+}
+
+public static Window CreateMainWindow() {
+    return new MainWindow();
+}
+)RS";
+
+    aero::AeroV3CompileInput input;
+    input.stdlibRootDir = AERO_STDLIB_DIR;
+    input.includeStdlib = true;
+    input.treeShakeStdlib = false;
+    input.optimizeBytecode = false;
+    input.emitAotCpp = false;
+    input.xamlPath = "Phase0Reg/MainWindow.xaml";
+    input.xamlContent = xaml;
+    input.scriptSources.push_back(aero::SourceFile{"Phase0Reg/MainWindow.rs", rs});
+
+    aero::AeroAppHostConfig cfg;
+    cfg.viewportWidth = 640u;
+    cfg.viewportHeight = 480u;
+    cfg.headless = true;
+    cfg.preferSoftwareRasterizer = true;
+
+    aero::AeroAppHost host(cfg);
+    std::string err;
+    const bool loaded = host.CompileAndLoad(input, &err);
+    Require(loaded, "Phase0Reg CompileAndLoad failed: " + err);
+    if (!loaded || !host.RootVisualNode().IsValid()) {
+        return;
+    }
+
+    // Settle initial bindings (capture fast-clean snapshot + _pollOnlyEntries)
+    host.StepFrame(0.016f, true);
+    host.StepFrame(0.016f, true);
+    const aero::ObjectRef uiObj = host.RootScriptObject();
+    Require(uiObj.valid(), "Phase0Reg RootScriptObject invalid");
+
+    // Verify Phase 0.1 heap object layout size for BoxedFloat & Thickness
+    if (const auto prog = host.Program()) {
+        const auto snap = host.Domains().uiHeap().snapshot();
+        bool foundBoxedFloat = false;
+        bool foundThickness = false;
+        for (const auto& obj : snap.objects) {
+            const auto* ts = prog->resolveType(obj.typeId);
+            if (!ts) { continue; }
+            if (ts->name == "BoxedFloat") {
+                foundBoxedFloat = true;
+                Require(obj.sizeBytes <= 48u,
+                    "Expected BoxedFloat <= 48B after Phase 0.1 static exclusion, got " +
+                    std::to_string(obj.sizeBytes));
+            } else if (ts->name == "Thickness") {
+                foundThickness = true;
+                Require(obj.sizeBytes <= 96u,
+                    "Expected Thickness <= 96B after Phase 0.1 static exclusion, got " +
+                    std::to_string(obj.sizeBytes));
+            }
+        }
+        Require(foundBoxedFloat, "Expected live BoxedFloat object in UI heap snapshot");
+        Require(foundThickness, "Expected live Thickness object in UI heap snapshot");
+    }
+
+    auto callStr = [&](std::string_view fn) -> std::string {
+        aero::UnifiedValue rv{};
+        if (host.InvokeScriptMethod(uiObj, fn, {}, &rv, aero::DomainKind::UiPresentation)) {
+            if (const auto* sv = std::get_if<aero::rs_rt::StringValue>(&rv)) {
+                return sv->str();
+            }
+            if (const auto* ref = std::get_if<aero::rs_rt::ObjectRef>(&rv);
+                ref && ref->valid() && ref->kind == aero::rs_rt::ObjectKind::String) {
+                if (const auto opt = host.Domains().stringViewAcrossDomains(*ref)) {
+                    return std::string(opt->data(), opt->size());
+                }
+            }
+        }
+        return {};
+    };
+    auto callInt = [&](std::string_view fn) -> std::int64_t {
+        aero::UnifiedValue rv{};
+        std::int64_t out = -1;
+        if (host.InvokeScriptMethod(uiObj, fn, {}, &rv, aero::DomainKind::UiPresentation)) {
+            (void)rv.tryGetInt64(out);
+        }
+        return out;
+    };
+    auto callVoidStr = [&](std::string_view fn, const std::string& arg) {
+        aero::UnifiedValue rv{};
+        Require(host.InvokeScriptMethod(
+                    uiObj, fn, {aero::UnifiedValue{aero::StringValue{arg}}}, &rv, aero::DomainKind::UiPresentation),
+            "Phase0Reg method failed: " + std::string(fn));
+    };
+
+    Require(callStr("GetTitleText") == "InitTitle", "Phase0Reg initial TitleText mismatch");
+    Require(callStr("GetMirrorText") == "InitElem", "Phase0Reg initial MirrorText mismatch");
+
+    // 1) Phase 0.3A + 0.3B: idle StepFrame(0.016f, false) skips FlushBindings once pendingScriptSync_ clears
+    {
+        aero::UnifiedValue rv{};
+        Require(host.InvokeScriptMethod(uiObj, "ResetFlushStats", {}, &rv, aero::DomainKind::UiPresentation),
+            "Phase0Reg ResetFlushStats failed");
+    }
+    for (int f = 0; f < 6; ++f) {
+        host.StepFrame(0.016f, false);
+    }
+    const std::int64_t scIdle = callInt("GetShortCircuitCount");
+    const std::int64_t evalIdle = callInt("GetEvaluatedCount");
+    Require(scIdle == 1 && evalIdle == 0,
+        "Expected 1 short-circuited flush and 0 evaluated entries across 6 idle frames, got sc=" +
+        std::to_string(scIdle) + " eval=" + std::to_string(evalIdle));
+
+    // 2) Phase 0.3B: forced FlushBindings hits O(1) whole-flush short-circuit with 0 evaluated entries
+    {
+        aero::UnifiedValue rv{};
+        Require(host.InvokeScriptMethod(uiObj, "ResetFlushStats", {}, &rv, aero::DomainKind::UiPresentation),
+            "Phase0Reg ResetFlushStats (forced) failed");
+    }
+    for (int f = 0; f < 5; ++f) {
+        host.StepFrame(0.016f, true);
+    }
+    const std::int64_t scForced = callInt("GetShortCircuitCount");
+    const std::int64_t evalForced = callInt("GetEvaluatedCount");
+    Require(scForced == 5 && evalForced == 0,
+        "Expected 5 short-circuited flushes and 0 evaluated entries on forced frames, got sc=" +
+        std::to_string(scForced) + " eval=" + std::to_string(evalForced));
+
+    // 3) Observable VM mutation still propagates immediately
+    callVoidStr("MutateTitle", "UpdatedTitle");
+    host.StepFrame(0.016f, false);
+    Require(callStr("GetTitleText") == "UpdatedTitle", "Phase0Reg VM mutation failed to propagate");
+
+    // 4) ElementName source property mutation still propagates immediately
+    callVoidStr("MutateSourceElement", "UpdatedElem");
+    host.StepFrame(0.016f, true);
+    Require(callStr("GetMirrorText") == "UpdatedElem", "Phase0Reg ElementName mutation failed to propagate");
+}
+
 } // namespace
 
 int main() {
@@ -1657,6 +1845,7 @@ int main() {
     TestGalleryEngineRuntimeFixes(sharedSession);
     TestPhase1OptimizationRegressions(sharedSession);
     TestCollapsedSubtreeCatchupAndSelfDataContext(sharedSession);
+    TestPhase0MemoryAndBindingShortCircuit(sharedSession);
 
     if (gFailureCount > 0) {
         std::cerr << gFailureCount << " v3_controls_and_samples_tests assertion(s) failed.\n";
