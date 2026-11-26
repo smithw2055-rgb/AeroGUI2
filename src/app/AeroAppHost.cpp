@@ -457,8 +457,9 @@ namespace {
                 return true;
             }
             if (slot->isAutoProperty && slot->backingFieldIndex != PropertySlotHandle::InvalidIndex) {
-                if (const UnifiedValue* fp = heap->fieldGetFast(obj, slot->backingFieldIndex)) {
-                    outValue = *fp;
+                UnifiedValue fp{};
+                if (heap->fieldGetInto(obj, slot->backingFieldIndex, fp)) {
+                    outValue = std::move(fp);
                     return true;
                 }
             }
@@ -474,8 +475,9 @@ namespace {
             const std::string backing = "$" + std::string(memberName);
             for (const auto& f : ts->fields) {
                 if (!f.staticField && (f.name == memberName || f.name == backing)) {
-                    if (const UnifiedValue* fp = heap->fieldGetFast(obj, f.index)) {
-                        outValue = *fp;
+                    UnifiedValue fp{};
+                    if (heap->fieldGetInto(obj, f.index, fp)) {
+                        outValue = std::move(fp);
                         return true;
                     }
                 }
@@ -505,8 +507,9 @@ namespace {
                     }
                     const std::string_view fname(fd.name);
                     if (fname == memberName || fname == backing) {
-                        if (const UnifiedValue* fp = heap->fieldGetFast(obj, fd.index)) {
-                            outValue = *fp;
+                        UnifiedValue fp{};
+                        if (heap->fieldGetInto(obj, fd.index, fp)) {
+                            outValue = std::move(fp);
                             return true;
                         }
                     }

@@ -524,8 +524,9 @@ struct AotProgramReflectionCache {
     rs_rt::ObjectRef colObj) noexcept {
     rs_rt::ObjectRef arrRef = ObservableListHelper::ResolveBackingArray(heap, colObj);
     if (!arrRef.valid() && colObj.kind == rs_rt::ObjectKind::Record) {
-        if (const rs_rt::Value* f0 = heap.fieldGetFast(colObj, 0u)) {
-            if (const auto* ov = std::get_if<rs_rt::ObjectRef>(f0);
+        rs_rt::Value f0{};
+        if (heap.fieldGetInto(colObj, 0u, f0)) {
+            if (const auto* ov = std::get_if<rs_rt::ObjectRef>(&f0);
                 ov && ov->valid() && ov->kind == rs_rt::ObjectKind::Array) {
                 arrRef = *ov;
             }
@@ -549,8 +550,9 @@ struct AotProgramReflectionCache {
     } else if (colObj.kind == rs_rt::ObjectKind::Record) {
         arrRef = ObservableListHelper::ResolveBackingArray(*heap, colObj);
         if (!arrRef.valid()) {
-            if (const rs_rt::Value* f0 = heap->fieldGetFast(colObj, 0u)) {
-                if (const auto* ov = std::get_if<rs_rt::ObjectRef>(f0);
+            rs_rt::Value f0{};
+            if (heap->fieldGetInto(colObj, 0u, f0)) {
+                if (const auto* ov = std::get_if<rs_rt::ObjectRef>(&f0);
                     ov && ov->valid() && ov->kind == rs_rt::ObjectKind::Array) {
                     arrRef = *ov;
                 }
@@ -587,8 +589,9 @@ struct AotProgramReflectionCache {
         if (ObservableListHelper::Replace(*heap, colObj, idx, writeVal)) {
             return true;
         }
-        if (const rs_rt::Value* f0 = heap->fieldGetFast(colObj, 0u)) {
-            if (const auto* ov = std::get_if<rs_rt::ObjectRef>(f0);
+        rs_rt::Value f0{};
+        if (heap->fieldGetInto(colObj, 0u, f0)) {
+            if (const auto* ov = std::get_if<rs_rt::ObjectRef>(&f0);
                 ov && ov->valid() && ov->kind == rs_rt::ObjectKind::Array) {
                 return heap->arraySet(*ov, idx, std::move(writeVal));
             }
@@ -661,8 +664,9 @@ struct AotProgramReflectionCache {
                 }
             }
             if (slot->isAutoProperty && slot->backingFieldIndex != PropertySlotHandle::InvalidIndex) {
-                if (const rs_rt::Value* fp = heap->fieldGetFast(obj, slot->backingFieldIndex)) {
-                    outValue = *fp;
+                rs_rt::Value fp{};
+                if (heap->fieldGetInto(obj, slot->backingFieldIndex, fp)) {
+                    outValue = std::move(fp);
                     return true;
                 }
             }
@@ -687,8 +691,9 @@ struct AotProgramReflectionCache {
     if (env.aotContext) {
         const AotMemberSlot slot = ResolveAotMemberSlot(env.aotContext->program(), typeId, memberName);
         if (slot.hasReadField) {
-            if (const rs_rt::Value* fp = heap->fieldGetFast(obj, slot.readFieldIndex)) {
-                outValue = *fp;
+            rs_rt::Value fp{};
+            if (heap->fieldGetInto(obj, slot.readFieldIndex, fp)) {
+                outValue = std::move(fp);
                 return true;
             }
         }

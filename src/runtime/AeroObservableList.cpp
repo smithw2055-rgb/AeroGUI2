@@ -483,11 +483,11 @@ ObjectRef ObservableListHelper::ResolveBackingArray(
     if (!IsWrapperType(tid)) {
         return ObjectRef{};
     }
-    const Value* field0 = heap.fieldGetFast(listOrArrayRef, 0u);
-    if (!field0) {
+    Value field0{};
+    if (!heap.fieldGetInto(listOrArrayRef, 0u, field0)) {
         return ObjectRef{};
     }
-    const auto* arrRef = std::get_if<ObjectRef>(field0);
+    const auto* arrRef = std::get_if<ObjectRef>(&field0);
     if (!arrRef || !arrRef->valid() || arrRef->kind != ObjectKind::Array ||
         !heap.isAlive(*arrRef)) {
         return ObjectRef{};
