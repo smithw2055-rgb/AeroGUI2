@@ -45,6 +45,7 @@ struct AeroAppHostConfig {
     float dpiScale = 0.0f;
     bool optimizeBytecode = false;
     bool enableStencilJit = false;
+    std::uint32_t stencilJitHotnessThreshold = 32u;
     std::string windowTitle = "AeroGUI 3.0";
     std::string entryClassName;
     std::string entryFunctionName;
@@ -56,6 +57,18 @@ struct PlayedSoundRecord {
     std::string uri;
     std::string resolvedPath;
     float volume = 1.0f;
+};
+
+struct AeroStencilJitStats {
+    bool active = false;
+    bool nativeBackendActive = false;
+    std::size_t trackedFunctions = 0;
+    std::size_t nativeFunctions = 0;
+    std::size_t threadedFunctions = 0;
+    std::size_t fallbackFunctions = 0;
+    std::size_t machineCodeBytes = 0;
+    std::uint64_t invokeHits = 0;
+    std::uint64_t fallbackHits = 0;
 };
 
 #ifdef AERO_HAS_COMPILER_V3
@@ -187,6 +200,7 @@ public:
     [[nodiscard]] std::shared_ptr<const ProgramImage> Program() const noexcept { return programImage_; }
     [[nodiscard]] Interpreter* ScriptInterpreter() noexcept { return interpreter_.get(); }
     [[nodiscard]] Interpreter* SimInterpreter();
+    [[nodiscard]] AeroStencilJitStats StencilJitStats() const noexcept;
     [[nodiscard]] rs_aot::ExecutionContext* AotContext() noexcept { return aotContext_.get(); }
     [[nodiscard]] rs_aot::ExecutionContext* SimAotContext() noexcept { return simAotContext_.get(); }
 

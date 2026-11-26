@@ -1308,20 +1308,28 @@ bool AeroAppHost::LoadProgramImageInternal(
     }
 
 #ifdef AERO_HAS_STENCIL_JIT
-    if (config_.enableStencilJit && programImage_->totalLazyFunctionCount() == 0u &&
-        realscript::jit::StencilJit::nativeAvailable()) {
+    if (config_.enableStencilJit && realscript::jit::StencilJit::nativeAvailable()) {
+        const bool isLazyProgram = (programImage_->totalLazyFunctionCount() > 0u);
         const realscript::jit::StencilJit jitCompiler;
         realscript::jit::StencilJitOptions jitOpts{};
         jitOpts.enableNativeCodegen = true;
-        jitOpts.enableThreadedFallback = true;
-        jitOpts.hotnessThreshold = 0;
+        jitOpts.enableThreadedFallback = !isLazyProgram;
+        jitOpts.hotnessThreshold = isLazyProgram
+            ? std::max<std::uint32_t>(1u, config_.stencilJitHotnessThreshold)
+            : config_.stencilJitHotnessThreshold;
         auto compileRes = jitCompiler.compile(programImage_, jitOpts);
         if (compileRes.succeeded() &&
-            (compileRes.nativeFunctionCount > 0 || compileRes.threadedFunctionCount > 0)) {
+            compileRes.module &&
+            compileRes.module->valid() &&
+            (isLazyProgram ||
+             jitOpts.hotnessThreshold > 0u ||
+             compileRes.nativeFunctionCount > 0u ||
+             compileRes.threadedFunctionCount > 0u)) {
             auto stencilMod = compileRes.module;
             stencilMod->setHeap(domains_.uiHeapPtr());
             stencilMod->setBindingRegistry(bindings_);
             uiStencilModule_ = stencilMod;
+            domains_.resetDesktopJitCounters();
             domains_.setDesktopJitInvoker(
                 [stencilMod, policy = domains_.executionPolicy(DomainKind::UiPresentation)](
                     DomainKind domain,
@@ -1334,38 +1342,21 @@ bool AeroAppHost::LoadProgramImageInternal(
                     if (domain != DomainKind::UiPresentation) {
                         return false;
                     }
-                    if (stencilMod->functionTier(functionId) ==
-                        realscript::jit::StencilTier::InterpreterFallback) {
-                        return false;
-                    }
-                    thread_local std::vector<UnifiedValue> tlPrimaryArgs;
-                    thread_local bool tlPrimaryInUse = false;
-                    std::vector<UnifiedValue> fallbackArgs;
-                    std::vector<UnifiedValue>& argVec = !tlPrimaryInUse ? tlPrimaryArgs : fallbackArgs;
-                    const bool claimedPrimary = !tlPrimaryInUse;
-                    if (claimedPrimary) {
-                        tlPrimaryInUse = true;
-                    }
-                    struct PrimaryGuard {
-                        bool active;
-                        ~PrimaryGuard() {
-                            if (active) {
-                                tlPrimaryInUse = false;
-                            }
-                        }
-                    } guard{claimedPrimary};
-                    argVec.clear();
-                    if (arguments != nullptr && argumentCount > 0u) {
-                        argVec.assign(arguments, arguments + argumentCount);
-                    }
                     rs_rt::ExecutionOptions execOpts{};
                     execOpts.limits.instructionBudget = 128'000'000u;
                     execOpts.limits.gcWorkBudget = 0u;
                     execOpts.executionPolicy = policy;
-                    const auto exec = stencilMod->invoke(functionId, argVec, std::move(execOpts));
+                    rs_rt::ExecutionResult exec{};
+                    if (!stencilMod->tryInvokeSpan(
+                            functionId,
+                            rs_rt::ValueSpan(arguments, argumentCount),
+                            std::move(execOpts),
+                            exec)) {
+                        return false;
+                    }
                     outSucceeded = exec.succeeded;
-                    outResult = exec.value;
-                    outError = exec.error;
+                    outResult = std::move(exec.value);
+                    outError = std::move(exec.error);
                     return true;
                 });
         }
@@ -3632,6 +3623,27 @@ VisualNodeId AeroAppHost::FindVisualByOwnerName(std::string_view elementName) co
         }
     }
     return VisualNodeId{};
+}
+
+AeroStencilJitStats AeroAppHost::StencilJitStats() const noexcept {
+    AeroStencilJitStats stats{};
+    stats.invokeHits = domains_.desktopJitInvokeHits();
+    stats.fallbackHits = domains_.desktopJitFallbackHits();
+#ifdef AERO_HAS_STENCIL_JIT
+    if (uiStencilModule_) {
+        const auto mod = std::static_pointer_cast<const realscript::jit::StencilModule>(uiStencilModule_);
+        if (mod && mod->valid()) {
+            stats.active = true;
+            stats.nativeBackendActive = mod->nativeBackendActive();
+            stats.trackedFunctions = mod->totalFunctionCount();
+            stats.nativeFunctions = mod->nativeFunctionCount();
+            stats.threadedFunctions = mod->threadedFunctionCount();
+            stats.fallbackFunctions = mod->fallbackFunctionCount();
+            stats.machineCodeBytes = mod->machineCodeBytes();
+        }
+    }
+#endif
+    return stats;
 }
 
 } // namespace aero

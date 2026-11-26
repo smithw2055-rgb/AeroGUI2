@@ -599,6 +599,69 @@ void TestStdlibDllUserArbcDiskCache() {
     fs::remove_all(cacheDir, ec);
 }
 
+void TestStdlibDllWithStencilJit() {
+    std::cout << "[Test 5] StencilJIT in aerogui_stdlib.dll lazy mode...\n";
+    const fs::path samplesRoot(AERO_SAMPLES_DIR);
+    const std::uint32_t clearRgba = QuantizedClearColorRgba(aero::AeroAppHostConfig{}.clearColor);
+
+    for (const char* sampleName : {"Buttons", "Gallery"}) {
+        const fs::path sampleDir = samplesRoot / sampleName;
+        aero::AeroV3CompileInput ci;
+        aero::AeroAppHostConfig hc;
+        Require(BuildSampleForDll(sampleDir, AERO_STDLIB_DLL_PATH, ci, hc),
+            std::string(sampleName) + ": discovery failed for JIT test");
+        hc.enableStencilJit = true;
+        hc.stencilJitHotnessThreshold = 4u;
+
+        const aero::AeroCompilerV3 compiler;
+        const aero::AeroV3CompileResult res = compiler.Compile(ci);
+        Require(res.succeeded && res.programImage != nullptr && res.usedStdlibDll,
+            std::string(sampleName) + ": DLL compile failed for JIT test");
+
+        aero::AeroAppHost host(hc);
+        const std::string entryHint = ci.xamlContent.empty() ? std::string{} : res.rootClassName;
+        Require(host.LoadProgramImage(res.programImage, entryHint),
+            std::string(sampleName) + ": LoadProgramImage failed under JIT: " + host.LastError());
+        for (int f = 0; f < 30; ++f) {
+            host.StepFrame(1.0f / 60.0f, f == 29);
+        }
+
+        std::vector<std::uint8_t> rgba;
+        Require(host.RenderHeadlessRgba(320u, 180u, rgba),
+            std::string(sampleName) + ": RenderHeadlessRgba failed under JIT");
+        std::size_t nonClear = 0u;
+        const std::size_t colors = CountDistinctColors(rgba, clearRgba, nonClear);
+        Require(host.World().LiveNodeCount() > 0u &&
+                host.RenderTree().NodeCount() > 0u &&
+                colors >= 2u,
+            std::string(sampleName) + ": rendered empty/uniform output under JIT");
+
+        const auto stats = host.StencilJitStats();
+        const std::size_t lazyTotal = res.programImage->totalLazyFunctionCount();
+        const std::size_t lazyCompiled = res.programImage->compiledLazyFunctionCount();
+        std::cout << "  [JIT_TEST] sample=" << sampleName
+                  << " active=" << (stats.active ? 1 : 0)
+                  << " native_backend=" << (stats.nativeBackendActive ? 1 : 0)
+                  << " tracked=" << stats.trackedFunctions
+                  << " native=" << stats.nativeFunctions
+                  << " threaded=" << stats.threadedFunctions
+                  << " fallback=" << stats.fallbackFunctions
+                  << " code_bytes=" << stats.machineCodeBytes
+                  << " invoke_hits=" << stats.invokeHits
+                  << " fallback_hits=" << stats.fallbackHits
+                  << " lazy=" << lazyCompiled << "/" << lazyTotal << "\n";
+
+        Require(stats.active && stats.nativeBackendActive,
+            std::string(sampleName) + ": StencilJIT module must be active with native backend");
+        Require(stats.nativeFunctions > 0u,
+            std::string(sampleName) + ": StencilJIT must promote hot functions to native");
+        Require(stats.invokeHits > 0u,
+            std::string(sampleName) + ": StencilJIT must record native invoke hits");
+        Require(lazyTotal > 0u && lazyCompiled < (lazyTotal / 2u),
+            std::string(sampleName) + ": StencilJIT must leave cold stdlib lazy functions undecoded");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -607,6 +670,7 @@ int main() {
     TestAll28SamplesUnderDllInterpretedMode();
     TestIsolatedTempDirLaunchesWithoutStdlibDir();
     TestStdlibDllUserArbcDiskCache();
+    TestStdlibDllWithStencilJit();
 
     if (gFailureCount != 0) {
         std::cerr << "\nv3_stdlib_dll_tests FAILED with " << gFailureCount << " failure(s).\n";

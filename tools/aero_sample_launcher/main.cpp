@@ -208,6 +208,9 @@ void PrintUsage() {
         "  --stdlib-source         Fallback to stdlib source tree compilation\n"
         "  --stdlib <dir>          Path to stdlib source dir (implies --stdlib-source)\n"
         "  --profile-startup       Print startup & lazy compilation profile metrics\n"
+        "  --jit                   Enable tiered StencilJIT in bytecode/DLL mode\n"
+        "  --no-jit                Disable StencilJIT (default)\n"
+        "  --jit-threshold <N>     Calls before promoting a UI function to native (default: 32)\n"
         "  --benchmark-subpages <mode>  Benchmark Gallery subpages (containers|all)\n"
         "  --benchmark-cycles <N>  Number of benchmark cycles (default: 2)\n"
         "  -h, --help              Show this help\n",
@@ -287,6 +290,8 @@ int main(int argc, char** argv) {
     std::string stdlibDllPath;
     std::string stdlibDir;
     bool profileStartup = false;
+    bool enableStencilJit = false;
+    std::uint32_t jitThreshold = 32u;
     std::string benchmarkSubpagesMode;
     std::uint64_t benchmarkCycles = 2u;
 
@@ -353,6 +358,14 @@ int main(int argc, char** argv) {
             }
         } else if (arg == "--profile-startup") {
             profileStartup = true;
+        } else if (arg == "--jit") {
+            enableStencilJit = true;
+        } else if (arg == "--no-jit") {
+            enableStencilJit = false;
+        } else if (arg == "--jit-threshold") {
+            const char* v = needNext(arg);
+            if (!v) return 2;
+            jitThreshold = static_cast<std::uint32_t>(std::max<unsigned long long>(1ull, std::strtoull(v, nullptr, 10)));
         } else if (arg == "--benchmark-subpages") {
             const char* v = needNext(arg);
             if (!v) return 2;
@@ -410,7 +423,8 @@ int main(int argc, char** argv) {
         hostCfg.preferSoftwareRasterizer = preferSoftware;
     }
     hostCfg.optimizeBytecode = false;
-    hostCfg.enableStencilJit = false;
+    hostCfg.enableStencilJit = enableStencilJit;
+    hostCfg.stencilJitHotnessThreshold = jitThreshold;
 
     aero::AeroAppHost host(hostCfg);
     std::string err;
@@ -483,6 +497,19 @@ int main(int argc, char** argv) {
             fontMb,
             imgMb,
             prog ? prog->decodedLazyChunkCacheSize() : 0u);
+        const auto js = host.StencilJitStats();
+        if (js.active) {
+            std::printf(
+                "[JIT_PROFILE] native_backend=%d tracked=%zu native=%zu threaded=%zu fallback=%zu code_bytes=%zu invoke_hits=%llu fallback_hits=%llu\n",
+                js.nativeBackendActive ? 1 : 0,
+                js.trackedFunctions,
+                js.nativeFunctions,
+                js.threadedFunctions,
+                js.fallbackFunctions,
+                js.machineCodeBytes,
+                static_cast<unsigned long long>(js.invokeHits),
+                static_cast<unsigned long long>(js.fallbackHits));
+        }
         std::fflush(stdout);
     };
 
@@ -770,6 +797,19 @@ int main(int argc, char** argv) {
                 cycle1EndNodes,
                 cycle2EndNodes,
                 prog ? prog->decodedLazyChunkCacheSize() : 0u);
+            const auto js = host.StencilJitStats();
+            if (js.active) {
+                std::printf(
+                    "[JIT_PROFILE] native_backend=%d tracked=%zu native=%zu threaded=%zu fallback=%zu code_bytes=%zu invoke_hits=%llu fallback_hits=%llu\n",
+                    js.nativeBackendActive ? 1 : 0,
+                    js.trackedFunctions,
+                    js.nativeFunctions,
+                    js.threadedFunctions,
+                    js.fallbackFunctions,
+                    js.machineCodeBytes,
+                    static_cast<unsigned long long>(js.invokeHits),
+                    static_cast<unsigned long long>(js.fallbackHits));
+            }
             std::fflush(stdout);
         }
 
