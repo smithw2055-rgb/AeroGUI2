@@ -114,6 +114,8 @@ void PrintUsage() {
         "  --out-dir <dir>           Output directory for bytecode bundle & generated files\n"
         "  --aot-cpp <stem|dir>      Emit C++17 AOT header/source (<stem>.h / <stem>.cpp)\n"
         "  --aot-ns <ns>             C++ namespace for AOT output (default: aero::aot_generated)\n"
+        "  --aot-full-tiers          Emit full multi-tier AOT templates/accounting (disable TrustedReleaseOnly)\n"
+        "  --aot-trusted-release-only  Emit slim TrustedReleaseOnly C++17 AOT output (default)\n"
         "  --emit-stdlib-dll-cpp <f> Emit self-contained stdlib DLL C++ data unit\n"
         "  --O2                      Enable aggressive MIR optimization\n"
         "  --O0                      Disable MIR optimization (for --emit-stdlib-dll-cpp)\n"
@@ -391,6 +393,10 @@ int main(int argc, char** argv) {
             const char* v = needNext(arg);
             if (!v) return 2;
             input.aotCppNamespace = v;
+        } else if (arg == "--aot-full-tiers") {
+            input.aotTrustedReleaseOnly = false;
+        } else if (arg == "--aot-trusted-release-only") {
+            input.aotTrustedReleaseOnly = true;
         } else if (arg == "--emit-stdlib-dll-cpp") {
             const char* v = needNext(arg);
             if (!v) return 2;

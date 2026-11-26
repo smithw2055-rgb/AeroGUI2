@@ -231,10 +231,20 @@ public partial class MainWindow : Window {
         "AOT source does not include compiled InitializeComponent");
     Require(sourceText.find("rs_rt::Interpreter") == std::string::npos,
         "Emitted C++17 AOT source must NOT reference bytecode Interpreter");
+    Require(sourceText.find("template <bool FastAccounting") == std::string::npos,
+        "Default TrustedReleaseOnly AOT source must NOT emit FastAccounting templates");
+    Require(sourceText.find("context.consume(") == std::string::npos,
+        "Default TrustedReleaseOnly AOT source must NOT emit per-opcode context.consume");
+    Require(sourceText.find("poly_dispatch_") != std::string::npos,
+        "Expected shared poly_dispatch_ helpers in emitted AOT source");
 
 #if defined(_WIN32)
     // Verify emitted C++17 AOT source compiles cleanly under MSVC /std:c++17 /GR- (zero RTTI)
+#ifdef AERO_REALSCRIPT_INCLUDE_DIR
+    const fs::path rsIncludeDir(AERO_REALSCRIPT_INCLUDE_DIR);
+#else
     const fs::path rsIncludeDir("C:/Projects/RealScript/include");
+#endif
     if (fs::exists(rsIncludeDir / "realscript" / "aot_cpp" / "RuntimeAbi.h")) {
         const fs::path objOut = outDir / "AotProbeUi.obj";
         const fs::path vcvarsCandidates[] = {

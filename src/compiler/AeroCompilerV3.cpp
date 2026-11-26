@@ -2090,6 +2090,10 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
         aotOpts.programName = progName;
         aotOpts.cppNamespace = cppNs;
         aotOpts.emitLineDirectives = false;
+        aotOpts.trustedRelease = input.aotTrustedReleaseOnly;
+        aotOpts.emitMode = input.aotTrustedReleaseOnly
+            ? rs_aot::AotEmitMode::TrustedReleaseOnly
+            : rs_aot::AotEmitMode::FullMultiTier;
         aotOpts.enableSharedReferenceGenerics = true;
 
         rs_diag::DiagnosticBag aotDiag;

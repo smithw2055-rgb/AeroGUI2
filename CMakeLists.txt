@@ -359,10 +359,12 @@ if(AERO_BUILD_TESTS)
         add_executable(v3_slim_no_rtti_and_aot_tests tests/v3_slim_no_rtti_and_aot_tests.cpp)
         target_link_libraries(v3_slim_no_rtti_and_aot_tests PRIVATE aerogui_host)
         add_dependencies(v3_slim_no_rtti_and_aot_tests aero-compiler)
+        get_filename_component(_aero_rs_include_dir "${REALSCRIPT_BUILD_DIR}/../include" ABSOLUTE)
         target_compile_definitions(v3_slim_no_rtti_and_aot_tests PRIVATE
             AERO_COMPILER_EXE="$<TARGET_FILE:aero-compiler>"
             AERO_STDLIB_DIR="${CMAKE_CURRENT_SOURCE_DIR}/stdlib"
             AERO_TEST_TEMP_DIR="${CMAKE_CURRENT_BINARY_DIR}/test_out"
+            AERO_REALSCRIPT_INCLUDE_DIR="${_aero_rs_include_dir}"
         )
         aero_apply_no_rtti_options(v3_slim_no_rtti_and_aot_tests)
         add_test(NAME v3_slim_no_rtti_and_aot_tests COMMAND v3_slim_no_rtti_and_aot_tests)

@@ -44,6 +44,7 @@ struct AeroV3CompileInput {
     bool allowDiskCache = true;
     bool allowStdlibCache = true;
     bool emitAotCpp = false;
+    bool aotTrustedReleaseOnly = true;
     std::string aotCppNamespace = "aero::aot_generated";
     std::string aotViewBuilderName;
 
