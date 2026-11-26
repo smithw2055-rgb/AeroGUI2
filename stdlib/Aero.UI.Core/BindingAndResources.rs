@@ -3,6 +3,204 @@ import Aero.Native;
 import RealScript.Math;
 
 // ============================================================================
+// 0. XamlElementFactoryRegistry & CompiledXamlCatalog (4-Package & Build-Time Catalog)
+// ============================================================================
+
+public delegate DependencyObject XamlElementFactory();
+public delegate UIElement CompiledXamlElementFactory(ResourceDictionary fallbackResources);
+public delegate ResourceDictionary CompiledXamlDictFactory();
+
+public static class XamlElementFactoryRegistry {
+    private static string[] _keys;
+    private static XamlElementFactory[] _factories;
+
+    public static void Register(string typeName, XamlElementFactory factory) {
+        if (typeName == null || typeName.Length == 0 || factory == null) { return; }
+        if (_keys == null) {
+            _keys = new string[0];
+            _factories = new XamlElementFactory[0];
+        }
+        for (int i = 0; i < _keys.Length; i += 1) {
+            if (_keys[i] == typeName) {
+                _factories[i] = factory;
+                return;
+            }
+        }
+        _keys.Push(typeName);
+        _factories.Push(factory);
+    }
+
+    public static DependencyObject TryCreate(string typeName) {
+        if (typeName == null || typeName.Length == 0 || _keys == null) { return null; }
+        for (int i = 0; i < _keys.Length; i += 1) {
+            if (_keys[i] == typeName && _factories[i] != null) {
+                var fn = _factories[i];
+                return fn();
+            }
+        }
+        return null;
+    }
+
+    public static void Clear() {
+        _keys = null;
+        _factories = null;
+    }
+}
+
+public static class CompiledXamlCatalog {
+    private static Dictionary<string, int> _elIndex;
+    private static CompiledXamlElementFactory[] _elFactories;
+    private static Dictionary<string, int> _dictIndex;
+    private static CompiledXamlDictFactory[] _dictFactories;
+    private static ResourceDictionary[] _dictCache;
+
+    public static string NormalizeUriKey(string uri) {
+        if (uri == null) { return ""; }
+        string s = uri.Trim();
+        if (s.Length == 0) { return ""; }
+        if (s.Contains("\\")) {
+            string[] parts = s.Split("\\");
+            s = "";
+            for (int i = 0; i < parts.Length; i += 1) {
+                if (i > 0) { s = s + "/"; }
+                s = s + parts[i];
+            }
+        }
+        while (s.StartsWith("./")) { s = s.Substring(2); }
+        while (s.StartsWith("/")) { s = s.Substring(1); }
+        return s.ToLower();
+    }
+
+    private static string ExtractBaseFileName(string normKey) {
+        if (normKey == null || normKey.Length == 0) { return ""; }
+        int slash = normKey.LastIndexOf("/");
+        if (slash >= 0 && slash + 1 < normKey.Length) {
+            return normKey.Substring(slash + 1);
+        }
+        return normKey;
+    }
+
+    public static void RegisterElement(string uriKey, CompiledXamlElementFactory factory) {
+        if (uriKey == null || factory == null) { return; }
+        string k = NormalizeUriKey(uriKey);
+        if (k.Length == 0) { return; }
+        if (_elIndex == null) {
+            _elIndex = new Dictionary<string, int>();
+            _elFactories = new CompiledXamlElementFactory[0];
+        }
+        if (_elIndex.ContainsKey(k)) {
+            int idx = _elIndex[k];
+            _elFactories[idx] = factory;
+            return;
+        }
+        int newIdx = _elFactories.Length;
+        _elFactories.Push(factory);
+        _elIndex[k] = newIdx;
+    }
+
+    public static void RegisterResourceDictionary(string uriKey, CompiledXamlDictFactory factory) {
+        if (uriKey == null || factory == null) { return; }
+        string k = NormalizeUriKey(uriKey);
+        if (k.Length == 0) { return; }
+        if (_dictIndex == null) {
+            _dictIndex = new Dictionary<string, int>();
+            _dictFactories = new CompiledXamlDictFactory[0];
+            _dictCache = new ResourceDictionary[0];
+        }
+        if (_dictIndex.ContainsKey(k)) {
+            int idx = _dictIndex[k];
+            _dictFactories[idx] = factory;
+            _dictCache[idx] = null;
+            return;
+        }
+        int newIdx = _dictFactories.Length;
+        _dictFactories.Push(factory);
+        _dictCache.Push(null);
+        _dictIndex[k] = newIdx;
+    }
+
+    private static int FindElementFactoryIndex(string uri) {
+        if (_elIndex == null || uri == null) { return -1; }
+        string k = NormalizeUriKey(uri);
+        if (k.Length == 0) { return -1; }
+        if (_elIndex.ContainsKey(k)) { return _elIndex[k]; }
+        string baseName = ExtractBaseFileName(k);
+        if (baseName.Length > 0 && baseName != k && _elIndex.ContainsKey(baseName)) {
+            return _elIndex[baseName];
+        }
+        return -1;
+    }
+
+    private static int FindDictFactoryIndex(string uri) {
+        if (_dictIndex == null || uri == null) { return -1; }
+        string k = NormalizeUriKey(uri);
+        if (k.Length == 0) { return -1; }
+        if (_dictIndex.ContainsKey(k)) { return _dictIndex[k]; }
+        string baseName = ExtractBaseFileName(k);
+        if (baseName.Length > 0 && baseName != k && _dictIndex.ContainsKey(baseName)) {
+            return _dictIndex[baseName];
+        }
+        return -1;
+    }
+
+    public static bool HasElement(string uriKey) { return FindElementFactoryIndex(uriKey) >= 0; }
+    public static bool HasResourceDictionary(string uriKey) { return FindDictFactoryIndex(uriKey) >= 0; }
+    public static int ElementCount() { return _elFactories != null ? _elFactories.Length : 0; }
+    public static int ResourceDictionaryCount() { return _dictFactories != null ? _dictFactories.Length : 0; }
+
+    public static UIElement TryLoadUri(string uri, ResourceDictionary fallbackResources = null) {
+        int idx = FindElementFactoryIndex(uri);
+        if (idx < 0 || _elFactories == null || idx >= _elFactories.Length || _elFactories[idx] == null) {
+            return null;
+        }
+        var fn = _elFactories[idx];
+        ResourceDictionary.PushAmbient(fallbackResources);
+        UIElement._xamlBuildDepth += 1;
+        BindingEngine.BeginBatch();
+        UIElement el = fn(fallbackResources);
+        UIElement._xamlBuildDepth -= 1;
+        ResourceDictionary.PopAmbient(fallbackResources);
+        if (el == null) {
+            BindingEngine.EndBatch();
+            return null;
+        }
+        el.SetUiFlag(1024, true);
+        if (fallbackResources != null && el.AmbientResources == null) {
+            el.AmbientResources = fallbackResources;
+        }
+        el.ApplyStyleSubtree();
+        el.RefreshDynamicResourcesRecursive();
+        BindingEngine.EndBatch();
+        BindingEngine.FlushSubtree(el);
+        return el;
+    }
+
+    public static ResourceDictionary TryLoadResourceDictionary(string uri) {
+        int idx = FindDictFactoryIndex(uri);
+        if (idx < 0 || _dictFactories == null || idx >= _dictFactories.Length || _dictFactories[idx] == null) {
+            return null;
+        }
+        if (_dictCache != null && idx < _dictCache.Length && _dictCache[idx] != null) {
+            return _dictCache[idx];
+        }
+        var fn = _dictFactories[idx];
+        ResourceDictionary built = fn();
+        if (built != null && _dictCache != null && idx < _dictCache.Length) {
+            _dictCache[idx] = built;
+        }
+        return built;
+    }
+
+    public static void Clear() {
+        _elIndex = null;
+        _elFactories = null;
+        _dictIndex = null;
+        _dictFactories = null;
+        _dictCache = null;
+    }
+}
+
+// ============================================================================
 // 1. ResourceDictionary
 // ============================================================================
 
@@ -52,6 +250,21 @@ public class ResourceDictionary : DependencyObject {
     public static object FindAmbientOrGlobal(string key) {
         DependencyObject box = FindAmbientBox(key);
         if (box != null) { return DependencyObject.Unbox(box); }
+        ResourceDictionary appRes = GlobalApplicationResources();
+        if (appRes != null && appRes.Contains(key)) {
+            return DependencyObject.Unbox(appRes.GetBox(key));
+        }
+        return null;
+    }
+
+    public static object FindScopedResource(object host, string key) {
+        DependencyObject ambient = FindAmbientBox(key);
+        if (ambient != null) { return DependencyObject.Unbox(ambient); }
+        if (host is UIElement) { return (host as UIElement).FindResource(key); }
+        if (host is ResourceDictionary) {
+            DependencyObject dbox = (host as ResourceDictionary).GetBox(key);
+            if (dbox != null) { return DependencyObject.Unbox(dbox); }
+        }
         ResourceDictionary appRes = GlobalApplicationResources();
         if (appRes != null && appRes.Contains(key)) {
             return DependencyObject.Unbox(appRes.GetBox(key));
@@ -260,6 +473,37 @@ public class ResourceDictionary : DependencyObject {
     }
 }
 
+public class ArrayCollectionSlot : CollectionSlotBase {
+    public ArrayCollectionBox Target;
+    public ArrayCollectionSlot(ArrayCollectionBox target) : base() { Target = target; }
+    public override bool Matches(object col) {
+        var o = col as ArrayCollectionBox;
+        return o == Target;
+    }
+}
+
+public class ArrayCollectionBox : DependencyObject, ICollectionNotifier {
+    private DependencyObject[] _items;
+    private CollectionSlotBase _notifierSlot;
+    public ArrayCollectionBox() { _items = new DependencyObject[0]; }
+    public ArrayCollectionBox(DependencyObject[] items) {
+        _items = items == null ? new DependencyObject[0] : items;
+    }
+    public override object UnboxObject() { return this; }
+    public CollectionSlotBase EnsureNotifierSlot() {
+        if (_notifierSlot == null) {
+            _notifierSlot = CollectionChangeHub.FindOrRegister(new ArrayCollectionSlot(this), this);
+        }
+        return _notifierSlot;
+    }
+    public void AddBox(DependencyObject b) { _items.Push(b); }
+    public int ItemCount() { return _items.Length; }
+    public DependencyObject BoxItemAt(int index) {
+        if (index < 0 || index >= _items.Length) { return null; }
+        return _items[index];
+    }
+}
+
 // ============================================================================
 // 2. Setter, Triggers, Style, ControlTemplate, DataTemplate
 // ============================================================================
@@ -357,10 +601,9 @@ public class Setter : DependencyObject {
 
     public static Grid FindGridWithNamedDefinition(UIElement rootTarget, string defName) {
         if (rootTarget == null || defName == null || defName.Length == 0) { return null; }
-        bool isTemplatedCtrl = (rootTarget is Control && (rootTarget as Control).TemplateRoot() != null);
-        UIElement searchRoot = isTemplatedCtrl
-            ? (rootTarget as Control).TemplateRoot()
-            : rootTarget;
+        UIElement tplRoot = rootTarget.GetTemplateRootInternal();
+        bool isTemplatedCtrl = (tplRoot != null);
+        UIElement searchRoot = isTemplatedCtrl ? tplRoot : rootTarget;
         var q = new UIElement[0];
         q.Push(searchRoot);
         int idx = 0;
@@ -382,7 +625,7 @@ public class Setter : DependencyObject {
                 UIElement ch = cur.ChildAt(i);
                 if (ch == null) { continue; }
                 if (isTemplatedCtrl) {
-                    if (Control.IsOwnedByTemplateChain(ch, rootTarget)) { q.Push(ch); }
+                    if (ch.IsOwnedByTemplateChainInternal(rootTarget)) { q.Push(ch); }
                 } else if (ch.TemplatedParent == null) {
                     q.Push(ch);
                 }
@@ -929,8 +1172,8 @@ public class Trigger : TriggerBase {
 
     internal static UIElement ResolveTemplateOrNamedElement(UIElement target, string name) {
         if (target == null || name == null || name.Length == 0) { return null; }
-        if (target is Control && (target as Control).TemplateRoot() != null) {
-            UIElement tc = (target as Control).GetTemplateChild(name);
+        if (target.GetTemplateRootInternal() != null) {
+            UIElement tc = target.GetTemplateChildInternal(name);
             if (tc != null) { return tc; }
         }
         UIElement se = BindingEntry.FindElementScoped(target, name);
@@ -1884,6 +2127,10 @@ public class EventTrigger : TriggerBase {
     }
 }
 
+public interface IBehaviorTrigger {
+    void Attach(UIElement associatedObject);
+}
+
 public class Style : DependencyObject {
     public string TargetType { get; set; } = "";
     private Style _basedOn;
@@ -1914,7 +2161,7 @@ public class Style : DependencyObject {
 
     private Setter[] _setters;
     private TriggerBase[] _triggers;
-    private BehaviorTriggerBase[] _behaviorTriggers;
+    private IBehaviorTrigger[] _behaviorTriggers;
     private UIElement[] _evaluatingTargets;
     private static Setter[] _emptySetters;
     private static TriggerBase[] _emptyTriggers;
@@ -1952,9 +2199,9 @@ public class Style : DependencyObject {
     public void AddTrigger(TriggerBase trigger) { if (trigger != null) { if (_triggers == null) { _triggers = new TriggerBase[0]; } _triggers.Push(trigger); } }
     public void AddDataTrigger(DataTrigger trigger) { AddTrigger(trigger); }
     public void AddEventTrigger(EventTrigger trigger) { AddTrigger(trigger); }
-    public void AddBehaviorTrigger(BehaviorTriggerBase trigger) {
+    public void AddBehaviorTrigger(IBehaviorTrigger trigger) {
         if (trigger != null) {
-            if (_behaviorTriggers == null) { _behaviorTriggers = new BehaviorTriggerBase[0]; }
+            if (_behaviorTriggers == null) { _behaviorTriggers = new IBehaviorTrigger[0]; }
             _behaviorTriggers.Push(trigger);
         }
     }
@@ -4733,6 +4980,7 @@ internal class BindingEntry : DependencyObject {
             return tn == "Panel" || tn == "StackPanel" || tn == "VirtualizingStackPanel" ||
                    tn == "TabPanel" || tn == "ToolBarPanel" || tn == "DockPanel" ||
                    tn == "WrapPanel" || tn == "ToolBarOverflowPanel" || tn == "UniformGrid" ||
+                   tn == "VirtualizingUniformGrid" || tn == "VirtualizingWrapGrid" ||
                    tn == "Canvas" || tn == "Grid";
         }
         if (typeName == "Shape") {

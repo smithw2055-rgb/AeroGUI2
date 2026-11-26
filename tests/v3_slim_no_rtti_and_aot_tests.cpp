@@ -2,6 +2,7 @@
 #error "v3_slim_no_rtti_and_aot_tests MUST be compiled with /GR- (RTTI disabled)"
 #endif
 
+#include "aero/app/AeroAppHost.hpp"
 #include "aero/core/RsAliases.hpp"
 #include "aero/host/HostDrivers.hpp"
 #include "aero/host/NativeWindowHost.hpp"
@@ -625,6 +626,87 @@ void TestLiveAotExecutionAndHeadlessRenderWithoutInterpreter() {
     gAotApp = nullptr;
 }
 
+void TestSlimAppRuntimeArbcLoadNoRtti() {
+    std::cout << "[Test] Pure /GR- AeroGUI::AppRuntime .arbc load & headless render...\n";
+    namespace fs = std::filesystem;
+    const fs::path workDir = fs::path(AERO_TEST_TEMP_DIR) / "slim_arbc_test";
+    std::error_code ec;
+    fs::remove_all(workDir, ec);
+    fs::create_directories(workDir, ec);
+
+    const fs::path xamlPath = workDir / "MainWindow.xaml";
+    const fs::path rsPath = workDir / "MainWindow.rs";
+    const fs::path arbcPath = workDir / "slim_app.arbc";
+
+    const char* kXaml = R"XML(
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="Samples.SlimArbc.MainWindow"
+        Title="Slim ARBC Runtime"
+        Width="400"
+        Height="240"
+        Background="#FF101828">
+    <StackPanel Margin="20" Spacing="10">
+        <Border Background="#FF2563EB" CornerRadius="8" Padding="14,10">
+            <TextBlock Text="Pure AppRuntime ARBC" FontSize="18" Foreground="#FFFFFFFF" />
+        </Border>
+        <Rectangle Width="180" Height="28" Fill="#FF10B981" RadiusX="6" RadiusY="6" />
+    </StackPanel>
+</Window>
+)XML";
+    const char* kRs = R"RS(
+module Samples.SlimArbc;
+import Aero.UI;
+public partial class MainWindow : Window {
+    public MainWindow() {
+        this.InitializeComponent();
+    }
+}
+)RS";
+    Require(WriteTextFile(xamlPath, kXaml), "Failed to write slim ARBC XAML");
+    Require(WriteTextFile(rsPath, kRs), "Failed to write slim ARBC RS");
+
+    const std::string cmd =
+        "\"" + std::string(AERO_COMPILER_EXE) + "\" --xaml \"" + xamlPath.string() +
+        "\" --rs \"" + rsPath.string() +
+        "\" --stdlib \"" + std::string(AERO_STDLIB_DIR) +
+        "\" --stdlib-packages core --out-arbc \"" + arbcPath.string() +
+        "\" --no-cache";
+    Require(RunCommandDirect(cmd) == 0, "aero-compiler --out-arbc failed");
+    Require(fs::is_regular_file(arbcPath, ec), "Missing .arbc bundle file");
+
+    std::vector<std::uint8_t> arbcBytes;
+    {
+        std::ifstream in(arbcPath, std::ios::binary | std::ios::ate);
+        Require(in.is_open(), "Cannot open generated .arbc file");
+        const auto sz = in.tellg();
+        in.seekg(0, std::ios::beg);
+        arbcBytes.resize(static_cast<std::size_t>(sz));
+        in.read(reinterpret_cast<char*>(arbcBytes.data()), sz);
+    }
+    Require(arbcBytes.size() > 16u &&
+        arbcBytes[0] == 'A' && arbcBytes[1] == 'R' && arbcBytes[2] == 'B' && arbcBytes[3] == 'C',
+        "Generated bundle missing ARBC magic");
+
+    aero::AeroAppHostConfig cfg;
+    cfg.headless = true;
+    cfg.viewportWidth = 400u;
+    cfg.viewportHeight = 240u;
+
+    aero::AeroAppHost hostA(cfg);
+    Require(hostA.LoadProgramImageFile(arbcPath), "LoadProgramImageFile failed: " + hostA.LastError());
+    std::vector<std::uint8_t> rgbaA;
+    Require(hostA.RenderHeadlessRgba(400u, 240u, rgbaA), "RenderHeadlessRgba (file) failed");
+    Require(CountDistinctColors(rgbaA) >= 2u, "Slim ARBC frame rendered blank");
+
+    aero::AeroAppHost hostB(cfg);
+    Require(hostB.LoadProgramImageBytes(arbcBytes.data(), arbcBytes.size()),
+        "LoadProgramImageBytes failed: " + hostB.LastError());
+    std::vector<std::uint8_t> rgbaB;
+    Require(hostB.RenderHeadlessRgba(400u, 240u, rgbaB), "RenderHeadlessRgba (bytes) failed");
+    Require(rgbaA == rgbaB, "LoadProgramImageFile vs LoadProgramImageBytes pixels diverged");
+}
+
 } // namespace
 
 int main() {
@@ -635,6 +717,7 @@ int main() {
         std::cout << "[Skip] CLI --O2 --aot-cpp + cl.exe check skipped in pure interpreter mode (set AERO_TEST_ENABLE_AOT_OPT=1 to enable)\n";
     }
     TestLiveAotExecutionAndHeadlessRenderWithoutInterpreter();
+    TestSlimAppRuntimeArbcLoadNoRtti();
 
     if (gFailureCount > 0) {
         std::cerr << gFailureCount << " v3_slim_no_rtti_and_aot_tests assertion(s) failed.\n";

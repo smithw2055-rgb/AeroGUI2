@@ -11,6 +11,14 @@
 #include <thread>
 #include <type_traits>
 
+#if defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+#include <emmintrin.h>
+#define AERO_SW_SIMD_SSE2 1
+#elif defined(__ARM_NEON) || defined(__aarch64__) || defined(_M_ARM64)
+#include <arm_neon.h>
+#define AERO_SW_SIMD_NEON 1
+#endif
+
 #include "aero/asset/GradientBrush.hpp"
 #include "aero/asset/MtsdfPathBaker.hpp"
 #include "aero/core/UIResourceStore.hpp"
@@ -31,6 +39,8 @@ using aero::render::detail::SafeCeilToInt;
 using aero::render::detail::SafeFloorToInt;
 using aero::render::detail::SpanNeedsEffectPass;
 
+thread_local int gRasterBandX0 = 0;
+thread_local int gRasterBandX1 = 0x3FFFFFFF;
 thread_local int gRasterBandY0 = 0;
 thread_local int gRasterBandY1 = 0x3FFFFFFF;
 thread_local bool gInScanlineBand = false;
@@ -177,11 +187,33 @@ void BlendPixelOver(
     }
     const float invA = 1.0f - a;
     if (blendMode == BlendingMode::Normal) {
+#ifdef AERO_SW_SIMD_SSE2
+        const __m128 vSrc = _mm_set_ps(255.0f, static_cast<float>(srcB), static_cast<float>(srcG), static_cast<float>(srcR));
+        const __m128 vDst = _mm_set_ps(
+            static_cast<float>(dstRgba[3]),
+            static_cast<float>(dstRgba[2]),
+            static_cast<float>(dstRgba[1]),
+            static_cast<float>(dstRgba[0]));
+        const __m128 vA = _mm_set1_ps(a);
+        const __m128 vInvA = _mm_set1_ps(invA);
+        const __m128 vHalf = _mm_set1_ps(0.5f);
+        const __m128 vZero = _mm_setzero_ps();
+        const __m128 v255 = _mm_set1_ps(255.0f);
+        const __m128 sum = _mm_add_ps(_mm_add_ps(_mm_mul_ps(vSrc, vA), _mm_mul_ps(vDst, vInvA)), vHalf);
+        const __m128 clamped = _mm_min_ps(_mm_max_ps(sum, vZero), v255);
+        const __m128i i32 = _mm_cvttps_epi32(clamped);
+        const __m128i i16 = _mm_packs_epi32(i32, i32);
+        const __m128i u8 = _mm_packus_epi16(i16, i16);
+        const std::uint32_t packed = static_cast<std::uint32_t>(_mm_cvtsi128_si32(u8));
+        std::memcpy(dstRgba, &packed, 4u);
+        return;
+#else
         dstRgba[0] = static_cast<std::uint8_t>(std::clamp(static_cast<float>(srcR) * a + static_cast<float>(dstRgba[0]) * invA + 0.5f, 0.0f, 255.0f));
         dstRgba[1] = static_cast<std::uint8_t>(std::clamp(static_cast<float>(srcG) * a + static_cast<float>(dstRgba[1]) * invA + 0.5f, 0.0f, 255.0f));
         dstRgba[2] = static_cast<std::uint8_t>(std::clamp(static_cast<float>(srcB) * a + static_cast<float>(dstRgba[2]) * invA + 0.5f, 0.0f, 255.0f));
         dstRgba[3] = static_cast<std::uint8_t>(std::clamp(a * 255.0f + static_cast<float>(dstRgba[3]) * invA + 0.5f, 0.0f, 255.0f));
         return;
+#endif
     }
     const float sr = static_cast<float>(srcR) / 255.0f;
     const float sg = static_cast<float>(srcG) / 255.0f;
@@ -209,6 +241,48 @@ void BlendPixelOver(
     dstRgba[1] = static_cast<std::uint8_t>(std::clamp((bg * a + dg * invA) * 255.0f + 0.5f, 0.0f, 255.0f));
     dstRgba[2] = static_cast<std::uint8_t>(std::clamp((bb * a + db * invA) * 255.0f + 0.5f, 0.0f, 255.0f));
     dstRgba[3] = static_cast<std::uint8_t>(std::clamp(a * 255.0f + static_cast<float>(dstRgba[3]) * invA + 0.5f, 0.0f, 255.0f));
+}
+
+void BlendSpanOverNormalFast(
+    std::uint8_t* dstRgbaSpan,
+    int count,
+    std::uint8_t srcR,
+    std::uint8_t srcG,
+    std::uint8_t srcB,
+    float a) noexcept {
+    const float invA = 1.0f - a;
+#ifdef AERO_SW_SIMD_SSE2
+    const __m128 vSrc = _mm_mul_ps(
+        _mm_set_ps(255.0f, static_cast<float>(srcB), static_cast<float>(srcG), static_cast<float>(srcR)),
+        _mm_set1_ps(a));
+    const __m128 vSrcHalf = _mm_add_ps(vSrc, _mm_set1_ps(0.5f));
+    const __m128 vInvA = _mm_set1_ps(invA);
+    const __m128 vZero = _mm_setzero_ps();
+    const __m128 v255 = _mm_set1_ps(255.0f);
+    for (int i = 0; i < count; ++i) {
+        std::uint8_t* d = dstRgbaSpan + static_cast<std::size_t>(i) * 4u;
+        const __m128 vDst = _mm_set_ps(
+            static_cast<float>(d[3]),
+            static_cast<float>(d[2]),
+            static_cast<float>(d[1]),
+            static_cast<float>(d[0]));
+        const __m128 sum = _mm_add_ps(vSrcHalf, _mm_mul_ps(vDst, vInvA));
+        const __m128 clamped = _mm_min_ps(_mm_max_ps(sum, vZero), v255);
+        const __m128i i32 = _mm_cvttps_epi32(clamped);
+        const __m128i i16 = _mm_packs_epi32(i32, i32);
+        const __m128i u8 = _mm_packus_epi16(i16, i16);
+        const std::uint32_t packed = static_cast<std::uint32_t>(_mm_cvtsi128_si32(u8));
+        std::memcpy(d, &packed, 4u);
+    }
+#else
+    for (int i = 0; i < count; ++i) {
+        std::uint8_t* d = dstRgbaSpan + static_cast<std::size_t>(i) * 4u;
+        d[0] = static_cast<std::uint8_t>(std::clamp(static_cast<float>(srcR) * a + 0.5f + static_cast<float>(d[0]) * invA, 0.0f, 255.0f));
+        d[1] = static_cast<std::uint8_t>(std::clamp(static_cast<float>(srcG) * a + 0.5f + static_cast<float>(d[1]) * invA, 0.0f, 255.0f));
+        d[2] = static_cast<std::uint8_t>(std::clamp(static_cast<float>(srcB) * a + 0.5f + static_cast<float>(d[2]) * invA, 0.0f, 255.0f));
+        d[3] = static_cast<std::uint8_t>(std::clamp(a * 255.0f + 0.5f + static_cast<float>(d[3]) * invA, 0.0f, 255.0f));
+    }
+#endif
 }
 
 struct PremulOffscreenLayer {
@@ -896,9 +970,23 @@ void ApplySaturationPremulLayer(PremulOffscreenLayer& layer, float saturationVal
             continue;
         }
         const float lum = 0.2126f * px[0] + 0.7152f * px[1] + 0.0722f * px[2];
+#ifdef AERO_SW_SIMD_SSE2
+        const __m128 vLum = _mm_set1_ps(lum);
+        const __m128 vSat = _mm_set1_ps(sat);
+        const __m128 vPx = _mm_loadu_ps(px);
+        const __m128 vOut = _mm_min_ps(
+            _mm_max_ps(_mm_add_ps(vLum, _mm_mul_ps(vSat, _mm_sub_ps(vPx, vLum))), _mm_setzero_ps()),
+            _mm_set1_ps(pa));
+        alignas(16) float tmp[4];
+        _mm_store_ps(tmp, vOut);
+        px[0] = tmp[0];
+        px[1] = tmp[1];
+        px[2] = tmp[2];
+#else
         px[0] = std::clamp(lum + sat * (px[0] - lum), 0.0f, pa);
         px[1] = std::clamp(lum + sat * (px[1] - lum), 0.0f, pa);
         px[2] = std::clamp(lum + sat * (px[2] - lum), 0.0f, pa);
+#endif
     }
 }
 
@@ -1412,9 +1500,11 @@ void RasterizeSingleNode(
         clipMaxX = std::min(clipMaxX, optPremulLayer->originX + optPremulLayer->width);
         clipMaxY = std::min(clipMaxY, optPremulLayer->originY + optPremulLayer->height);
     }
+    const int effClipMinX = optPremulLayer ? clipMinX : std::max(clipMinX, gRasterBandX0);
+    const int effClipMaxX = optPremulLayer ? clipMaxX : std::min(clipMaxX, gRasterBandX1);
     const int effClipMinY = std::max(clipMinY, gRasterBandY0);
     const int effClipMaxY = std::min(clipMaxY, gRasterBandY1);
-    if (clipMaxX <= clipMinX || effClipMaxY <= effClipMinY) {
+    if (effClipMaxX <= effClipMinX || effClipMaxY <= effClipMinY) {
         return;
     }
 
@@ -1828,8 +1918,8 @@ void RasterizeSingleNode(
                 if (rowPxStart < rowPxEnd) {
                     narrowLinearInterval(baseSv, stepSvX, rowPxStart, rowPxEnd);
                 }
-                rowPxStart = std::max(pxStart, rowPxStart);
-                rowPxEnd = std::min(pxEnd, rowPxEnd);
+                rowPxStart = std::max(effClipMinX, rowPxStart);
+                rowPxEnd = std::min(effClipMaxX, rowPxEnd);
                 if (rowPxStart >= rowPxEnd) {
                     continue;
                 }
@@ -2047,6 +2137,10 @@ void RasterizeSingleNode(
                             auto* dst32 = reinterpret_cast<std::uint32_t*>(
                                 outRgba8 + (static_cast<std::size_t>(py) * viewportWidth + static_cast<std::size_t>(sdfInteriorX0)) * 4u);
                             std::fill_n(dst32, static_cast<std::size_t>(spanLen), packedPixel);
+                        } else if (nd->blendMode == BlendingMode::Normal) {
+                            std::uint8_t* dstSpan = outRgba8 +
+                                (static_cast<std::size_t>(py) * viewportWidth + static_cast<std::size_t>(sdfInteriorX0)) * 4u;
+                            BlendSpanOverNormalFast(dstSpan, spanLen, r8, g8, b8, baseAlpha);
                         } else {
                             std::uint8_t* dstSpan = outRgba8 +
                                 (static_cast<std::size_t>(py) * viewportWidth + static_cast<std::size_t>(sdfInteriorX0)) * 4u;
@@ -2413,6 +2507,29 @@ void RasterizeSingleNode(
                             const std::uint8_t* p10 = rowTexPtr0 + static_cast<std::size_t>(x1) * 4u;
                             const std::uint8_t* p01 = rowTexPtr1 + static_cast<std::size_t>(x0) * 4u;
                             const std::uint8_t* p11 = rowTexPtr1 + static_cast<std::size_t>(x1) * 4u;
+#ifdef AERO_SW_SIMD_SSE2
+                            auto loadRgbaFloat4 = [](const std::uint8_t* p) noexcept -> __m128 {
+                                return _mm_set_ps(
+                                    static_cast<float>(p[3]),
+                                    static_cast<float>(p[2]),
+                                    static_cast<float>(p[1]),
+                                    static_cast<float>(p[0]));
+                            };
+                            const __m128 v00 = loadRgbaFloat4(p00);
+                            const __m128 v10 = loadRgbaFloat4(p10);
+                            const __m128 v01 = loadRgbaFloat4(p01);
+                            const __m128 v11 = loadRgbaFloat4(p11);
+                            const __m128 vFx = _mm_set1_ps(fx);
+                            const __m128 vFy = _mm_set1_ps(rowTexFy);
+                            const __m128 vTop = _mm_add_ps(v00, _mm_mul_ps(_mm_sub_ps(v10, v00), vFx));
+                            const __m128 vBot = _mm_add_ps(v01, _mm_mul_ps(_mm_sub_ps(v11, v01), vFx));
+                            const __m128 vOut = _mm_mul_ps(
+                                _mm_add_ps(vTop, _mm_mul_ps(_mm_sub_ps(vBot, vTop), vFy)),
+                                _mm_set1_ps(kInv255));
+                            alignas(16) float ch[4];
+                            _mm_store_ps(ch, vOut);
+                            texel = Color{ch[0], ch[1], ch[2], ch[3]};
+#else
                             auto bilerpRowCh = [&](std::size_t ch) noexcept -> float {
                                 const float c00 = static_cast<float>(p00[ch]);
                                 const float c10 = static_cast<float>(p10[ch]);
@@ -2423,6 +2540,7 @@ void RasterizeSingleNode(
                                 return (top + (bot - top) * rowTexFy) * kInv255;
                             };
                             texel = Color{bilerpRowCh(0u), bilerpRowCh(1u), bilerpRowCh(2u), bilerpRowCh(3u)};
+#endif
                         }
                     } else if (hasBoundTexture) {
                         const float topV = v0.v + su * (v1.v - v0.v);
@@ -3511,6 +3629,215 @@ bool ZeroCopyGpuStream::ComputeBackdropBlurPatchPremulRgba8(
     outPatchW = pw;
     outPatchH = ph;
     return true;
+}
+
+void ZeroCopyGpuStream::RasterizeTreeDirtyRectsToRgba8(
+    const PagedRenderTree& tree,
+    std::uint32_t viewportWidth,
+    std::uint32_t viewportHeight,
+    const std::vector<Rect>& dirtyRects,
+    std::vector<std::uint8_t>& ioRgba8,
+    Color clearColor,
+    SoftwareDirtyRectStats* outStats) {
+    SoftwareDirtyRectStats stats{};
+    if (viewportWidth == 0u || viewportHeight == 0u) {
+        ioRgba8.clear();
+        if (outStats) *outStats = stats;
+        return;
+    }
+
+    const std::size_t pixelCount =
+        static_cast<std::size_t>(viewportWidth) * static_cast<std::size_t>(viewportHeight);
+    constexpr std::uint32_t kTileSize = 64u;
+    const std::uint32_t tilesX = (viewportWidth + kTileSize - 1u) / kTileSize;
+    const std::uint32_t tilesY = (viewportHeight + kTileSize - 1u) / kTileSize;
+    const std::uint32_t totalTiles = tilesX * tilesY;
+    stats.totalTiles = totalTiles;
+
+    const bool canPartial =
+        (ioRgba8.size() == pixelCount * 4u) &&
+        tree.BlurLayerSpans().empty() &&
+        totalTiles > 0u;
+    if (!canPartial) {
+        stats.dirtyTiles = totalTiles;
+        stats.mergedStrips = (totalTiles > 0u) ? 1u : 0u;
+        stats.fellBackToFullFrame = true;
+        RasterizeTreeToRgba8(tree, viewportWidth, viewportHeight, ioRgba8, clearColor);
+        if (outStats) *outStats = stats;
+        return;
+    }
+
+    if (dirtyRects.empty()) {
+        if (outStats) *outStats = stats;
+        return;
+    }
+
+    thread_local std::vector<std::uint8_t> tlDirtyTiles;
+    tlDirtyTiles.assign(totalTiles, 0u);
+    const int vpW = static_cast<int>(std::min<std::uint32_t>(viewportWidth, 0x3FFFFFFFu));
+    const int vpH = static_cast<int>(std::min<std::uint32_t>(viewportHeight, 0x3FFFFFFFu));
+
+    std::uint32_t dirtyTileCount = 0u;
+    for (const Rect& dr : dirtyRects) {
+        if (!std::isfinite(dr.x) || !std::isfinite(dr.y) ||
+            !std::isfinite(dr.width) || !std::isfinite(dr.height) ||
+            dr.width <= 0.0f || dr.height <= 0.0f) {
+            continue;
+        }
+        const int rx0 = SafeFloorToInt(dr.x - 1.0f, 0, vpW);
+        const int ry0 = SafeFloorToInt(dr.y - 1.0f, 0, vpH);
+        const int rx1 = SafeCeilToInt(dr.x + dr.width + 1.0f, 0, vpW);
+        const int ry1 = SafeCeilToInt(dr.y + dr.height + 1.0f, 0, vpH);
+        if (rx1 <= rx0 || ry1 <= ry0) {
+            continue;
+        }
+        const std::uint32_t tx0 = static_cast<std::uint32_t>(rx0) / kTileSize;
+        const std::uint32_t tx1 = static_cast<std::uint32_t>(rx1 - 1) / kTileSize;
+        const std::uint32_t ty0 = static_cast<std::uint32_t>(ry0) / kTileSize;
+        const std::uint32_t ty1 = static_cast<std::uint32_t>(ry1 - 1) / kTileSize;
+        for (std::uint32_t ty = ty0; ty <= ty1 && ty < tilesY; ++ty) {
+            const std::size_t rowBase = static_cast<std::size_t>(ty) * tilesX;
+            for (std::uint32_t tx = tx0; tx <= tx1 && tx < tilesX; ++tx) {
+                if (tlDirtyTiles[rowBase + tx] == 0u) {
+                    tlDirtyTiles[rowBase + tx] = 1u;
+                    ++dirtyTileCount;
+                }
+            }
+        }
+    }
+
+    stats.dirtyTiles = dirtyTileCount;
+    if (dirtyTileCount == 0u) {
+        if (outStats) *outStats = stats;
+        return;
+    }
+
+    if (static_cast<double>(dirtyTileCount) > 0.65 * static_cast<double>(totalTiles)) {
+        stats.mergedStrips = 1u;
+        stats.fellBackToFullFrame = true;
+        RasterizeTreeToRgba8(tree, viewportWidth, viewportHeight, ioRgba8, clearColor);
+        if (outStats) *outStats = stats;
+        return;
+    }
+
+    ScopedBandTexCacheGuard rootTexGuard;
+
+    const std::uint32_t clearPacked = PackColorRgba8(clearColor, 1.0f);
+    const std::uint32_t nNodes = static_cast<std::uint32_t>(tree.NodeCount());
+    const std::size_t totalPages = tree.PageCount();
+    struct NodePxBounds {
+        int x0 = 1;
+        int y0 = 1;
+        int x1 = 0;
+        int y1 = 0;
+    };
+    thread_local std::vector<NodePxBounds> tlNodeBounds;
+    tlNodeBounds.resize(nNodes);
+    for (std::uint32_t ni = 0u; ni < nNodes; ++ni) {
+        const RenderNodeDescriptor* nd = tree.GetNode(ni);
+        if (!nd || nd->pageIndex >= totalPages || !std::isfinite(nd->opacity) || nd->opacity <= 0.001f) {
+            tlNodeBounds[ni] = NodePxBounds{};
+            continue;
+        }
+        const CommandPage& page = tree.GetPage(nd->pageIndex);
+        const bool clipOn = (page.header.flags & CommandPageFlag_ScissorClipActive) != 0u;
+        if (clipOn &&
+            (!std::isfinite(page.header.clipX) || !std::isfinite(page.header.clipY) ||
+             !std::isfinite(page.header.clipW) || !std::isfinite(page.header.clipH))) {
+            tlNodeBounds[ni] = NodePxBounds{};
+            continue;
+        }
+        const int cMinX = clipOn ? SafeCeilToInt(page.header.clipX - 0.5f, 0, vpW) : 0;
+        const int cMinY = clipOn ? SafeCeilToInt(page.header.clipY - 0.5f, 0, vpH) : 0;
+        const int cMaxX = clipOn
+            ? SafeCeilToInt(page.header.clipX + std::max(0.0f, page.header.clipW) - 0.5f, 0, vpW)
+            : vpW;
+        const int cMaxY = clipOn
+            ? SafeCeilToInt(page.header.clipY + std::max(0.0f, page.header.clipH) - 0.5f, 0, vpH)
+            : vpH;
+        if (cMaxX <= cMinX || cMaxY <= cMinY) {
+            tlNodeBounds[ni] = NodePxBounds{};
+            continue;
+        }
+        const std::size_t quadCount = nd->vertexCount / 4u;
+        int bX0 = vpW, bY0 = vpH, bX1 = 0, bY1 = 0;
+        for (std::size_t q = 0u; q < quadCount; ++q) {
+            const std::size_t vIdx = nd->vertexOffsetInPage + q * 4u;
+            if (vIdx + 4u > kVerticesPerCommandPage) break;
+            const AeroVertex& v0 = page.vertices[vIdx + 0u];
+            const AeroVertex& v1 = page.vertices[vIdx + 1u];
+            const AeroVertex& v2 = page.vertices[vIdx + 2u];
+            const AeroVertex& v3 = page.vertices[vIdx + 3u];
+            if (((v0.rgba | v1.rgba | v2.rgba | v3.rgba) & 0xFF000000u) == 0u) continue;
+            if (!std::isfinite(v0.x) || !std::isfinite(v0.y) ||
+                !std::isfinite(v1.x) || !std::isfinite(v1.y) ||
+                !std::isfinite(v2.x) || !std::isfinite(v2.y) ||
+                !std::isfinite(v3.x) || !std::isfinite(v3.y)) continue;
+            const float qMinX = std::min(std::min(v0.x, v1.x), std::min(v2.x, v3.x));
+            const float qMaxX = std::max(std::max(v0.x, v1.x), std::max(v2.x, v3.x));
+            const float qMinY = std::min(std::min(v0.y, v1.y), std::min(v2.y, v3.y));
+            const float qMaxY = std::max(std::max(v0.y, v1.y), std::max(v2.y, v3.y));
+            bX0 = std::min(bX0, SafeFloorToInt(qMinX, cMinX, cMaxX));
+            bX1 = std::max(bX1, SafeCeilToInt(qMaxX, cMinX, cMaxX));
+            bY0 = std::min(bY0, SafeFloorToInt(qMinY, cMinY, cMaxY));
+            bY1 = std::max(bY1, SafeCeilToInt(qMaxY, cMinY, cMaxY));
+        }
+        tlNodeBounds[ni] = NodePxBounds{bX0, bY0, bX1, bY1};
+    }
+
+    const int prevX0 = gRasterBandX0;
+    const int prevX1 = gRasterBandX1;
+    const int prevY0 = gRasterBandY0;
+    const int prevY1 = gRasterBandY1;
+    std::uint8_t* rawOut = ioRgba8.data();
+    const std::size_t rowStrideBytes = static_cast<std::size_t>(viewportWidth) * 4u;
+
+    for (std::uint32_t ty = 0u; ty < tilesY; ++ty) {
+        const std::size_t rowBase = static_cast<std::size_t>(ty) * tilesX;
+        const int sy0 = static_cast<int>(ty * kTileSize);
+        const int sy1 = std::min(vpH, static_cast<int>((ty + 1u) * kTileSize));
+        std::uint32_t tx = 0u;
+        while (tx < tilesX) {
+            if (tlDirtyTiles[rowBase + tx] == 0u) {
+                ++tx;
+                continue;
+            }
+            const std::uint32_t txStart = tx;
+            while (tx < tilesX && tlDirtyTiles[rowBase + tx] != 0u) {
+                ++tx;
+            }
+            const int sx0 = static_cast<int>(txStart * kTileSize);
+            const int sx1 = std::min(vpW, static_cast<int>(tx * kTileSize));
+            if (sx1 <= sx0 || sy1 <= sy0) {
+                continue;
+            }
+            stats.mergedStrips += 1u;
+
+            const std::size_t stripCols = static_cast<std::size_t>(sx1 - sx0);
+            for (int py = sy0; py < sy1; ++py) {
+                auto* dst32 = reinterpret_cast<std::uint32_t*>(
+                    rawOut + static_cast<std::size_t>(py) * rowStrideBytes + static_cast<std::size_t>(sx0) * 4u);
+                std::fill_n(dst32, stripCols, clearPacked);
+            }
+
+            gRasterBandX0 = sx0;
+            gRasterBandX1 = sx1;
+            gRasterBandY0 = sy0;
+            gRasterBandY1 = sy1;
+            for (std::uint32_t ni = 0u; ni < nNodes; ++ni) {
+                const NodePxBounds& nb = tlNodeBounds[ni];
+                if (nb.x1 > sx0 && nb.x0 < sx1 && nb.y1 > sy0 && nb.y0 < sy1) {
+                    RasterizeSingleNode(tree, ni, viewportWidth, viewportHeight, rawOut, nullptr);
+                }
+            }
+        }
+    }
+
+    gRasterBandX0 = prevX0;
+    gRasterBandX1 = prevX1;
+    gRasterBandY0 = prevY0;
+    gRasterBandY1 = prevY1;
+    if (outStats) *outStats = stats;
 }
 
 } // namespace aero

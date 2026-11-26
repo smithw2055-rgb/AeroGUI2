@@ -1219,21 +1219,20 @@ void PagedRenderTree::Clear() noexcept {
     treeId_ = gNextRenderTreeId.fetch_add(1u, std::memory_order_relaxed);
 }
 
-bool PagedRenderTree::TryGetPageScreenBounds(std::size_t pageIdx, Rect& outBounds) noexcept {
-    if (pageIdx >= pages_.size() || pageIdx >= pageBoundsState_.size() || pageIdx >= pageScreenBounds_.size()) {
+bool PagedRenderTree::ComputePageScreenBoundsConst(std::size_t pageIdx, Rect& outBounds) const noexcept {
+    if (pageIdx >= pages_.size()) {
         return false;
     }
-    if (pageBoundsState_[pageIdx] == 1u) {
+    if (pageIdx < pageBoundsState_.size() && pageBoundsState_[pageIdx] == 1u) {
         outBounds = pageScreenBounds_[pageIdx];
         return true;
     }
-    if (pageBoundsState_[pageIdx] == 0u) {
+    if (pageIdx < pageBoundsState_.size() && pageBoundsState_[pageIdx] == 0u) {
         return false;
     }
     const CommandPage& pg = pages_[pageIdx];
     const std::size_t vCount = std::min<std::size_t>(pg.header.vertexCount, kVerticesPerCommandPage);
     if (vCount == 0u) {
-        pageBoundsState_[pageIdx] = 0u;
         return false;
     }
     float minX = 1e30f;
@@ -1255,10 +1254,27 @@ bool PagedRenderTree::TryGetPageScreenBounds(std::size_t pageIdx, Rect& outBound
         }
     }
     if (!anyOpaque || maxX < minX || maxY < minY) {
-        pageBoundsState_[pageIdx] = 0u;
         return false;
     }
     outBounds = Rect{minX, minY, std::max(0.1f, maxX - minX), std::max(0.1f, maxY - minY)};
+    return true;
+}
+
+bool PagedRenderTree::TryGetPageScreenBounds(std::size_t pageIdx, Rect& outBounds) noexcept {
+    if (pageIdx >= pages_.size() || pageIdx >= pageBoundsState_.size() || pageIdx >= pageScreenBounds_.size()) {
+        return false;
+    }
+    if (pageBoundsState_[pageIdx] == 1u) {
+        outBounds = pageScreenBounds_[pageIdx];
+        return true;
+    }
+    if (pageBoundsState_[pageIdx] == 0u) {
+        return false;
+    }
+    if (!ComputePageScreenBoundsConst(pageIdx, outBounds)) {
+        pageBoundsState_[pageIdx] = 0u;
+        return false;
+    }
     pageScreenBounds_[pageIdx] = outBounds;
     pageBoundsState_[pageIdx] = 1u;
     return true;
@@ -1269,10 +1285,22 @@ std::uint32_t PagedRenderTree::EnsurePageForAllocation(
     const Rect& clipRect,
     bool clipActive,
     std::uint32_t textureId) {
+    bool effectiveClipActive = clipActive;
+    if (effectiveClipActive &&
+        hasHintNextBounds_ &&
+        hintNextBounds_.width > 0.0f &&
+        hintNextBounds_.height > 0.0f &&
+        (hintNextBounds_.x - 1.0f >= clipRect.x) &&
+        (hintNextBounds_.y - 1.0f >= clipRect.y) &&
+        (hintNextBounds_.x + hintNextBounds_.width + 1.0f <= clipRect.x + clipRect.width) &&
+        (hintNextBounds_.y + hintNextBounds_.height + 1.0f <= clipRect.y + clipRect.height)) {
+        effectiveClipActive = false;
+    }
+
     const auto desiredBlend = static_cast<std::uint32_t>(activeBlendMode_);
     auto pageMatchesState = [&](const CommandPage& pg) noexcept -> bool {
         return (pg.header.vertexCount + neededVertices <= kVerticesPerCommandPage) &&
-               SameClipRect(pg.header, clipRect, clipActive) &&
+               SameClipRect(pg.header, clipRect, effectiveClipActive) &&
                (pg.header.reserved[0] == textureId) &&
                (pg.header.reserved[1] == desiredBlend);
     };
@@ -1301,6 +1329,9 @@ std::uint32_t PagedRenderTree::EnsurePageForAllocation(
                 }
                 return static_cast<std::uint32_t>(idx);
             }
+            if (pages_[idx].header.vertexCount == 0u) {
+                continue;
+            }
             Rect pb{};
             if (!TryGetPageScreenBounds(idx, pb)) {
                 break;
@@ -1322,7 +1353,7 @@ std::uint32_t PagedRenderTree::EnsurePageForAllocation(
     newPage.header.firstNodeId = static_cast<std::uint32_t>(nodes_.size());
     newPage.header.reserved[0] = textureId;
     newPage.header.reserved[1] = desiredBlend;
-    if (clipActive) {
+    if (effectiveClipActive) {
         newPage.header.clipX = clipRect.x;
         newPage.header.clipY = clipRect.y;
         newPage.header.clipW = clipRect.width;

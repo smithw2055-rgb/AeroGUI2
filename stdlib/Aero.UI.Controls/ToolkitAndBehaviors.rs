@@ -1449,22 +1449,37 @@ public class RiveControl : Control {
             reqW = (float)tw;
             reqH = (float)th;
         }
-        if (!_cachedHasInlineQuery &&
-            _imageView.ApplyRiveDirect(
-                cleanSrc,
-                _instanceId,
-                _animTime,
-                _stateTime,
-                reqW,
-                reqH,
-                _stretch,
-                _inputs,
-                _inputsDirty)) {
-            _inputsDirty = false;
-            if (Visibility == Visibility.Visible) {
-                Host_RequestRenderWake();
+        if (!_cachedHasInlineQuery) {
+            string[] rNames = null;
+            DependencyObject[] rVals = null;
+            if (_inputsDirty && _inputs != null && _inputs.Length > 0) {
+                rNames = new string[_inputs.Length];
+                rVals = new DependencyObject[_inputs.Length];
+                for (int riIdx = 0; riIdx < _inputs.Length; riIdx += 1) {
+                    RiveInput ri = _inputs[riIdx];
+                    if (ri != null) {
+                        rNames[riIdx] = ri.InputName;
+                        rVals[riIdx] = ri.InputValueBox;
+                    }
+                }
             }
-            return;
+            if (_imageView.ApplyRiveDirect(
+                    cleanSrc,
+                    _instanceId,
+                    _animTime,
+                    _stateTime,
+                    reqW,
+                    reqH,
+                    _stretch,
+                    rNames,
+                    rVals,
+                    _inputsDirty)) {
+                _inputsDirty = false;
+                if (Visibility == Visibility.Visible) {
+                    Host_RequestRenderWake();
+                }
+                return;
+            }
         }
         string inp = BuildInputsQuery();
         if (inp != _lastInputsSig) {
@@ -1728,7 +1743,7 @@ public class ComparisonCondition : DependencyObject {
     }
 }
 
-public class BehaviorTriggerBase : DependencyObject {
+public class BehaviorTriggerBase : DependencyObject, IBehaviorTrigger {
     private TriggerAction[] _actions;
     private ComparisonCondition[] _conditions;
 
@@ -2924,6 +2939,11 @@ public static class DragDrop {
     private static float _dragAdornerHalfW = 56.0f;
     private static float _dragAdornerHalfH = 56.0f;
     private static bool _hookInstalled = false;
+
+    internal static bool IsElementInActiveDrag(UIElement el) {
+        if (el == null) { return false; }
+        return el == _selectedSource || (_isDragging && el == _pressCandidate);
+    }
 
     public static void EnsureInstalled() {
         if (_hookInstalled) { return; }

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -614,6 +615,9 @@ public:
     [[nodiscard]] const GpuBackendTelemetry& Telemetry() const noexcept override {
         return telemetry_;
     }
+    [[nodiscard]] const SoftwareDirtyRectStats& LastDirtyRasterStats() const noexcept {
+        return lastDirtyStats_;
+    }
 
 private:
     ShaderBackend shaderBackend_ = ShaderBackend::DesktopGL33;
@@ -628,6 +632,15 @@ private:
     std::uint32_t lastRenderedTreeId_ = 0xFFFFFFFFu;
     std::size_t lastRenderedNodeCount_ = 0u;
     Color lastClearColor_{0.0f, 0.0f, 0.0f, 0.0f};
+    struct CachedQuadSnapshot {
+        std::uint64_t vertexHash = 0u;
+        Rect bounds{};
+        bool valid = false;
+    };
+    std::vector<std::pair<bool, Rect>> lastPageBounds_;
+    std::vector<std::uint32_t> lastPageRevisions_;
+    std::vector<std::array<CachedQuadSnapshot, 64u>> lastPageQuads_;
+    SoftwareDirtyRectStats lastDirtyStats_{};
 
     mutable std::vector<std::uint32_t> quadIndexMirror_;
     std::vector<std::uint8_t> atlasRgba8_;

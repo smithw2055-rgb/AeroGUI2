@@ -121,9 +121,137 @@ void PrintUsage() {
         "  --O0                      Disable MIR optimization (for --emit-stdlib-dll-cpp)\n"
         "  --no-stdlib               Do not auto-load Aero.Native / Aero.UI stdlib pack\n"
         "  --stdlib <dir>            Path to stdlib root directory\n"
+        "  --stdlib-packages <list>  Select stdlib packages (auto|core|controls|runtimexaml|workbench|gamehud|all)\n"
+        "  --sample-dir <dir>        Discover XAML/script/asset inputs from a sample directory\n"
+        "  --compiled-xaml-catalog   Compile Data/Samples, Theme brushes, and Language dictionaries into catalog\n"
+        "  --out-arbc <file.arbc>    Write linked precompiled ARBC bytecode bundle\n"
         "  --cache-dir <dir>         Directory for persistent stdlib module cache\n"
         "  --no-cache                Disable persistent disk cache (overrides AERO_CACHE_DIR)\n"
         "  -h, --help                Show this help\n");
+}
+
+[[nodiscard]] bool ParseStdlibPackageCsv(std::string_view spec, std::uint32_t& outFlags) noexcept {
+    if (spec.empty() || aero::str::EqualsIgnoreCase(spec, "auto")) {
+        outFlags = aero::AeroStdlibPkg_Auto;
+        return true;
+    }
+    std::uint32_t flags = 0u;
+    std::size_t pos = 0u;
+    while (pos < spec.size()) {
+        const std::size_t comma = spec.find(',', pos);
+        const std::string_view token = aero::str::Trim(
+            comma == std::string_view::npos ? spec.substr(pos) : spec.substr(pos, comma - pos));
+        if (!token.empty()) {
+            if (aero::str::EqualsIgnoreCase(token, "core")) {
+                flags |= aero::AeroStdlibPkg_Core;
+            } else if (aero::str::EqualsIgnoreCase(token, "controls")) {
+                flags |= aero::AeroStdlibPkg_Controls;
+            } else if (aero::str::EqualsIgnoreCase(token, "runtimexaml") ||
+                       aero::str::EqualsIgnoreCase(token, "runtime_xaml")) {
+                flags |= aero::AeroStdlibPkg_RuntimeXaml;
+            } else if (aero::str::EqualsIgnoreCase(token, "workbench")) {
+                flags |= aero::AeroStdlibPkg_Workbench;
+            } else if (aero::str::EqualsIgnoreCase(token, "gamehud") ||
+                       aero::str::EqualsIgnoreCase(token, "game_hud")) {
+                flags |= aero::AeroStdlibPkg_GameHud | aero::AeroStdlibPkg_Core;
+            } else if (aero::str::EqualsIgnoreCase(token, "all")) {
+                flags |= aero::AeroStdlibPkg_All;
+            } else {
+                return false;
+            }
+        }
+        if (comma == std::string_view::npos) {
+            break;
+        }
+        pos = comma + 1u;
+    }
+    outFlags = flags;
+    return true;
+}
+
+void DiscoverCompilerSampleDir(
+    const std::filesystem::path& sampleDir,
+    std::vector<std::string>& ioXamlFiles,
+    std::vector<std::string>& ioScriptFiles,
+    aero::AeroV3CompileInput& ioInput) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    if (sampleDir.empty() || !fs::is_directory(sampleDir, ec)) {
+        return;
+    }
+    const fs::path root = sampleDir.lexically_normal();
+    if (ioInput.resourceSearchRoot.empty()) {
+        ioInput.resourceSearchRoot = root.generic_string();
+    }
+    auto toLower = [](std::string_view s) {
+        std::string out(s);
+        for (char& ch : out) {
+            if (ch >= 'A' && ch <= 'Z') {
+                ch = static_cast<char>(ch - 'A' + 'a');
+            }
+        }
+        return out;
+    };
+    auto addDir = [&](const fs::path& d) {
+        std::error_code dEc;
+        if (!fs::is_directory(d, dEc)) {
+            return;
+        }
+        const std::string s = d.lexically_normal().generic_string();
+        if (std::find(ioInput.resourceSearchPaths.begin(), ioInput.resourceSearchPaths.end(), s) ==
+            ioInput.resourceSearchPaths.end()) {
+            ioInput.resourceSearchPaths.push_back(s);
+        }
+    };
+    addDir(root);
+    addDir(root / "Data");
+    addDir(root / "Data" / "Theme");
+    addDir(root / "Data" / "Samples");
+    fs::path probe = fs::absolute(root, ec);
+    if (ec || probe.empty()) {
+        probe = root;
+    }
+    for (int up = 0; up < 5 && !probe.empty(); ++up) {
+        addDir(probe / "Theme" / "Data");
+        addDir(probe / "Theme" / "Data" / "Theme");
+        addDir(probe / "Samples" / "Theme" / "Data");
+        addDir(probe / "Samples" / "Theme" / "Data" / "Theme");
+        const fs::path parent = probe.parent_path();
+        if (parent == probe) {
+            break;
+        }
+        probe = parent;
+    }
+
+    for (const auto& entry : fs::recursive_directory_iterator(root, ec)) {
+        if (ec || !entry.is_regular_file(ec)) {
+            continue;
+        }
+        const fs::path p = entry.path().lexically_normal();
+        const std::string ext = p.extension().string();
+        const std::string fname = p.filename().string();
+        const std::string lowerRel = toLower(p.lexically_relative(root).generic_string());
+        if (aero::str::EqualsIgnoreCase(ext, ".xaml")) {
+            if (aero::str::StartsWith(lowerRel, "data/samples/") ||
+                aero::str::StartsWith(lowerRel, "samples/") ||
+                aero::str::StartsWith(lowerRel, "data/theme/") ||
+                aero::str::StartsWith(lowerRel, "theme/") ||
+                aero::str::StartsWith(lowerRel, "data/pagepreviews/") ||
+                aero::str::StartsWith(lowerRel, "pagepreviews/") ||
+                aero::str::StartsWith(lowerRel, "data/controls/") ||
+                aero::str::StartsWith(lowerRel, "controls/") ||
+                aero::str::EqualsIgnoreCase(fname, "Resources.xaml") ||
+                aero::str::StartsWith(toLower(fname), "language-")) {
+                continue;
+            }
+            ioXamlFiles.push_back(p.generic_string());
+        } else if ((aero::str::EqualsIgnoreCase(ext, ".rs") || aero::str::EqualsIgnoreCase(ext, ".cs")) &&
+                   !aero::str::EndsWith(toLower(fname), ".g.rs")) {
+            ioScriptFiles.push_back(p.generic_string());
+        }
+    }
+    std::sort(ioXamlFiles.begin(), ioXamlFiles.end());
+    std::sort(ioScriptFiles.begin(), ioScriptFiles.end());
 }
 
 [[nodiscard]] std::string RewriteAotHeaderInclude(
@@ -347,9 +475,12 @@ int main(int argc, char** argv) {
     std::vector<std::string> scriptPaths;
     std::string outRsPath;
     std::string outDirPath;
+    std::string outArbcPath;
     std::string aotCppPath;
     std::string emitStdlibDllCppPath;
+    std::string sampleDirPath;
     std::string explicitCacheDir;
+    bool compiledXamlCatalog = false;
     bool noCache = false;
     bool optO0 = false;
     bool optO2 = false;
@@ -413,6 +544,23 @@ int main(int argc, char** argv) {
             const char* v = needNext(arg);
             if (!v) return 2;
             input.stdlibRootDir = v;
+        } else if (arg == "--stdlib-packages") {
+            const char* v = needNext(arg);
+            if (!v) return 2;
+            if (!ParseStdlibPackageCsv(v, input.stdlibPackages)) {
+                std::cerr << "Invalid --stdlib-packages value: " << v << "\n";
+                return 2;
+            }
+        } else if (arg == "--sample-dir") {
+            const char* v = needNext(arg);
+            if (!v) return 2;
+            sampleDirPath = v;
+        } else if (arg == "--compiled-xaml-catalog") {
+            compiledXamlCatalog = true;
+        } else if (arg == "--out-arbc") {
+            const char* v = needNext(arg);
+            if (!v) return 2;
+            outArbcPath = v;
         } else if (arg == "--no-stdlib") {
             input.includeStdlib = false;
         } else if (arg == "--cache-dir") {
@@ -431,6 +579,13 @@ int main(int argc, char** argv) {
     if (!emitStdlibDllCppPath.empty()) {
         const bool enableStdlibO2 = optO0 ? false : (optO2 ? true : true);
         return EmitStdlibDllCppFile(emitStdlibDllCppPath, input.stdlibRootDir, enableStdlibO2);
+    }
+
+    if (!sampleDirPath.empty()) {
+        DiscoverCompilerSampleDir(sampleDirPath, xamlFilePaths, scriptPaths, input);
+        if (compiledXamlCatalog) {
+            aero::CollectCatalogXamlEntries(sampleDirPath, input.catalogXamlSources);
+        }
     }
 
     if (xamlFilePaths.empty() && scriptPaths.empty()) {
@@ -533,6 +688,13 @@ int main(int argc, char** argv) {
                 outDir / (stem + ".rsb"),
                 result.programImageBytes.data(),
                 result.programImageBytes.size());
+        }
+    }
+
+    if (!outArbcPath.empty() && !result.programImageBytes.empty()) {
+        if (!WriteFileBytes(outArbcPath, result.programImageBytes.data(), result.programImageBytes.size())) {
+            std::cerr << "Failed to write ARBC bytecode bundle: " << outArbcPath << "\n";
+            return 1;
         }
     }
 

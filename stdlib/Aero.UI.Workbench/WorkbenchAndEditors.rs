@@ -2455,3 +2455,17 @@ public class NodeGraphCanvas : Control {
         e.Handled = true;
     }
 }
+
+public static void __RegisterWorkbenchXamlFactories() {
+    XamlElementFactoryRegistry.Register("NumericScrubber", () => { return new NumericScrubber(); });
+    XamlElementFactoryRegistry.Register("Vector2Field", () => { return new Vector2Field(); });
+    XamlElementFactoryRegistry.Register("Vector3Field", () => { return new Vector3Field(); });
+    XamlElementFactoryRegistry.Register("ViewportSurface", () => { return new ViewportSurface(); });
+    XamlElementFactoryRegistry.Register("DockPane", () => { return new DockPane(); });
+    XamlElementFactoryRegistry.Register("DockTabGroup", () => { return new DockTabGroup(); });
+    XamlElementFactoryRegistry.Register("DockSplitNode", () => { return new DockSplitNode(); });
+    XamlElementFactoryRegistry.Register("DockingWorkspace", () => { return new DockingWorkspace(); });
+    XamlElementFactoryRegistry.Register("CodeEditorView", () => { return new CodeEditorView(); });
+    XamlElementFactoryRegistry.Register("PropertyGrid", () => { return new PropertyGrid(); });
+    XamlElementFactoryRegistry.Register("NodeGraphCanvas", () => { return new NodeGraphCanvas(); });
+}

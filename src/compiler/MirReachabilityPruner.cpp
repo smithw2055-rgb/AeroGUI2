@@ -463,6 +463,32 @@ bool PruneUnreachableStdlibMir(
     std::vector<SymbolId> typeQueue;
     std::vector<SymbolId> funcQueue;
 
+    auto isWorkbenchControlName = [](std::string_view name) noexcept -> bool {
+        return name == "PropertyGrid" ||
+               name == "DataGrid" ||
+               name == "InspectorPanel" ||
+               name == "CodeEditor" ||
+               name == "CodeEditorView" ||
+               name == "Viewport3D" ||
+               name == "ViewportSurface" ||
+               name == "TimelineEditor" ||
+               name == "NodeGraphEditor" ||
+               name == "NodeGraphCanvas" ||
+               name == "CurveEditor" ||
+               name == "AssetBrowser" ||
+               name == "DockLayout" ||
+               name == "DockPane" ||
+               name == "DockTabGroup" ||
+               name == "DockSplitNode" ||
+               name == "DockingWorkspace" ||
+               name == "TreeListView" ||
+               name == "NumericScrubber" ||
+               name == "Vector2Field" ||
+               name == "Vector3Field" ||
+               name == "RiveControl";
+    };
+    bool workbenchFactoriesSeeded = false;
+
     auto markTypeId = [&](SymbolId id) {
         while (id != 0u) {
             if (typeById.find(id) != typeById.end()) {
@@ -669,6 +695,13 @@ bool PruneUnreachableStdlibMir(
                 continue;
             }
             const rs_sem::TypeSymbol& type = *tIt->second;
+
+            if (!workbenchFactoriesSeeded &&
+                (type.name == "XamlReader" || isWorkbenchControlName(type.name))) {
+                workbenchFactoriesSeeded = true;
+                markFuncByName("Aero.UI::__RegisterWorkbenchXamlFactories");
+                markFuncByName("__RegisterWorkbenchXamlFactories");
+            }
 
             markTypeId(type.baseTypeId);
             markTypeByName(type.baseTypeName, type.moduleName);

@@ -78,6 +78,12 @@ struct AeroStencilJitStats {
     const std::filesystem::path& sampleDir,
     AeroV3CompileInput& outCompileInput,
     AeroAppHostConfig& outHostConfig);
+
+/// Discovers catalog XAML files (Data/Samples/*.xaml, Theme/NoesisTheme.Brushes.*.xaml,
+/// Localization/Data/Language-*.xaml) for build-time CompiledXamlCatalog emission.
+void DiscoverCatalogXamlSources(
+    const std::filesystem::path& sampleDir,
+    std::vector<CatalogXamlEntry>& outCatalogEntries);
 #endif
 
 class AeroAppHost final {
@@ -95,10 +101,29 @@ public:
     [[nodiscard]] bool InitializeRuntime();
     [[nodiscard]] bool IsInitialized() const noexcept { return initialized_; }
 
-    // Execution backend 1: Bytecode ProgramImage
+    // Execution backend 1: Bytecode ProgramImage / precompiled .arbc bundle
     [[nodiscard]] bool LoadProgramImage(
         std::shared_ptr<const ProgramImage> image,
         std::string_view entryClassOrFn = {});
+    [[nodiscard]] bool LoadProgramImageWithPreferredEntry(
+        std::shared_ptr<const ProgramImage> image,
+        std::string_view entryClassOrFn,
+        std::string_view preferredEntryClass);
+    [[nodiscard]] bool LoadProgramImageBytes(
+        const std::uint8_t* data,
+        std::size_t size,
+        std::string_view entryClassOrFn = {},
+        std::string_view preferredEntryClass = {});
+    [[nodiscard]] bool LoadProgramImageFile(
+        const std::filesystem::path& filePath,
+        std::string_view entryClassOrFn = {},
+        std::string_view preferredEntryClass = {});
+
+    void RegisterAssetDirectory(std::string_view dir);
+    void DiscoverAssetDirectories(const std::filesystem::path& sampleRoot);
+    void SetDevCompileResultOpaque(std::shared_ptr<void> result) noexcept;
+    [[nodiscard]] const void* DevCompileResultOpaque() const noexcept;
+    void SetLastErrorMessage(std::string message);
 
 #ifdef AERO_HAS_COMPILER_V3
     [[nodiscard]] bool CompileAndLoad(
@@ -243,6 +268,8 @@ private:
         SymbolId applyTemplateSubtree = 0u;
         SymbolId ensureLoadedSubtree = 0u;
         SymbolId popupSetOverlayHost = 0u;
+        SymbolId registerWorkbenchFactories = 0u;
+        SymbolId registerCompiledXamlCatalog = 0u;
     };
 
     void RegisterAssetDirectoryInternal(std::string_view dir);
@@ -305,9 +332,8 @@ private:
     std::unique_ptr<rs_aot::ExecutionContext> aotContext_;
     std::unique_ptr<rs_aot::ExecutionContext> simAotContext_;
 
-#ifdef AERO_HAS_COMPILER_V3
-    std::unique_ptr<AeroV3CompileResult> lastCompileResult_;
-#endif
+    // Fixed ODR layout shared identically by AeroGUI::AppRuntime (/GR-) and AeroGUI::AppDevHost.
+    std::shared_ptr<void> devCompileResultOpaque_;
 
     CachedDispatchSymbols symbols_{};
     std::string preferredEntryClass_;

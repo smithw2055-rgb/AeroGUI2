@@ -2134,6 +2134,211 @@ public static Window CreateMainWindow() {
         "Phase1Perf lazy PlasmaBrush ImageSource mismatch: " + lazyUri);
 }
 
+void TestPhase4VirtualizationAndCompiledCatalog(aero::rs_comp::CompilerSession& sharedSession) {
+    std::cout << "[Test] Phase 4 VirtualizingUniformGrid, VirtualizingWrapGrid, and CompiledXamlCatalog...\n";
+
+    // 1. 2D VirtualizingUniformGrid & VirtualizingWrapGrid container bounding
+    {
+        aero::AeroV3CompileInput ci;
+        ci.xamlPath = "Virt2DView.xaml";
+        ci.xamlContent = R"XML(
+<UserControl xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="Samples.Phase4Virt.Virt2DView"
+             Width="640" Height="220">
+    <StackPanel Orientation="Horizontal" Spacing="20">
+        <ListBox x:Name="GridList" Width="300" Height="200">
+            <ListBox.ItemsPanel>
+                <ItemsPanelTemplate>
+                    <VirtualizingUniformGrid Columns="3" Spacing="4" />
+                </ItemsPanelTemplate>
+            </ListBox.ItemsPanel>
+        </ListBox>
+        <ListBox x:Name="WrapList" Width="280" Height="180">
+            <ListBox.ItemsPanel>
+                <ItemsPanelTemplate>
+                    <VirtualizingWrapGrid Orientation="Horizontal" ItemWidth="84" ItemHeight="36" Spacing="6" />
+                </ItemsPanelTemplate>
+            </ListBox.ItemsPanel>
+        </ListBox>
+    </StackPanel>
+</UserControl>
+)XML";
+        ci.scriptSources.push_back(aero::SourceFile{"Virt2DView.rs", R"RS(
+module Samples.Phase4Virt;
+import Aero.UI;
+public partial class Virt2DView : UserControl {
+    public Virt2DView() {
+        this.InitializeComponent();
+        var itemsA = new ObservableList<string>();
+        for (int i = 0; i < 240; i += 1) {
+            itemsA.Add("Grid_" + i);
+        }
+        this.GridList.EstimatedItemHeight = 36.0f;
+        this.GridList.EstimatedItemWidth = 96.0f;
+        this.GridList.ItemsSource = itemsA;
+        this.GridList.UpdateVirtualizedViewport(0.0f, 200.0f, 300.0f);
+
+        var itemsB = new ObservableList<string>();
+        for (int i = 0; i < 180; i += 1) {
+            itemsB.Add("Wrap_" + i);
+        }
+        this.WrapList.EstimatedItemHeight = 36.0f;
+        this.WrapList.EstimatedItemWidth = 84.0f;
+        this.WrapList.ItemsSource = itemsB;
+        this.WrapList.UpdateVirtualizedViewport(0.0f, 180.0f, 280.0f);
+    }
+
+    public void ScrollDownBoth(float offsetY) {
+        this.GridList.UpdateVirtualizedViewport(offsetY, 200.0f, 300.0f);
+        this.WrapList.UpdateVirtualizedViewport(offsetY, 180.0f, 280.0f);
+    }
+
+    public int GridChildCount() {
+        var p = this.GridList.ItemsHostPanel;
+        return p != null ? p.Children().Length : -1;
+    }
+
+    public int WrapChildCount() {
+        var p = this.WrapList.ItemsHostPanel;
+        return p != null ? p.Children().Length : -1;
+    }
+
+    public int CheckGridVirtualMetrics() {
+        var p = this.GridList.ItemsHostPanel as VirtualizingUniformGrid;
+        if (p == null) { return 1; }
+        int cnt = p.Children().Length;
+        if (cnt <= 3 || cnt >= 70) { return 2; }
+        if (p.VirtualTopPadding() <= 0.0f) { return 3; }
+        if (p.VirtualBottomPadding() <= 0.0f) { return 4; }
+        return 0;
+    }
+
+    public int CheckWrapVirtualMetrics() {
+        var p = this.WrapList.ItemsHostPanel as VirtualizingWrapGrid;
+        if (p == null) { return 1; }
+        int cnt = p.Children().Length;
+        if (cnt <= 3 || cnt >= 70) { return 2; }
+        if (p.VirtualTopPadding() <= 0.0f) { return 3; }
+        if (p.VirtualBottomPadding() <= 0.0f) { return 4; }
+        return 0;
+    }
+}
+)RS"});
+        ci.stdlibRootDir = AERO_STDLIB_DIR;
+        ci.compilerSession = &sharedSession;
+        ci.allowDiskCache = false;
+        ci.allowStdlibCache = true;
+
+        aero::AeroAppHostConfig cfg;
+        cfg.headless = true;
+        cfg.viewportWidth = 640u;
+        cfg.viewportHeight = 220u;
+        aero::AeroAppHost host(cfg);
+        std::string err;
+        const bool virtLoaded = host.CompileAndLoad(ci, &err);
+        Require(virtLoaded, "Virt2DView CompileAndLoad failed: " + err);
+        auto root = host.RootScriptObject();
+        Require(root.valid(), "Virt2DView root invalid");
+
+        auto callInt = [&](std::string_view fn, float arg = -1.0f) -> int {
+            aero::UnifiedValue rv{};
+            if (arg >= 0.0f) {
+                Require(host.InvokeScriptMethod(root, fn, {aero::UnifiedValue{aero::FloatValue{arg}}},
+                    &rv, aero::DomainKind::UiPresentation), "Invoke failed");
+                return 0;
+            }
+            Require(host.InvokeScriptMethod(root, fn, {}, &rv, aero::DomainKind::UiPresentation),
+                "Invoke int failed");
+            std::int64_t iv = -999;
+            (void)rv.tryGetInt64(iv);
+            return static_cast<int>(iv);
+        };
+
+        const int gridInit = callInt("GridChildCount");
+        const int wrapInit = callInt("WrapChildCount");
+        Require(gridInit > 3 && gridInit < 70, "Expected bounded VirtualizingUniformGrid containers, got " + std::to_string(gridInit));
+        Require(wrapInit > 3 && wrapInit < 70, "Expected bounded VirtualizingWrapGrid containers, got " + std::to_string(wrapInit));
+
+        callInt("ScrollDownBoth", 900.0f);
+        host.StepFrame(0.016f, false);
+        Require(callInt("CheckGridVirtualMetrics") == 0, "CheckGridVirtualMetrics failed after scroll");
+        Require(callInt("CheckWrapVirtualMetrics") == 0, "CheckWrapVirtualMetrics failed after scroll");
+    }
+
+    // 2. Runtime CompiledXamlCatalog lookup (without any XAML disk file!)
+    {
+        aero::AeroV3CompileInput ci;
+        ci.xamlPath = "CatRuntimeMain.xaml";
+        ci.xamlContent = R"XML(
+<UserControl xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="Samples.CatRuntime.CatRuntimeMain"
+             Width="320" Height="160">
+    <Border x:Name="HostBorder" />
+</UserControl>
+)XML";
+        ci.scriptSources.push_back(aero::SourceFile{"CatRuntimeMain.rs", R"RS(
+module Samples.CatRuntime;
+import Aero.UI;
+public partial class CatRuntimeMain : UserControl {
+    public int VerifyRuntimeCatalog() {
+        if (CompiledXamlCatalog.ElementCount() < 1) { return 1; }
+        if (CompiledXamlCatalog.ResourceDictionaryCount() < 1) { return 2; }
+        ResourceDictionary rd = XamlReader.LoadResourceDictionary("Theme/CatRuntimeTheme.xaml");
+        if (rd == null) { return 3; }
+        if (!rd.Contains("CatKey") || rd.Get("CatKey") == null) { return 4; }
+        UIElement el = XamlReader.LoadUri("/Data/Samples/CatRuntimeCard.xaml", rd);
+        if (el == null) { return 5; }
+        if (this.HostBorder != null) { this.HostBorder.Child = el; }
+        return 0;
+    }
+}
+)RS"});
+        ci.catalogXamlSources.push_back(aero::CatalogXamlEntry{
+            "Data/Samples/CatRuntimeCard.xaml",
+            {"/Data/Samples/CatRuntimeCard.xaml"},
+            "Data/Samples/CatRuntimeCard.xaml",
+            R"XML(
+<Border xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Background="#FF224466">
+    <TextBlock Text="CatalogCardLoaded" Foreground="#FFFFFFFF" />
+</Border>
+)XML",
+            false});
+        ci.catalogXamlSources.push_back(aero::CatalogXamlEntry{
+            "Theme/CatRuntimeTheme.xaml",
+            {"/Theme/CatRuntimeTheme.xaml"},
+            "Theme/CatRuntimeTheme.xaml",
+            R"XML(
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <SolidColorBrush x:Key="CatKey" Color="#FF33CC77" />
+</ResourceDictionary>
+)XML",
+            true});
+        ci.stdlibRootDir = AERO_STDLIB_DIR;
+        ci.stdlibPackages = aero::AeroStdlibPkg_RuntimeXaml;
+        ci.allowDiskCache = false;
+        ci.allowStdlibCache = false;
+
+        aero::AeroAppHostConfig cfg;
+        cfg.headless = true;
+        cfg.viewportWidth = 320u;
+        cfg.viewportHeight = 160u;
+        aero::AeroAppHost host(cfg);
+        std::string err;
+        const bool catLoaded = host.CompileAndLoad(ci, &err);
+        Require(catLoaded, "CatRuntimeMain CompileAndLoad failed: " + err);
+        auto root = host.RootScriptObject();
+        aero::UnifiedValue rv{};
+        Require(host.InvokeScriptMethod(root, "VerifyRuntimeCatalog", {}, &rv, aero::DomainKind::UiPresentation),
+            "VerifyRuntimeCatalog call failed");
+        std::int64_t code = -1;
+        Require(rv.tryGetInt64(code) && code == 0,
+            "VerifyRuntimeCatalog failed with code " + std::to_string(code));
+    }
+}
+
 } // namespace
 
 int main() {
@@ -2149,6 +2354,7 @@ int main() {
     TestCollapsedSubtreeCatchupAndSelfDataContext(sharedSession);
     TestPhase0MemoryAndBindingShortCircuit(sharedSession);
     TestPhase1PushBindingPropIdMathAndPlasma(sharedSession);
+    TestPhase4VirtualizationAndCompiledCatalog(sharedSession);
 
     if (gFailureCount > 0) {
         std::cerr << gFailureCount << " v3_controls_and_samples_tests assertion(s) failed.\n";

@@ -3488,6 +3488,12 @@ public partial class UIElement : DependencyObject {
         r.ToolTip = DependencyObject.BoxString(text);
         if (r.ToolTip != null) { EnableToolTipHover(); }
     }
+    public void EnableToolTipHover() {
+        if (_toolTipEventHook != null) {
+            var tth = _toolTipEventHook;
+            tth(this, "ToolTip", DependencyObject.BoxBool(true));
+        }
+    }
 
     public UIElement Parent { get { return _parent; } }
     public UIElement TemplatedParent {
@@ -6469,6 +6475,11 @@ public partial class UIElement : DependencyObject {
             cur = cur._parent != null ? cur._parent : cur._templatedParent;
         }
     }
+
+    internal virtual UIElement GetTemplateRootInternal() { return null; }
+    internal virtual UIElement GetTemplateChildInternal(string name) { return FindName(name); }
+    internal virtual bool IsOwnedByTemplateChainInternal(UIElement owner) { return false; }
+    internal virtual DependencyObject GetContentBoxInternal() { return null; }
 
     public virtual bool IsNamescopeBoundary() { return HasUiFlag(1024); }
 }

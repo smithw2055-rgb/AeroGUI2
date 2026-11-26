@@ -61,10 +61,12 @@ struct SessionSnapshotCache final {
 struct StdlibCacheKey final {
     std::string resolvedRoot;
     std::uint64_t stdlibHash = 0u;
+    std::uint32_t packageMask = AeroStdlibPkg_All;
     bool enableReactiveMacros = true;
 
     [[nodiscard]] bool operator==(const StdlibCacheKey& other) const noexcept {
         return stdlibHash == other.stdlibHash &&
+               packageMask == other.packageMask &&
                enableReactiveMacros == other.enableReactiveMacros &&
                resolvedRoot == other.resolvedRoot;
     }
@@ -74,6 +76,7 @@ struct StdlibCacheKeyHash final {
     [[nodiscard]] std::size_t operator()(const StdlibCacheKey& key) const noexcept {
         std::uint64_t h = key.stdlibHash;
         h ^= std::hash<std::string>{}(key.resolvedRoot) + 0x9e3779b97f4a7c15ull + (h << 6u) + (h >> 2u);
+        h ^= static_cast<std::uint64_t>(key.packageMask) * 0x9e3779b97f4a7c15ull;
         h ^= key.enableReactiveMacros ? 0x517cc1b727220a95ull : 0x243f6a8885a308d3ull;
         return static_cast<std::size_t>(h);
     }
@@ -516,6 +519,7 @@ void PopulateStdlibDerivedCache(ProcessStdlibCacheEntry& entry) {
     const std::string& resolvedRootKey,
     const std::vector<SourceFile>& stdlibSources,
     std::uint64_t stdlibHash,
+    std::uint32_t packageMask,
     bool enableReactiveMacros,
     const std::filesystem::path& effectiveCacheDir,
     rs_comp::CompilerSession* callerSession,
@@ -526,7 +530,7 @@ void PopulateStdlibDerivedCache(ProcessStdlibCacheEntry& entry) {
     bool allowDiskSnapshotLoad = true) {
     outCacheHit = false;
     outEntry.reset();
-    const StdlibCacheKey key{resolvedRootKey, stdlibHash, enableReactiveMacros};
+    const StdlibCacheKey key{resolvedRootKey, stdlibHash, packageMask, enableReactiveMacros};
     auto& procCache = GetProcessStdlibCache();
 
     const std::filesystem::path snapMetaPath = effectiveCacheDir.empty()
@@ -837,6 +841,7 @@ struct FastStdlibStatCache final {
     struct Entry final {
         std::string resolvedRootKey;
         std::uint64_t statFingerprint = 0u;
+        std::uint32_t packageMask = AeroStdlibPkg_All;
         bool enableReactiveMacros = true;
         std::uint64_t stdlibHash = 0u;
     };
@@ -852,13 +857,32 @@ struct FastStdlibStatCache final {
 [[nodiscard]] std::uint64_t ComputeStdlibStatFingerprint(
     const std::filesystem::path& resolvedRoot,
     std::string_view resolvedRootKey,
+    std::uint32_t packageMask,
     bool enableReactiveMacros) {
     DualHash128 hasher;
-    hasher.mixU32(1u);
+    hasher.mixU32(2u);
+    hasher.mixU32(packageMask);
     hasher.mixU32(enableReactiveMacros ? 1u : 0u);
     hasher.mixString(resolvedRootKey);
 
-    const char* subdirs[2] = {"Aero.Native", "Aero.UI"};
+    std::error_code splitEc;
+    std::vector<const char*> subdirs;
+    subdirs.push_back("Aero.Native");
+    if (std::filesystem::is_directory(resolvedRoot / "Aero.UI.Core", splitEc)) {
+        subdirs.push_back("Aero.UI.Core");
+        if ((packageMask & AeroStdlibPkg_Controls) != 0u) {
+            subdirs.push_back("Aero.UI.Controls");
+        }
+        if ((packageMask & AeroStdlibPkg_RuntimeXaml) != 0u) {
+            subdirs.push_back("Aero.UI.RuntimeXaml");
+        }
+        if ((packageMask & AeroStdlibPkg_Workbench) != 0u) {
+            subdirs.push_back("Aero.UI.Workbench");
+        }
+    } else {
+        subdirs.push_back("Aero.UI");
+    }
+
     for (const char* sub : subdirs) {
         const std::filesystem::path dir = resolvedRoot / sub;
         std::error_code ec;
@@ -904,6 +928,7 @@ struct FastStdlibStatCache final {
 [[nodiscard]] bool TryGetFastStdlibHash(
     std::string_view resolvedRootKey,
     std::uint64_t statFingerprint,
+    std::uint32_t packageMask,
     bool enableReactiveMacros,
     const std::filesystem::path& cacheDir,
     std::uint64_t& outStdlibHash) {
@@ -912,6 +937,7 @@ struct FastStdlibStatCache final {
         std::lock_guard<std::mutex> lock(statCache.mutex);
         for (const auto& e : statCache.entries) {
             if (e.statFingerprint == statFingerprint &&
+                e.packageMask == packageMask &&
                 e.enableReactiveMacros == enableReactiveMacros &&
                 e.resolvedRootKey == resolvedRootKey) {
                 outStdlibHash = e.stdlibHash;
@@ -925,7 +951,7 @@ struct FastStdlibStatCache final {
     }
 
     std::vector<std::uint8_t> bytes;
-    if (!ReadBinaryFile(cacheDir / "stdlib_stat_v1.bin", bytes) || bytes.size() < 20u) {
+    if (!ReadBinaryFile(cacheDir / "stdlib_stat_v1.bin", bytes) || bytes.size() < 24u) {
         return false;
     }
     const std::size_t payloadSize = bytes.size() - 8u;
@@ -959,7 +985,7 @@ struct FastStdlibStatCache final {
 
     std::uint32_t ver = 0u;
     std::uint32_t count = 0u;
-    if (!readU32(ver) || ver != 1u || !readU32(count) || count > 64u) {
+    if (!readU32(ver) || ver != 2u || !readU32(count) || count > 64u) {
         return false;
     }
 
@@ -973,7 +999,7 @@ struct FastStdlibStatCache final {
         FastStdlibStatCache::Entry e;
         e.resolvedRootKey.assign(reinterpret_cast<const char*>(bytes.data() + pos), len);
         pos += len;
-        if (!readU64(e.statFingerprint) || pos >= payloadSize) {
+        if (!readU64(e.statFingerprint) || !readU32(e.packageMask) || pos >= payloadSize) {
             return false;
         }
         e.enableReactiveMacros = (bytes[pos++] != 0u);
@@ -991,6 +1017,7 @@ struct FastStdlibStatCache final {
         std::lock_guard<std::mutex> lock(statCache.mutex);
         for (const auto& le : loaded) {
             if (le.statFingerprint == statFingerprint &&
+                le.packageMask == packageMask &&
                 le.enableReactiveMacros == enableReactiveMacros &&
                 le.resolvedRootKey == resolvedRootKey) {
                 outStdlibHash = le.stdlibHash;
@@ -999,6 +1026,7 @@ struct FastStdlibStatCache final {
             bool exists = false;
             for (const auto& cur : statCache.entries) {
                 if (cur.statFingerprint == le.statFingerprint &&
+                    cur.packageMask == le.packageMask &&
                     cur.enableReactiveMacros == le.enableReactiveMacros &&
                     cur.resolvedRootKey == le.resolvedRootKey) {
                     exists = true;
@@ -1016,6 +1044,7 @@ struct FastStdlibStatCache final {
 void RecordFastStdlibHash(
     std::string_view resolvedRootKey,
     std::uint64_t statFingerprint,
+    std::uint32_t packageMask,
     bool enableReactiveMacros,
     const std::filesystem::path& cacheDir,
     std::uint64_t stdlibHash) {
@@ -1025,7 +1054,8 @@ void RecordFastStdlibHash(
         std::lock_guard<std::mutex> lock(statCache.mutex);
         bool updated = false;
         for (auto& e : statCache.entries) {
-            if (e.enableReactiveMacros == enableReactiveMacros &&
+            if (e.packageMask == packageMask &&
+                e.enableReactiveMacros == enableReactiveMacros &&
                 e.resolvedRootKey == resolvedRootKey) {
                 e.statFingerprint = statFingerprint;
                 e.stdlibHash = stdlibHash;
@@ -1040,6 +1070,7 @@ void RecordFastStdlibHash(
             statCache.entries.push_back(FastStdlibStatCache::Entry{
                 std::string(resolvedRootKey),
                 statFingerprint,
+                packageMask,
                 enableReactiveMacros,
                 stdlibHash,
             });
@@ -1065,7 +1096,7 @@ void RecordFastStdlibHash(
     };
 
     pushBytes("ASTS", 4u);
-    pushU32(1u);
+    pushU32(2u);
     pushU32(static_cast<std::uint32_t>(snapshot.size()));
     for (const auto& e : snapshot) {
         pushU32(static_cast<std::uint32_t>(e.resolvedRootKey.size()));
@@ -1073,6 +1104,7 @@ void RecordFastStdlibHash(
             pushBytes(e.resolvedRootKey.data(), e.resolvedRootKey.size());
         }
         pushU64(e.statFingerprint);
+        pushU32(e.packageMask);
         buf.push_back(e.enableReactiveMacros ? 1u : 0u);
         pushU64(e.stdlibHash);
     }
@@ -1081,10 +1113,11 @@ void RecordFastStdlibHash(
     WriteBinaryFileAtomic(cacheDir / "stdlib_stat_v1.bin", buf);
 }
 
-constexpr std::uint32_t kProgramCacheVersion = 10u;
+constexpr std::uint32_t kProgramCacheVersion = 12u;
 
 [[nodiscard]] std::pair<std::uint64_t, std::uint64_t> ComputeRawInputBundleKey(
     const AeroV3CompileInput& input,
+    std::uint32_t resolvedPackages,
     std::uint64_t stdlibHash) noexcept {
     DualHash128 hasher;
     hasher.mixU32(kProgramCacheVersion);
@@ -1099,6 +1132,7 @@ constexpr std::uint32_t kProgramCacheVersion = 10u;
         (input.enableReactiveMacros ? 8u : 0u) |
         (input.useStdlibDll ? 16u : 0u);
     hasher.mixU32(flags);
+    hasher.mixU32(resolvedPackages);
     hasher.mixU64(stdlibHash);
 
     hasher.mixNormalizedPath(input.xamlPath);
@@ -1113,6 +1147,18 @@ constexpr std::uint32_t kProgramCacheVersion = 10u;
     for (const auto& sf : input.additionalXamlSources) {
         hasher.mixNormalizedPath(sf.path);
         hasher.mixString(sf.content);
+    }
+
+    hasher.mixU64(static_cast<std::uint64_t>(input.catalogXamlSources.size()));
+    for (const auto& cat : input.catalogXamlSources) {
+        hasher.mixString(cat.uri);
+        hasher.mixU32(cat.isResourceDictionary ? 1u : 0u);
+        hasher.mixU64(static_cast<std::uint64_t>(cat.aliasUris.size()));
+        for (const auto& alias : cat.aliasUris) {
+            hasher.mixString(alias);
+        }
+        hasher.mixNormalizedPath(cat.xamlPath);
+        hasher.mixString(cat.xamlContent);
     }
 
     hasher.mixU64(static_cast<std::uint64_t>(input.scriptSources.size()));
@@ -1437,6 +1483,16 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
         result.stdlibDllLoadMs = loadedDll->loadAndDecodeMs;
     }
 
+    const std::uint32_t effectiveStdlibPackages =
+        useDllMode
+            ? AeroStdlibPkg_All
+            : (input.stdlibPackages != AeroStdlibPkg_Auto
+                   ? ResolveEffectiveStdlibPackageMask(input.stdlibPackages)
+                   : (input.compilerSession != nullptr
+                          ? AeroStdlibPkg_All
+                          : InferRequiredStdlibPackages(input)));
+    result.resolvedStdlibPackages = input.includeStdlib ? effectiveStdlibPackages : 0u;
+
     std::vector<SourceFile> stdlibSources;
     std::string resolvedStdlibRootKey;
     std::filesystem::path resolvedStdlibRoot;
@@ -1461,14 +1517,15 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
             ? canon.lexically_normal().generic_string()
             : resolvedStdlibRoot.lexically_normal().generic_string();
         stdlibStatFp = ComputeStdlibStatFingerprint(
-            resolvedStdlibRoot, resolvedStdlibRootKey, input.enableReactiveMacros);
+            resolvedStdlibRoot, resolvedStdlibRootKey, effectiveStdlibPackages, input.enableReactiveMacros);
         if (!TryGetFastStdlibHash(
                 resolvedStdlibRootKey,
                 stdlibStatFp,
+                effectiveStdlibPackages,
                 input.enableReactiveMacros,
                 effectiveCacheDir,
                 stdlibHash)) {
-            stdlibSources = LoadStdlibModulePack(input.stdlibRootDir);
+            stdlibSources = LoadStdlibModulePack(input.stdlibRootDir, effectiveStdlibPackages);
             if (stdlibSources.empty()) {
                 result.diagnostics.emplace_back(
                     "StdlibModulePack: failed to locate stdlib Aero.Native / Aero.UI sources");
@@ -1478,6 +1535,7 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
             RecordFastStdlibHash(
                 resolvedStdlibRootKey,
                 stdlibStatFp,
+                effectiveStdlibPackages,
                 input.enableReactiveMacros,
                 effectiveCacheDir,
                 stdlibHash);
@@ -1488,7 +1546,7 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
     std::uint64_t progH2 = 0u;
     std::filesystem::path progCacheFilePath;
     if (canUseRawProgramCache) {
-        const auto [h1, h2] = ComputeRawInputBundleKey(input, stdlibHash);
+        const auto [h1, h2] = ComputeRawInputBundleKey(input, effectiveStdlibPackages, stdlibHash);
         progH1 = h1;
         progH2 = h2;
         progCacheFilePath = MakeProgramCacheFilePath(effectiveCacheDir, progH1, progH2);
@@ -1528,7 +1586,7 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
     }
 
     if (input.includeStdlib && !useDllMode && stdlibSources.empty()) {
-        stdlibSources = LoadStdlibModulePack(input.stdlibRootDir);
+        stdlibSources = LoadStdlibModulePack(input.stdlibRootDir, effectiveStdlibPackages);
         if (stdlibSources.empty()) {
             result.diagnostics.emplace_back(
                 "StdlibModulePack: failed to locate stdlib Aero.Native / Aero.UI sources");
@@ -1540,11 +1598,12 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
             RecordFastStdlibHash(
                 resolvedStdlibRootKey,
                 stdlibStatFp,
+                effectiveStdlibPackages,
                 input.enableReactiveMacros,
                 effectiveCacheDir,
                 stdlibHash);
             if (canUseRawProgramCache) {
-                const auto [h1, h2] = ComputeRawInputBundleKey(input, stdlibHash);
+                const auto [h1, h2] = ComputeRawInputBundleKey(input, effectiveStdlibPackages, stdlibHash);
                 progH1 = h1;
                 progH2 = h2;
                 progCacheFilePath = MakeProgramCacheFilePath(effectiveCacheDir, progH1, progH2);
@@ -1648,6 +1707,96 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
         }
     }
 
+    // Emit build-time CompiledXamlCatalog entries into module __AeroCompiledCatalog
+    std::vector<SourceFile> catalogGeneratedSources;
+    if (!input.catalogXamlSources.empty()) {
+        auto escapeRsLiteral = [](std::string_view text) {
+            std::string out;
+            out.reserve(text.size() + 8u);
+            out.push_back('"');
+            for (const char ch : text) {
+                if (ch == '\\' || ch == '"') {
+                    out.push_back('\\');
+                }
+                out.push_back(ch);
+            }
+            out.push_back('"');
+            return out;
+        };
+
+        std::ostringstream regBody;
+        std::size_t okCount = 0u;
+        for (std::size_t i = 0u; i < input.catalogXamlSources.size(); ++i) {
+            const CatalogXamlEntry& entry = input.catalogXamlSources[i];
+            if (entry.xamlContent.empty() || entry.uri.empty()) {
+                continue;
+            }
+            XamlEmitOptions catOpts;
+            catOpts.xamlPath = entry.xamlPath.empty() ? entry.uri : entry.xamlPath;
+            catOpts.defaultModuleName = "__AeroCompiledCatalog";
+            catOpts.classNameOverride = "__CatalogItem_" + std::to_string(i);
+            catOpts.forceStandaloneClass = true;
+            catOpts.externalXamlResolver = input.externalXamlResolver;
+            catOpts.resourceSearchRoot = input.resourceSearchRoot;
+            catOpts.resourceSearchPaths = input.resourceSearchPaths;
+            catOpts.pruneUnreferencedExternalStyles = !entry.isResourceDictionary;
+            if (!entry.isResourceDictionary) {
+                catOpts.usageHintTexts.push_back(entry.xamlContent);
+            }
+            XamlEmitResult catRes = EmitXamlToRealScript(entry.xamlContent, catOpts);
+            if (!catRes.succeeded || catRes.generatedRsCode.empty()) {
+                result.diagnostics.emplace_back(
+                    "CompiledXamlCatalog skipped '" + entry.uri + "'" +
+                    (catRes.diagnostics.empty() ? std::string{} : (": " + catRes.diagnostics.front())));
+                continue;
+            }
+            catalogGeneratedSources.push_back(SourceFile{
+                "__AeroCompiledCatalog_Item_" + std::to_string(i) + ".g.rs",
+                std::move(catRes.generatedRsCode)});
+
+            auto emitUriReg = [&](std::string_view uriKey) {
+                if (uriKey.empty()) {
+                    return;
+                }
+                if (entry.isResourceDictionary) {
+                    regBody << "        CompiledXamlCatalog.RegisterResourceDictionary("
+                            << escapeRsLiteral(uriKey)
+                            << ", () => { return __CatalogItem_" << i << ".Build(); });\n";
+                } else {
+                    regBody << "        CompiledXamlCatalog.RegisterElement("
+                            << escapeRsLiteral(uriKey)
+                            << ", (ResourceDictionary fallback) => { return __CatalogItem_" << i << ".Build(); });\n";
+                }
+            };
+            emitUriReg(entry.uri);
+            for (const auto& alias : entry.aliasUris) {
+                emitUriReg(alias);
+            }
+            ++okCount;
+        }
+
+        if (okCount > 0u) {
+            std::ostringstream initUnit;
+            initUnit << "module __AeroCompiledCatalog;\n"
+                     << "import Aero.UI;\n\n"
+                     << "public static class __AeroCompiledXamlCatalogInit\n"
+                     << "{\n"
+                     << "    private static bool _registered = false;\n"
+                     << "    public static void RegisterAll()\n"
+                     << "    {\n"
+                     << "        if (_registered) { return; }\n"
+                     << "        _registered = true;\n"
+                     << regBody.str()
+                     << "    }\n"
+                     << "}\n";
+            catalogGeneratedSources.push_back(
+                SourceFile{"__AeroCompiledCatalogInit.rs", initUnit.str()});
+            result.compiledCatalogEntryCount = okCount;
+        } else {
+            catalogGeneratedSources.clear();
+        }
+    }
+
     // Assemble declared modules before C# compatibility lowering
     std::unordered_set<std::string> availableModules =
         useDllMode
@@ -1666,6 +1815,9 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
             availableModules.insert(addRes.moduleName);
         }
     }
+    if (!catalogGeneratedSources.empty()) {
+        availableModules.insert("__AeroCompiledCatalog");
+    }
 
     std::vector<SourceFile> loweredScripts;
     loweredScripts.reserve(input.scriptSources.size());
@@ -1678,7 +1830,8 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
 
     std::vector<SourceFile> allSources;
     allSources.reserve(
-        stdlibSources.size() + additionalXamlResults.size() + loweredScripts.size() + 1u);
+        stdlibSources.size() + additionalXamlResults.size() +
+        catalogGeneratedSources.size() + loweredScripts.size() + 1u);
     std::unordered_set<std::string> seenPaths;
 
     auto pushUniqueSource = [&](SourceFile sf) {
@@ -1700,6 +1853,9 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
         if (!addRes.generatedRsCode.empty()) {
             pushUniqueSource(SourceFile{addRes.generatedFilePath, std::move(addRes.generatedRsCode)});
         }
+    }
+    for (auto& catSf : catalogGeneratedSources) {
+        pushUniqueSource(std::move(catSf));
     }
     for (auto& lowered : loweredScripts) {
         pushUniqueSource(std::move(lowered));
@@ -1749,6 +1905,7 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
                     resolvedStdlibRootKey,
                     stdlibSources,
                     stdlibHash,
+                    effectiveStdlibPackages,
                     input.enableReactiveMacros,
                     effectiveCacheDir,
                     input.compilerSession,
@@ -1765,6 +1922,7 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
                 resolvedStdlibRootKey,
                 stdlibSources,
                 stdlibHash,
+                effectiveStdlibPackages,
                 input.enableReactiveMacros,
                 effectiveCacheDir,
                 nullptr,
@@ -1806,6 +1964,9 @@ AeroV3CompileResult AeroCompilerV3::Compile(const AeroV3CompileInput& input) con
             "NativeObjectBox",
             "INotifyPropertyChanged",
         };
+        if (result.compiledCatalogEntryCount > 0u) {
+            compOpts.reachabilityRootSymbols.insert("__AeroCompiledXamlCatalogInit");
+        }
     }
 
     xamlRes = XamlEmitResult{};

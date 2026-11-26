@@ -1715,7 +1715,8 @@ bool TestFractionalScissorPixelCenterAndNoOverflowSeam() {
 
 bool TestStandaloneCpuEvictionAndLazyReload() {
     aero::ImageAtlas atlas;
-    // Construct an uncompressed 24-bit BMP larger than kDefaultMaxPackableExtent (256)
+    atlas.ConfigureAtlas(256u, 255u, 255u);
+    // Construct an uncompressed 24-bit BMP larger than configured max packable extent (255)
     constexpr std::uint32_t kW = 300u;
     constexpr std::uint32_t kH = 300u;
     constexpr std::uint32_t rowBytes = kW * 3u; // 900 is multiple of 4
@@ -1826,6 +1827,155 @@ bool TestNumericPlasmaAndRiveAtlasPaths() {
     return true;
 }
 
+bool TestPhase4MultiPageAtlasScissorElisionAndDirtyRects() {
+    // 1. Multi-page tiered Skyline Atlas: pack 10 x 256x256 sprites into 512x512 base -> overflows to page >= 2
+    {
+        aero::ImageAtlas atlas;
+        atlas.ConfigureAtlas(512u, 512u, 512u);
+        std::unordered_set<std::uint32_t> texIds;
+        for (int i = 0; i < 10; ++i) {
+            aero::DecodedImage img;
+            img.width = 256u;
+            img.height = 256u;
+            img.format = aero::ImageFormat::RawRgba8;
+            img.rgbaPixels.assign(256u * 256u * 4u, static_cast<std::uint8_t>(40 + i * 17));
+            const aero::ImageAtlasEntry* entry = atlas.RegisterDecodedImage(
+                "mem://tile_" + std::to_string(i) + ".png", std::move(img), false);
+            AERO_CHECK(entry != nullptr);
+            AERO_CHECK(!entry->isStandalone);
+            texIds.insert(entry->textureId);
+        }
+        AERO_CHECK(atlas.SharedAtlasPageCount() >= 2u);
+        AERO_CHECK(texIds.size() >= 2u);
+        AERO_CHECK(texIds.count(aero::ImageAtlas::kSharedUiAtlasTextureId) == 1u);
+    }
+
+    // 2. PagedRenderTree strict-interior scissor elision (1px strict inset skips redundant scissor split)
+    {
+        auto store = std::make_shared<aero::UIResourceStore>();
+        aero::VisualWorld world(nullptr, store.get());
+        const aero::VisualNodeId root = world.CreateNode(aero::VisualKind::Box);
+        world.SetRoot(root);
+        world.SetSize(root, 600.0f, 400.0f);
+
+        const aero::VisualNodeId outerClip = world.CreateNode(aero::VisualKind::Box);
+        world.AddChild(root, outerClip);
+        world.SetAlignment(outerClip, aero::HorizontalAlignment::Left, aero::VerticalAlignment::Top);
+        world.SetMargin(outerClip, 100.0f, 100.0f, 0.0f, 0.0f);
+        world.SetSize(outerClip, 400.0f, 240.0f);
+        world.SetClipToBounds(outerClip, true);
+
+        const aero::VisualNodeId innerBox = world.CreateNode(aero::VisualKind::Box);
+        world.AddChild(outerClip, innerBox);
+        world.SetAlignment(innerBox, aero::HorizontalAlignment::Left, aero::VerticalAlignment::Top);
+        world.SetMargin(innerBox, 40.0f, 40.0f, 0.0f, 0.0f);
+        world.SetSize(innerBox, 80.0f, 50.0f);
+        world.SetBoxStyle(innerBox, aero::ParseColorRgba32("#FF44AAFF"), 0u, 0, 0, 0, 0, 0, 0, 0, 0);
+
+        world.UpdateLayout(600.0f, 400.0f);
+
+        aero::VisualRenderAdapter adapter;
+        aero::PagedRenderTree tree;
+        tree.SetResourceStore(store.get());
+        AERO_CHECK(adapter.SyncPagedRenderTree(world, nullptr, tree, store.get()) >= 1u);
+        AERO_CHECK(tree.PageCount() == 1u);
+        AERO_CHECK((tree.GetPage(0u).header.flags & aero::CommandPageFlag_ScissorClipActive) == 0u);
+    }
+
+    // 3. Bit-exact 0-byte memcmp SoftwareSurfaceBackend incremental dirty-rect + SIMD rasterization
+    {
+        constexpr std::uint32_t W = 512u;
+        constexpr std::uint32_t H = 384u;
+        const aero::Color clearCol{0.05f, 0.08f, 0.14f, 1.0f};
+
+        auto store = std::make_shared<aero::UIResourceStore>();
+        aero::DecodedImage tex;
+        tex.width = 32u;
+        tex.height = 32u;
+        tex.format = aero::ImageFormat::RawRgba8;
+        tex.rgbaPixels.resize(32u * 32u * 4u);
+        for (std::uint32_t y = 0u; y < 32u; ++y) {
+            for (std::uint32_t x = 0u; x < 32u; ++x) {
+                const bool chk = (((x / 4u) + (y / 4u)) & 1u) != 0u;
+                const std::size_t off = (static_cast<std::size_t>(y) * 32u + x) * 4u;
+                tex.rgbaPixels[off + 0u] = chk ? 220u : 30u;
+                tex.rgbaPixels[off + 1u] = chk ? 120u : 190u;
+                tex.rgbaPixels[off + 2u] = 240u;
+                tex.rgbaPixels[off + 3u] = ((x + y) & 1u) ? 255u : 180u;
+            }
+        }
+        const auto* texEntry = store->Images().RegisterDecodedImage("mem://dirty_chk.png", std::move(tex), false);
+        AERO_CHECK(texEntry != nullptr);
+
+        aero::VisualWorld world(nullptr, store.get());
+        const aero::VisualNodeId root = world.CreateNode(aero::VisualKind::Box);
+        world.SetRoot(root);
+        world.SetSize(root, static_cast<float>(W), static_cast<float>(H));
+
+        const aero::VisualNodeId bgPanel = world.CreateNode(aero::VisualKind::Box);
+        world.AddChild(root, bgPanel);
+        world.SetAlignment(bgPanel, aero::HorizontalAlignment::Left, aero::VerticalAlignment::Top);
+        world.SetMargin(bgPanel, 24.0f, 20.0f, 0.0f, 0.0f);
+        world.SetSize(bgPanel, 260.0f, 120.0f);
+        world.SetBoxStyle(bgPanel, aero::ParseColorRgba32("#883B82F6"), 0u, 8, 8, 8, 8, 0, 0, 0, 0);
+
+        const aero::VisualNodeId imgNode = world.CreateNode(aero::VisualKind::Image);
+        world.AddChild(root, imgNode);
+        world.SetAlignment(imgNode, aero::HorizontalAlignment::Left, aero::VerticalAlignment::Top);
+        world.SetMargin(imgNode, 300.0f, 24.0f, 0.0f, 0.0f);
+        world.SetSize(imgNode, 72.0f, 72.0f);
+        world.SetImage(imgNode, "mem://dirty_chk.png", aero::Stretch::Fill, aero::StretchDirection::Both, 0xFFFFFFFFu);
+
+        const aero::VisualNodeId mover = world.CreateNode(aero::VisualKind::Box);
+        world.AddChild(root, mover);
+        world.SetAlignment(mover, aero::HorizontalAlignment::Left, aero::VerticalAlignment::Top);
+        world.SetMargin(mover, 36.0f, 200.0f, 0.0f, 0.0f);
+        world.SetSize(mover, 56.0f, 36.0f);
+        world.SetBoxStyle(mover, aero::ParseColorRgba32("#FF10B981"), 0u, 6, 6, 6, 6, 0, 0, 0, 0);
+
+        world.UpdateLayout(static_cast<float>(W), static_cast<float>(H));
+        aero::VisualRenderAdapter adapter;
+        aero::PagedRenderTree tree;
+        tree.SetResourceStore(store.get());
+        AERO_CHECK(adapter.SyncPagedRenderTree(world, nullptr, tree, store.get()) >= 3u);
+
+        aero::ZeroCopyGpuStream stream(aero::ShaderBackend::DesktopGL33, 16u);
+        aero::SoftwareSurfaceBackend backend;
+        aero::GpuBackendConfig cfg{};
+        cfg.initialViewportWidth = W;
+        cfg.initialViewportHeight = H;
+        AERO_CHECK(backend.Initialize(cfg));
+
+        const auto f1 = backend.SubmitAndPresent(tree, stream, W, H, clearCol);
+        AERO_CHECK(f1.succeeded);
+
+        // Update moving box in-place so treeId and page topology stay preserved for dirty-rect rasterization
+        const auto* moverDesc = world.GetNode(mover);
+        AERO_CHECK(moverDesc != nullptr);
+        AERO_CHECK(tree.UpdateSolidBoxNodeInPlace(
+            moverDesc->layout.renderNodeId,
+            aero::Rect{0.0f, 0.0f, 56.0f, 36.0f},
+            aero::Color{16.0f / 255.0f, 185.0f / 255.0f, 129.0f / 255.0f, 1.0f},
+            aero::CornerRadius{6.0f},
+            aero::Matrix2D::Translation(320.0f, 240.0f),
+            aero::BlendingMode::Normal));
+
+        const auto f2 = backend.SubmitAndPresent(tree, stream, W, H, clearCol);
+        AERO_CHECK(f2.succeeded);
+        const aero::SoftwareDirtyRectStats dStats = backend.LastDirtyRasterStats();
+        AERO_CHECK(!dStats.fellBackToFullFrame);
+        AERO_CHECK(dStats.dirtyTiles > 0u && dStats.dirtyTiles < dStats.totalTiles);
+
+        std::vector<std::uint8_t> fullRef;
+        aero::ZeroCopyGpuStream::RasterizeTreeToRgba8(tree, W, H, fullRef, clearCol);
+        AERO_CHECK(backend.FramebufferRgba8().size() == fullRef.size());
+        AERO_CHECK(std::memcmp(backend.FramebufferRgba8().data(), fullRef.data(), fullRef.size()) == 0);
+        backend.Shutdown();
+    }
+
+    return true;
+}
+
 } // namespace
 
 int main() {
@@ -1855,6 +2005,7 @@ int main() {
         {"FractionalScissorPixelCenterAndNoOverflowSeam", &TestFractionalScissorPixelCenterAndNoOverflowSeam},
         {"StandaloneCpuEvictionAndLazyReload", &TestStandaloneCpuEvictionAndLazyReload},
         {"NumericPlasmaAndRiveAtlasPaths", &TestNumericPlasmaAndRiveAtlasPaths},
+        {"Phase4MultiPageAtlasScissorElisionAndDirtyRects", &TestPhase4MultiPageAtlasScissorElisionAndDirtyRects},
     };
 
     int passed = 0;

@@ -618,8 +618,8 @@ public class TextBlock : FrameworkElement {
             }
             object rawObj = DependencyObject.Unbox(value);
             string tt = DependencyObject.UnboxString(value, "None").Trim();
-            if ((tt.Length == 0 || tt == "ComboBoxItem") && rawObj is ContentControl) {
-                tt = DependencyObject.UnboxString((rawObj as ContentControl).ContentBox, "None").Trim();
+            if ((tt.Length == 0 || tt == "ComboBoxItem") && rawObj is UIElement) {
+                tt = DependencyObject.UnboxString((rawObj as UIElement).GetContentBoxInternal(), "None").Trim();
             }
             if (tt == "CharacterEllipsis") { TextTrimming = TextTrimming.CharacterEllipsis; return true; }
             if (tt == "WordEllipsis") { TextTrimming = TextTrimming.WordEllipsis; return true; }
@@ -714,7 +714,8 @@ public class Image : FrameworkElement {
 
     internal bool ApplyRiveDirect(
         string assetPath, int instanceId, float tLoopSec, float tStateSec,
-        float reqW, float reqH, Stretch stretch, RiveInput[] inputs, bool inputsDirty) {
+        float reqW, float reqH, Stretch stretch,
+        string[] inputNames, DependencyObject[] inputValues, bool inputsDirty) {
         if (!ParseUtil.IsValidHandle(__nativeHandle)) { return false; }
         _stretch = stretch;
         uint tintCol = _tint != null ? _tint.ResolveRgba() : ParseUtil.PackArgb(255u, 255u, 255u, 255u);
@@ -730,14 +731,16 @@ public class Image : FrameworkElement {
             tintCol);
         if (inputsDirty) {
             Visual_ClearRiveInputs(__nativeHandle);
-            if (inputs != null) {
-                for (int i = 0; i < inputs.Length; i += 1) {
-                    RiveInput ri = inputs[i];
-                    if (ri != null && ri.InputName != null && ri.InputName.Length > 0 && ri.InputValueBox != null) {
-                        float val = (ri.InputValueBox is BoxedBool)
-                            ? ((ri.InputValueBox as BoxedBool).Value ? 1.0f : 0.0f)
-                            : DependencyObject.UnboxFloat(ri.InputValueBox, 0.0f);
-                        Visual_SetRiveInput(__nativeHandle, ri.InputName, val);
+            if (inputNames != null && inputValues != null) {
+                int count = inputNames.Length < inputValues.Length ? inputNames.Length : inputValues.Length;
+                for (int i = 0; i < count; i += 1) {
+                    string rName = inputNames[i];
+                    DependencyObject rVal = inputValues[i];
+                    if (rName != null && rName.Length > 0 && rVal != null) {
+                        float val = (rVal is BoxedBool)
+                            ? ((rVal as BoxedBool).Value ? 1.0f : 0.0f)
+                            : DependencyObject.UnboxFloat(rVal, 0.0f);
+                        Visual_SetRiveInput(__nativeHandle, rName, val);
                     }
                 }
             }

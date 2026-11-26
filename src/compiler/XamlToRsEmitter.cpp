@@ -970,7 +970,7 @@ struct XamlNode final {
         "TickLength", "TickWidth", "MinAngle", "MaxAngle", "Volume",
         "LineHeight", "CharacterSpacing",
         "ViewportSize", "MaxDropDownHeight", "HorizontalOffset", "VerticalOffset",
-        "OffsetX", "OffsetY", "Spread"
+        "OffsetX", "OffsetY", "Spread", "ItemWidth", "ItemHeight"
     };
     return kFloatProps.count(prop) > 0;
 }
@@ -1042,7 +1042,7 @@ struct XamlNode final {
         "Year", "Month", "Day", "Hour", "Minute", "Second", "Format", "UseSystemTime",
         "LineHeight", "CharacterSpacing", "MaxLines",
         "IsDirectionReversed", "IsTabStop", "TabIndex", "ViewportSize", "MaxDropDownHeight",
-        "FontStyle", "IsItemsHost", "FlowDirection"
+        "FontStyle", "IsItemsHost", "FlowDirection", "ItemWidth", "ItemHeight"
     };
     return kProps.count(prop) > 0;
 }
@@ -1070,9 +1070,9 @@ struct XamlNode final {
 
 [[nodiscard]] bool IsPanelType(std::string_view typeName) {
     static const std::unordered_set<std::string_view> kPanels = {
-        "Panel", "Grid", "StackPanel", "VirtualizingStackPanel", "TabPanel",
-        "ToolBarPanel", "DockPanel", "WrapPanel", "ToolBarOverflowPanel",
-        "UniformGrid", "Canvas"
+        "Panel", "Grid", "StackPanel", "VirtualizingStackPanel", "VirtualizingUniformGrid",
+        "VirtualizingWrapGrid", "TabPanel", "ToolBarPanel", "DockPanel", "WrapPanel",
+        "ToolBarOverflowPanel", "UniformGrid", "Canvas"
     };
     return kPanels.count(typeName) > 0;
 }
@@ -1198,6 +1198,7 @@ struct XamlNode final {
     if (prop == "ShowGridLines") return targetType == "Grid";
     if (prop == "Orientation") {
         return targetType == "StackPanel" || targetType == "VirtualizingStackPanel" ||
+               targetType == "VirtualizingWrapGrid" ||
                targetType == "TabPanel" || targetType == "ToolBarPanel" ||
                targetType == "WrapPanel" || targetType == "ToolBarOverflowPanel" ||
                targetType == "ToolBar" || targetType == "Slider" ||
@@ -1206,12 +1207,18 @@ struct XamlNode final {
     }
     if (prop == "Spacing") {
         return targetType == "StackPanel" || targetType == "VirtualizingStackPanel" ||
+               targetType == "VirtualizingUniformGrid" || targetType == "VirtualizingWrapGrid" ||
                targetType == "TabPanel" || targetType == "ToolBarPanel" ||
                targetType == "WrapPanel" || targetType == "ToolBarOverflowPanel" ||
                targetType == "UniformGrid";
     }
     if (prop == "LastChildFill") return targetType == "DockPanel";
-    if (prop == "Rows" || prop == "Columns" || prop == "FirstColumn") return targetType == "UniformGrid";
+    if (prop == "Rows" || prop == "Columns" || prop == "FirstColumn") {
+        return targetType == "UniformGrid" || targetType == "VirtualizingUniformGrid";
+    }
+    if (prop == "ItemWidth" || prop == "ItemHeight") {
+        return targetType == "WrapPanel" || targetType == "VirtualizingWrapGrid";
+    }
     if (prop == "Stretch") {
         return targetType == "Viewbox" || targetType == "LayoutScaler" ||
                targetType == "Image" || IsShapeType(targetType) ||
@@ -1344,9 +1351,13 @@ struct XamlNode final {
         }
         if (prop == "Spacing") {
             return targetType == "StackPanel" || targetType == "VirtualizingStackPanel" ||
+                   targetType == "VirtualizingUniformGrid" || targetType == "VirtualizingWrapGrid" ||
                    targetType == "TabPanel" || targetType == "ToolBarPanel" ||
                    targetType == "WrapPanel" || targetType == "ToolBarOverflowPanel" ||
                    targetType == "UniformGrid" || targetType == "RadialTicks";
+        }
+        if (prop == "ItemWidth" || prop == "ItemHeight") {
+            return targetType == "WrapPanel" || targetType == "VirtualizingWrapGrid";
         }
         if (prop == "Minimum" || prop == "Maximum") {
             return IsRangeBaseType(targetType) || targetType == "Track" || targetType == "TickBar" ||
@@ -1397,7 +1408,9 @@ struct XamlNode final {
     }
     if (!targetType.empty() && (IsKnownUIElementType(targetType) || IsNonUIElementType(targetType))) {
         if (prop == "ZIndex") return !IsNonUIElementType(targetType);
-        if (prop == "Rows" || prop == "Columns" || prop == "FirstColumn") return targetType == "UniformGrid";
+        if (prop == "Rows" || prop == "Columns" || prop == "FirstColumn") {
+            return targetType == "UniformGrid" || targetType == "VirtualizingUniformGrid";
+        }
         if (prop == "MaxLines") return targetType == "TextBlock" || targetType == "TextBox";
         if (prop == "MaxLength") {
             return targetType == "TextBoxBase" || targetType == "TextBox" || targetType == "PasswordBox";
@@ -1959,7 +1972,14 @@ public:
         }
         res.dataType = xDataType;
 
-        if (!xClass.empty()) {
+        if (opts_.forceStandaloneClass && !opts_.classNameOverride.empty()) {
+            xClass.clear();
+            moduleName_ = !opts_.defaultModuleName.empty()
+                ? opts_.defaultModuleName
+                : "__AeroCompiledCatalog";
+            shortClassName_ = opts_.classNameOverride;
+            rootClassName_ = moduleName_ + "." + shortClassName_;
+        } else if (!xClass.empty()) {
             const std::size_t dot = xClass.rfind('.');
             if (dot != std::string::npos) {
                 moduleName_ = xClass.substr(0, dot);
@@ -2588,7 +2608,10 @@ private:
             Indent(initBody, 2);
             initBody << "// StartupUri: " << startup->value << "\n";
         }
-        EmitResourcesPropertyElement(root, baseClass, "this", currentXamlPath, initBody, 2);
+        if (EmitResourcesPropertyElement(root, baseClass, "this", currentXamlPath, initBody, 2)) {
+            Indent(initBody, 2);
+            initBody << "ResourceDictionary.PopAmbient(this.Resources);\n";
+        }
 
         if (inPartialClass_) {
             out << "[Observable]\n";
@@ -2713,7 +2736,7 @@ private:
         out << "}\n}\n";
     }
 
-    void EmitResourcesPropertyElement(
+    bool EmitResourcesPropertyElement(
         const XamlNode& ownerNode,
         std::string_view ownerType,
         std::string_view ownerVar,
@@ -2725,10 +2748,12 @@ private:
             resProp = ownerNode.FindPropertyElement("FrameworkElement", "Resources");
         }
         if (resProp == nullptr) {
-            return;
+            return false;
         }
 
         const std::string dictVar = std::string(ownerVar) + ".Resources";
+        Indent(out, indent);
+        out << "ResourceDictionary.PushAmbient(" << dictVar << ");\n";
         for (const auto& child : resProp->children) {
             if (ShouldIgnoreXmlElement(*child)) {
                 continue;
@@ -2739,6 +2764,7 @@ private:
                 EmitSingleDirectResource(*child, dictVar, out, indent);
             }
         }
+        return true;
     }
 
     void EmitSingleDirectResource(
@@ -2880,6 +2906,35 @@ private:
             }
             Indent(out, indent);
             out << dictVar << ".SetBox(" << EscapeRsString(key) << ", " << cVar << ");\n";
+        } else if (child.localName == "GradientStopCollection") {
+            const std::string gscVar = FreshVar("gsc");
+            Indent(out, indent);
+            out << "var " << gscVar << " = new ArrayCollectionBox();\n";
+            for (const auto& stop : child.children) {
+                if (!stop || stop->localName != "GradientStop") {
+                    continue;
+                }
+                float offset = 0.0f;
+                if (const auto* oAttr = stop->FindAttribute("Offset")) {
+                    (void)aero::str::TryParseFloat32(oAttr->value, offset);
+                }
+                std::string color = "#00000000";
+                if (const auto* cAttr = stop->FindAttribute("Color")) {
+                    if (!LooksLikeMarkupExtension(cAttr->value)) {
+                        color = ResolveColorHexOrString(cAttr->value);
+                    }
+                }
+                Indent(out, indent);
+                out << gscVar << ".AddBox(new GradientStop(" << EscapeRsString(color)
+                    << ", " << FormatFloatLiteral(offset) << "));\n";
+            }
+            Indent(out, indent);
+            out << dictVar << ".SetBox(" << EscapeRsString(key) << ", " << gscVar << ");\n";
+        } else if (IsKnownUIElementType(child.localName)) {
+            const std::string elVar = EmitConstructedElement(
+                child, {}, dictVar, opts_.xamlPath, out, indent);
+            Indent(out, indent);
+            out << dictVar << ".SetBox(" << EscapeRsString(key) << ", " << elVar << ");\n";
         }
     }
 
@@ -4113,7 +4168,10 @@ private:
             Indent(out, indent);
             out << tplVar << ".AmbientResources = " << dictVar << ";\n";
         }
-        EmitResourcesPropertyElement(tplNode, "ControlTemplate", tplVar, opts_.xamlPath, out, indent);
+        if (EmitResourcesPropertyElement(tplNode, "ControlTemplate", tplVar, opts_.xamlPath, out, indent)) {
+            Indent(out, indent);
+            out << "ResourceDictionary.PopAmbient(" << tplVar << ".Resources);\n";
+        }
         Indent(out, indent);
         out << tplVar << ".Factory = (Control " << tpParam << ") =>\n";
         Indent(out, indent);
@@ -4242,7 +4300,10 @@ private:
                 Indent(out, indent);
                 out << dtVar << ".AmbientResources = " << dictVar << ";\n";
             }
-            EmitResourcesPropertyElement(dtNode, dtNode.localName, dtVar, opts_.xamlPath, out, indent);
+            if (EmitResourcesPropertyElement(dtNode, dtNode.localName, dtVar, opts_.xamlPath, out, indent)) {
+                Indent(out, indent);
+                out << "ResourceDictionary.PopAmbient(" << dtVar << ".Resources);\n";
+            }
         };
 
         auto emitFactoryLambdaBody = [&]() {
@@ -5164,13 +5225,13 @@ private:
         std::string_view key,
         std::string_view dictVar) const {
         if (inPartialClass_) {
-            return "this.FindResource(" + EscapeRsString(key) + ")";
+            return "ResourceDictionary.FindScopedResource(this, " + EscapeRsString(key) + ")";
         }
         if (!currentTplParentVar_.empty()) {
             return currentTplParentVar_ + ".FindResource(" + EscapeRsString(key) + ")";
         }
         if (!dictVar.empty()) {
-            return std::string(dictVar) + ".Get(" + EscapeRsString(key) + ")";
+            return "ResourceDictionary.FindScopedResource(" + std::string(dictVar) + ", " + EscapeRsString(key) + ")";
         }
         return "ResourceDictionary.FindAmbientOrGlobal(" + EscapeRsString(key) + ")";
     }
@@ -5213,7 +5274,7 @@ private:
                         return "(DataTemplate)" + LookupResourceExpr(key, dictVar);
                     }
                     if (propName == "ItemsPanel") {
-                        return "((ItemsPanelTemplate)" + LookupResourceExpr(key, dictVar) + ").GetFactory()";
+                        return "ItemsPanelTemplate.GetFactoryOrNull(" + LookupResourceExpr(key, dictVar) + ")";
                     }
                     if (const auto it = knownGeometries_.find(key); it != knownGeometries_.end()) {
                         return EscapeRsString(it->second);
@@ -5691,7 +5752,7 @@ private:
                         out << targetVar << ".HeaderTemplate = (DataTemplate)" << lookup << ";\n";
                     } else if (propName == "ItemsPanel") {
                         Indent(out, indent);
-                        out << targetVar << ".ItemsPanel = ((ItemsPanelTemplate)" << lookup << ").GetFactory();\n";
+                        out << targetVar << ".ItemsPanel = ItemsPanelTemplate.GetFactoryOrNull(" << lookup << ");\n";
                     } else if (propName == "Storyboard") {
                         // Handled at action level
                     } else if (IsDirectUIPropertyFor(targetType, propName) ||
@@ -6223,6 +6284,9 @@ private:
         std::string srcExpr = !explicitSourceVar.empty()
             ? std::string(explicitSourceVar)
             : std::string("null");
+        if (!spec.sourceResourceKey.empty()) {
+            srcExpr = LookupResourceExpr(spec.sourceResourceKey, {});
+        }
         if (spec.hasRelativeSource && spec.ancestorType.empty()) {
             if (spec.relativeSourceMode == "Self") {
                 srcExpr = std::string(targetVar);
@@ -6442,7 +6506,14 @@ private:
         }
 
         // Resources property element before child properties so StaticResource references resolve
-        EmitResourcesPropertyElement(node, xmlLocalName, targetVar, currentXamlPath, out, indent);
+        const bool pushedLocalResources = EmitResourcesPropertyElement(
+            node, xmlLocalName, targetVar, currentXamlPath, out, indent);
+        auto popLocalResourcesIfNeeded = [&]() {
+            if (pushedLocalResources) {
+                Indent(out, indent);
+                out << "ResourceDictionary.PopAmbient(" << targetVar << ".Resources);\n";
+            }
+        };
 
         // Emit regular attributes
         bool hasDragDropAttr = false;
@@ -6929,12 +7000,14 @@ private:
                 Indent(out, indent);
                 out << targetVar << ".Text = " << EscapeRsString(node.textContent) << ";\n";
             }
+            popLocalResourcesIfNeeded();
             return;
         }
         if ((resolvedTypeName == "Path" || resolvedTypeName == "Geometry") &&
             !node.textContent.empty() && node.FindAttribute("Data") == nullptr) {
             Indent(out, indent);
             out << targetVar << ".Data = " << EscapeRsString(aero::str::Trim(node.textContent)) << ";\n";
+            popLocalResourcesIfNeeded();
             return;
         }
 
@@ -7012,6 +7085,7 @@ private:
             Indent(out, indent);
             out << targetVar << ".SetContent(" << EscapeRsString(node.textContent) << ");\n";
         }
+        popLocalResourcesIfNeeded();
     }
 
     [[nodiscard]] std::string EmitRunElement(

@@ -20,8 +20,32 @@ using SourceFile = rs_comp::SourceFile;
     std::string_view source,
     const std::unordered_set<std::string>* availableModules = nullptr);
 
+enum AeroStdlibPackageFlags : std::uint32_t {
+    AeroStdlibPkg_Auto = 0u,
+    AeroStdlibPkg_Core = 1u << 0,
+    AeroStdlibPkg_Controls = 1u << 1,
+    AeroStdlibPkg_RuntimeXaml = 1u << 2,
+    AeroStdlibPkg_Workbench = 1u << 3,
+    AeroStdlibPkg_GameHud = 1u << 4,
+    AeroStdlibPkg_All = AeroStdlibPkg_Core |
+                        AeroStdlibPkg_Controls |
+                        AeroStdlibPkg_RuntimeXaml |
+                        AeroStdlibPkg_Workbench,
+};
+
+struct CatalogXamlEntry {
+    std::string uri;
+    std::vector<std::string> aliasUris;
+    std::string xamlPath;
+    std::string xamlContent;
+    bool isResourceDictionary = false;
+};
+
 [[nodiscard]] std::vector<SourceFile> LoadStdlibModulePack(
     std::string_view stdlibRootDir = {});
+[[nodiscard]] std::vector<SourceFile> LoadStdlibModulePack(
+    std::string_view stdlibRootDir,
+    std::uint32_t packageMask);
 
 using ExternalXamlResolverFn = std::function<bool(
     std::string_view requestedSource,
@@ -33,8 +57,10 @@ struct AeroV3CompileInput {
     std::string xamlPath = "MainView.xaml";
     std::string xamlContent;
     std::vector<SourceFile> additionalXamlSources;
+    std::vector<CatalogXamlEntry> catalogXamlSources;
     std::vector<SourceFile> scriptSources;
     std::string stdlibRootDir;
+    std::uint32_t stdlibPackages = AeroStdlibPkg_Auto;
     bool includeStdlib = true;
     bool useStdlibDll = false;
     std::string stdlibDllPath;
@@ -85,6 +111,8 @@ struct AeroV3CompileResult {
     std::size_t prunedMirTypes = 0u;
     std::size_t retainedMirFunctions = 0u;
     std::size_t prunedMirFunctions = 0u;
+    std::uint32_t resolvedStdlibPackages = 0u;
+    std::size_t compiledCatalogEntryCount = 0u;
     std::vector<std::string> diagnostics;
 };
 

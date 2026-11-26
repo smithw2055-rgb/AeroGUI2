@@ -173,7 +173,9 @@ class ImageAtlas {
 public:
     static constexpr std::uint32_t kSharedUiAtlasTextureId = 0u;
     static constexpr std::uint32_t kDefaultSharedAtlasSize = 512u;
-    static constexpr std::uint32_t kDefaultMaxPackableExtent = 256u;
+    static constexpr std::uint32_t kDefaultMaxPackableExtent = 512u;
+    static constexpr std::uint32_t kDefaultMaxSharedAtlasSize = 2048u;
+    static constexpr std::uint32_t kMaxSharedAtlasPages = 3u;
 
     static ImageAtlas& Instance() noexcept;
 
@@ -193,6 +195,7 @@ public:
     [[nodiscard]] std::uint32_t SharedAtlasSize() const noexcept;
     [[nodiscard]] std::uint32_t MaxPackableWidth() const noexcept;
     [[nodiscard]] std::uint32_t MaxPackableHeight() const noexcept;
+    [[nodiscard]] std::size_t SharedAtlasPageCount() const noexcept;
 
     // Primary XAML base directory & fallback search roots for relative URIs (e.g. "Images/Earth.png")
     void SetBaseDirectory(std::string_view baseDir);
@@ -390,7 +393,12 @@ private:
 
     std::string baseDirectory_;
     std::vector<std::string> searchDirectories_;
-    SkylinePacker skyline_;
+    struct SharedAtlasPage {
+        std::uint32_t textureId = 0u;
+        std::uint32_t size = 0u;
+        SkylinePacker skyline;
+    };
+    std::vector<SharedAtlasPage> sharedAtlasPages_;
 
     struct DynamicSlotCacheEntry {
         std::string slotKey;

@@ -2695,8 +2695,9 @@ void ImageAtlas::ConfigureAtlas(
     } else if (textureSlots_.find(kSharedUiAtlasTextureId) == textureSlots_.end()) {
         sharedAtlasSize_ = clampedAtlas;
     }
-    maxPackableWidth_ = std::min(maxPackableWidth, sharedAtlasSize_ - 2u);
-    maxPackableHeight_ = std::min(maxPackableHeight, sharedAtlasSize_ - 2u);
+    const std::uint32_t maxPackLimit = std::max(sharedAtlasSize_, kDefaultMaxSharedAtlasSize) - 2u;
+    maxPackableWidth_ = std::min(maxPackableWidth, maxPackLimit);
+    maxPackableHeight_ = std::min(maxPackableHeight, maxPackLimit);
     revision_.fetch_add(1u, std::memory_order_release);
 }
 
@@ -2713,6 +2714,11 @@ std::uint32_t ImageAtlas::MaxPackableWidth() const noexcept {
 std::uint32_t ImageAtlas::MaxPackableHeight() const noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
     return maxPackableHeight_;
+}
+
+std::size_t ImageAtlas::SharedAtlasPageCount() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return sharedAtlasPages_.size();
 }
 
 void ImageAtlas::SetBaseDirectory(std::string_view baseDir) {
@@ -2766,23 +2772,31 @@ void ImageAtlas::EnsureWritableAtlasPixelsLocked(
 }
 
 void ImageAtlas::EnsureSharedAtlasAllocatedLocked() {
-    if (textureSlots_.find(kSharedUiAtlasTextureId) != textureSlots_.end()) {
+    if (!sharedAtlasPages_.empty() &&
+        textureSlots_.find(kSharedUiAtlasTextureId) != textureSlots_.end()) {
         return;
     }
-    TextureSlotBuffer slot{};
-    slot.textureId = kSharedUiAtlasTextureId;
-    slot.width = sharedAtlasSize_;
-    slot.height = sharedAtlasSize_;
-    slot.dirtyRevision = 1u;
-    slot.isAtlas = true;
-    EnsureWritableAtlasPixelsLocked(slot, sharedAtlasSize_);
-    slot.pixelSnapshot.reset();
-    slot.hasDirtyRect = false;
-    slot.dirtyBaseRevision = 1u;
-    textureSlots_.emplace(kSharedUiAtlasTextureId, std::move(slot));
-
-    skyline_.Reset(sharedAtlasSize_, sharedAtlasSize_);
-    revision_.fetch_add(1u, std::memory_order_release);
+    if (textureSlots_.find(kSharedUiAtlasTextureId) == textureSlots_.end()) {
+        TextureSlotBuffer slot{};
+        slot.textureId = kSharedUiAtlasTextureId;
+        slot.width = sharedAtlasSize_;
+        slot.height = sharedAtlasSize_;
+        slot.dirtyRevision = 1u;
+        slot.isAtlas = true;
+        EnsureWritableAtlasPixelsLocked(slot, sharedAtlasSize_);
+        slot.pixelSnapshot.reset();
+        slot.hasDirtyRect = false;
+        slot.dirtyBaseRevision = 1u;
+        textureSlots_.emplace(kSharedUiAtlasTextureId, std::move(slot));
+        revision_.fetch_add(1u, std::memory_order_release);
+    }
+    if (sharedAtlasPages_.empty()) {
+        SharedAtlasPage page0{};
+        page0.textureId = kSharedUiAtlasTextureId;
+        page0.size = sharedAtlasSize_;
+        page0.skyline.Reset(sharedAtlasSize_, sharedAtlasSize_);
+        sharedAtlasPages_.push_back(std::move(page0));
+    }
 }
 
 bool ImageAtlas::TryAllocateSkylineRectLocked(
@@ -2790,7 +2804,10 @@ bool ImageAtlas::TryAllocateSkylineRectLocked(
     std::uint32_t paddedH,
     std::uint32_t& outX,
     std::uint32_t& outY) noexcept {
-    return skyline_.TryAllocate(paddedW, paddedH, outX, outY);
+    if (sharedAtlasPages_.empty()) {
+        return false;
+    }
+    return sharedAtlasPages_[0].skyline.TryAllocate(paddedW, paddedH, outX, outY);
 }
 
 void ImageAtlas::BlitWithExtrudedBorderLocked(
@@ -2985,8 +3002,8 @@ const ImageAtlasEntry* ImageAtlas::InsertDecodedSharedLocked(
     const bool fitsPackThreshold = !forceStandalone &&
         width <= maxPackableWidth_ &&
         height <= maxPackableHeight_ &&
-        (width + 2u) <= sharedAtlasSize_ &&
-        (height + 2u) <= sharedAtlasSize_;
+        (width + 2u) <= kDefaultMaxSharedAtlasSize &&
+        (height + 2u) <= kDefaultMaxSharedAtlasSize;
 
     ImageAtlasEntry entry{};
     entry.uriKey = canonicalKey;
@@ -2996,27 +3013,71 @@ const ImageAtlasEntry* ImageAtlas::InsertDecodedSharedLocked(
     bool packedInSharedAtlas = false;
     if (fitsPackThreshold) {
         EnsureSharedAtlasAllocatedLocked();
-        std::uint32_t paddedX = 0u;
-        std::uint32_t paddedY = 0u;
-        if (TryAllocateSkylineRectLocked(width + 2u, height + 2u, paddedX, paddedY)) {
+        const std::uint32_t reqW = width + 2u;
+        const std::uint32_t reqH = height + 2u;
+        auto packIntoPage = [&](SharedAtlasPage& pg) -> bool {
+            if (reqW > pg.size || reqH > pg.size) {
+                return false;
+            }
+            std::uint32_t paddedX = 0u;
+            std::uint32_t paddedY = 0u;
+            if (!pg.skyline.TryAllocate(reqW, reqH, paddedX, paddedY)) {
+                return false;
+            }
             const std::uint32_t innerX = paddedX + 1u;
             const std::uint32_t innerY = paddedY + 1u;
-            TextureSlotBuffer& sharedBuf = textureSlots_[kSharedUiAtlasTextureId];
+            TextureSlotBuffer& sharedBuf = textureSlots_[pg.textureId];
             BlitWithExtrudedBorderLocked(sharedBuf, innerX, innerY, width, height, pixels->data());
 
-            const float invAtlasW = 1.0f / static_cast<float>(sharedAtlasSize_);
-            const float invAtlasH = 1.0f / static_cast<float>(sharedAtlasSize_);
-            entry.textureId = kSharedUiAtlasTextureId;
+            const float invAtlas = 1.0f / static_cast<float>(pg.size);
+            entry.textureId = pg.textureId;
             entry.atlasX = innerX;
             entry.atlasY = innerY;
-            entry.atlasWidth = sharedAtlasSize_;
-            entry.atlasHeight = sharedAtlasSize_;
-            entry.u0 = static_cast<float>(innerX) * invAtlasW;
-            entry.v0 = static_cast<float>(innerY) * invAtlasH;
-            entry.u1 = static_cast<float>(innerX + width) * invAtlasW;
-            entry.v1 = static_cast<float>(innerY + height) * invAtlasH;
+            entry.atlasWidth = pg.size;
+            entry.atlasHeight = pg.size;
+            entry.u0 = static_cast<float>(innerX) * invAtlas;
+            entry.v0 = static_cast<float>(innerY) * invAtlas;
+            entry.u1 = static_cast<float>(innerX + width) * invAtlas;
+            entry.v1 = static_cast<float>(innerY + height) * invAtlas;
             entry.isStandalone = false;
-            packedInSharedAtlas = true;
+            return true;
+        };
+
+        for (SharedAtlasPage& pg : sharedAtlasPages_) {
+            if (packIntoPage(pg)) {
+                packedInSharedAtlas = true;
+                break;
+            }
+        }
+
+        if (!packedInSharedAtlas && sharedAtlasPages_.size() < kMaxSharedAtlasPages) {
+            std::uint32_t nextSize = std::max<std::uint32_t>(1024u, sharedAtlasSize_);
+            const std::uint32_t needExtent = std::max(reqW, reqH);
+            while (nextSize < needExtent && nextSize < kDefaultMaxSharedAtlasSize) {
+                nextSize *= 2u;
+            }
+            nextSize = std::min(nextSize, kDefaultMaxSharedAtlasSize);
+            if (needExtent <= nextSize) {
+                const std::uint32_t pageTexId = AllocateStandaloneTextureIdLocked();
+                TextureSlotBuffer pageSlot{};
+                pageSlot.textureId = pageTexId;
+                pageSlot.width = nextSize;
+                pageSlot.height = nextSize;
+                pageSlot.dirtyRevision = 1u;
+                pageSlot.isAtlas = true;
+                EnsureWritableAtlasPixelsLocked(pageSlot, nextSize);
+                pageSlot.pixelSnapshot.reset();
+                pageSlot.hasDirtyRect = false;
+                pageSlot.dirtyBaseRevision = 1u;
+                textureSlots_.emplace(pageTexId, std::move(pageSlot));
+
+                SharedAtlasPage newPage{};
+                newPage.textureId = pageTexId;
+                newPage.size = nextSize;
+                newPage.skyline.Reset(nextSize, nextSize);
+                sharedAtlasPages_.push_back(std::move(newPage));
+                packedInSharedAtlas = packIntoPage(sharedAtlasPages_.back());
+            }
         }
     }
 
@@ -4931,7 +4992,7 @@ std::size_t ImageAtlas::EstimatedMemoryBytes() const noexcept {
 
 void ImageAtlas::Clear() noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
-    skyline_.ClearToEmpty();
+    sharedAtlasPages_.clear();
     memoryEncodedAssets_.clear();
     entries_.clear();
     packedMasks_.clear();
