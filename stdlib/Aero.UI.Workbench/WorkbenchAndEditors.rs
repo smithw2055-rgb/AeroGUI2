@@ -45,9 +45,9 @@ public static class EditorMath {
     }
     public static string IntToStr(int v) {
         if (v == 0) { return "0"; }
+        if (v <= (-2147483647 - 1)) { return "-2147483648"; }
         bool neg = v < 0;
         int n = neg ? -v : v;
-        if (n < 0) { return "-2147483648"; }
         string res = "";
         while (n > 0) {
             res = DigitChar(n % 10) + res;
@@ -79,6 +79,15 @@ public class ValueEditLifecycleEventArgs : RoutedEventArgs {
     public string OldText { get; set; } = "";
     public string NewText { get; set; } = "";
     public EditLifecyclePhase Phase { get; set; } = EditLifecyclePhase.Change;
+    public float FloatW { get; set; } = 0.0f;
+    public float ValueY { get; set; } = 0.0f;
+    public float ValueZ { get; set; } = 0.0f;
+    public float ValueW { get; set; } = 0.0f;
+    public float ColorR { get; set; } = 0.0f;
+    public float ColorG { get; set; } = 0.0f;
+    public float ColorB { get; set; } = 0.0f;
+    public float ColorA { get; set; } = 1.0f;
+    public int IntValue { get; set; } = 0;
 
     public ValueEditLifecycleEventArgs() : base("ValueEdit") {}
     public ValueEditLifecycleEventArgs(
@@ -95,6 +104,40 @@ public class ValueEditLifecycleEventArgs : RoutedEventArgs {
 }
 
 public delegate void ValueEditEventHandler(object sender, ValueEditLifecycleEventArgs e);
+
+public class PropertyCardActionEventArgs : RoutedEventArgs {
+    public string GroupKey { get; set; } = "";
+    public string Category { get; set; } = "";
+    public string Action { get; set; } = "";
+
+    public PropertyCardActionEventArgs() : base("PropertyCardAction") {}
+    public PropertyCardActionEventArgs(string groupKey, string category, string action, object source = null)
+        : base("PropertyCardAction", source) {
+        GroupKey = groupKey == null ? "" : groupKey;
+        Category = category == null ? "" : category;
+        Action = action == null ? "" : action;
+    }
+}
+
+public delegate void PropertyCardActionEventHandler(object sender, PropertyCardActionEventArgs e);
+
+public class PropertyAssetActionEventArgs : RoutedEventArgs {
+    public string PropertyPath { get; set; } = "";
+    public string Action { get; set; } = "";
+    public string AssetFilter { get; set; } = "";
+    public string AssetPath { get; set; } = "";
+
+    public PropertyAssetActionEventArgs() : base("PropertyAssetAction") {}
+    public PropertyAssetActionEventArgs(string propPath, string action, string filter, string path, object source = null)
+        : base("PropertyAssetAction", source) {
+        PropertyPath = propPath == null ? "" : propPath;
+        Action = action == null ? "" : action;
+        AssetFilter = filter == null ? "" : filter;
+        AssetPath = path == null ? "" : path;
+    }
+}
+
+public delegate void PropertyAssetActionEventHandler(object sender, PropertyAssetActionEventArgs e);
 
 public class ViewportInputEventArgs : RoutedEventArgs {
     public float LocalX { get; set; } = 0.0f;
@@ -123,6 +166,7 @@ public class NumericScrubber : Control {
     private float _step = 0.1f;
     private int _decimals = 2;
     private bool _isReadOnly = false;
+    private bool _isMixed = false;
     private string _propertyPath = "";
 
     private bool _scrubbing = false;
@@ -198,6 +242,9 @@ public class NumericScrubber : Control {
                 ke.Handled = true;
             }
         };
+        _inlineBox.LostFocus += (object s, RoutedEventArgs re) => {
+            self.CommitInlineText();
+        };
         _rootGrid.AddChild(_inlineBox);
     }
 
@@ -225,7 +272,7 @@ public class NumericScrubber : Control {
             _labelText.Foreground = _labelBrush != null ? _labelBrush : new SolidColorBrush("#FF38BDF8");
         }
         if (_valueText != null) {
-            _valueText.Text = FormatFloat(_value);
+            _valueText.Text = _isMixed ? "—" : FormatFloat(_value);
             _valueText.Visibility = _inlineEditing ? Visibility.Collapsed : Visibility.Visible;
         }
         if (_inlineBox != null) {
@@ -261,6 +308,17 @@ public class NumericScrubber : Control {
         get { return _isReadOnly; }
         set { _isReadOnly = value; }
     }
+    public bool IsMixed {
+        get { return _isMixed; }
+        set {
+            if (_isMixed == value) { return; }
+            _isMixed = value;
+            RefreshVisuals();
+        }
+    }
+    public bool IsInlineEditing() { return _inlineEditing; }
+    public TextBox InlineTextBox() { return _inlineBox; }
+    public string DisplayedValueText() { return _valueText != null ? _valueText.Text : ""; }
     public string PropertyPath {
         get { return _propertyPath; }
         set { _propertyPath = value == null ? "" : value; }
@@ -275,14 +333,19 @@ public class NumericScrubber : Control {
         float clamped = Math.Clampf(nextVal, _min, _max);
         float prev = _value;
         _value = clamped;
+        if (emitEvents) {
+            _isMixed = false;
+        }
         BumpPropEpoch();
         NotifyBoundPropertyChanged("Value", DependencyObject.BoxFloat(_value));
         RefreshVisuals();
         if (emitEvents) {
             var ev = new ValueEditLifecycleEventArgs(_propertyPath, prev, _value, phase, this);
+            ev.IntValue = EditorMath.RoundToInt(_value);
             ValueChanged(this, ev);
             if (phase == EditLifecyclePhase.Commit) {
                 var cev = new ValueEditLifecycleEventArgs(_propertyPath, _editStartValue, _value, EditLifecyclePhase.Commit, this);
+                cev.IntValue = EditorMath.RoundToInt(_value);
                 EditCommitted(this, cev);
             }
         }
@@ -302,15 +365,22 @@ public class NumericScrubber : Control {
         if (_isReadOnly || _inlineEditing) { return; }
         _inlineEditing = true;
         _editStartValue = _value;
-        _inlineBox.Text = FormatFloat(_value);
+        _inlineBox.PlaceholderText = _isMixed ? "—" : "";
+        _inlineBox.Text = _isMixed ? "" : FormatFloat(_value);
         RefreshVisuals();
         _inlineBox.Focus();
+        _inlineBox.SelectAll();
     }
 
     public void CommitInlineText() {
         if (!_inlineEditing) { return; }
         _inlineEditing = false;
-        float parsed = ParseUtil.ParseFloat(_inlineBox.Text, _value);
+        string raw = _inlineBox.Text == null ? "" : _inlineBox.Text.Trim();
+        if (_isMixed && (raw.Length == 0 || raw == "—")) {
+            RefreshVisuals();
+            return;
+        }
+        float parsed = ParseUtil.ParseFloat(raw, _value);
         SetValueInternal(parsed, true, EditLifecyclePhase.Commit);
     }
 
@@ -427,11 +497,22 @@ public class Vector2Field : Control {
     internal void RaiseVectorChanged() { VectorChanged(this, EventArgs.Empty()); }
     internal void RaiseEditCommitted() { EditCommitted(this, EventArgs.Empty()); }
 
+    public NumericScrubber ScrubberX() { return _xBox; }
+    public NumericScrubber ScrubberY() { return _yBox; }
+
     public float X { get { return _xBox.Value; } set { _xBox.Value = value; } }
     public float Y { get { return _yBox.Value; } set { _yBox.Value = value; } }
     public float Step {
         get { return _xBox.Step; }
         set { _xBox.Step = value; _yBox.Step = value; }
+    }
+    public bool IsMixed {
+        get { return _xBox.IsMixed || _yBox.IsMixed; }
+        set { _xBox.IsMixed = value; _yBox.IsMixed = value; }
+    }
+    public bool IsReadOnly {
+        get { return _xBox.IsReadOnly; }
+        set { _xBox.IsReadOnly = value; _yBox.IsReadOnly = value; }
     }
 
     public override bool SetPropertyValue(string propName, DependencyObject value) {
@@ -507,6 +588,14 @@ public class Vector3Field : Control {
         get { return _xBox.Step; }
         set { _xBox.Step = value; _yBox.Step = value; _zBox.Step = value; }
     }
+    public bool IsMixed {
+        get { return _xBox.IsMixed || _yBox.IsMixed || _zBox.IsMixed; }
+        set { _xBox.IsMixed = value; _yBox.IsMixed = value; _zBox.IsMixed = value; }
+    }
+    public bool IsReadOnly {
+        get { return _xBox.IsReadOnly; }
+        set { _xBox.IsReadOnly = value; _yBox.IsReadOnly = value; _zBox.IsReadOnly = value; }
+    }
 
     public override bool SetPropertyValue(string propName, DependencyObject value) {
         if (propName == "X") { X = DependencyObject.UnboxFloat(value, 0.0f); return true; }
@@ -522,6 +611,403 @@ public class Vector3Field : Control {
         if (propName == "Z") { return DependencyObject.BoxFloat(Z); }
         if (propName == "Step") { return DependencyObject.BoxFloat(Step); }
         return base.GetPropertyValue(propName);
+    }
+}
+
+public class ColorPicker : Control {
+    private float _r = 1.0f;
+    private float _g = 1.0f;
+    private float _b = 1.0f;
+    private float _a = 1.0f;
+    private bool _isHdr = false;
+    private bool _isMixed = false;
+    internal bool _isReadOnly = false;
+    private string _propertyPath = "";
+    private bool _syncing = false;
+
+    private Grid _rootGrid;
+    private Border _swatchBtn;
+    private TextBlock _hdrBadge;
+    private TextBox _hexBox;
+    private Button _expandBtn;
+    private Popup _popup;
+    private Slider[] _sliders;
+    private NumericScrubber[] _scrubbers;
+
+    public event ValueEditEventHandler ColorChanged;
+    public event ValueEditEventHandler EditCommitted;
+
+    public ColorPicker() : base() {
+        Height = 26.0f;
+        _sliders = new Slider[4];
+        _scrubbers = new NumericScrubber[4];
+        BuildVisuals();
+        RefreshVisuals();
+    }
+
+    public override string GetTypeName() { return "ColorPicker"; }
+
+    private void BuildVisuals() {
+        _rootGrid = new Grid();
+        _rootGrid.ColumnSpacing = 4.0f;
+        _rootGrid.SetColumnDefinitions("44,*,24");
+        AddChild(_rootGrid);
+
+        _swatchBtn = new Border();
+        _swatchBtn.Height = 24.0f;
+        _swatchBtn.CornerRadius = new CornerRadius(3.0f);
+        _swatchBtn.BorderBrush = new SolidColorBrush("#FF475569");
+        _swatchBtn.BorderThickness = new Thickness(1.0f);
+        _hdrBadge = new TextBlock();
+        _hdrBadge.Text = "HDR";
+        _hdrBadge.FontSize = 9.0f;
+        _hdrBadge.FontWeight = "Bold";
+        _hdrBadge.Foreground = new SolidColorBrush("#FFFFFFFF");
+        _hdrBadge.HorizontalAlignment = HorizontalAlignment.Center;
+        _hdrBadge.VerticalAlignment = VerticalAlignment.Center;
+        _hdrBadge.Visibility = Visibility.Collapsed;
+        _swatchBtn.Child = _hdrBadge;
+        UIElement.SetGridColumn(_swatchBtn, 0);
+        _rootGrid.AddChild(_swatchBtn);
+
+        _hexBox = new TextBox();
+        _hexBox.Height = 24.0f;
+        _hexBox.FontSize = 11.0f;
+        _hexBox.Padding = new Thickness(4.0f, 2.0f, 4.0f, 2.0f);
+        UIElement.SetGridColumn(_hexBox, 1);
+        _rootGrid.AddChild(_hexBox);
+
+        _expandBtn = new Button();
+        var expTxt = new TextBlock();
+        expTxt.Text = "▾";
+        expTxt.FontSize = 10.0f;
+        _expandBtn.Content = expTxt;
+        _expandBtn.Width = 24.0f;
+        _expandBtn.Height = 24.0f;
+        _expandBtn.Padding = new Thickness(0.0f);
+        UIElement.SetGridColumn(_expandBtn, 2);
+        _rootGrid.AddChild(_expandBtn);
+
+        _popup = new Popup();
+        _popup.PlacementTarget = _swatchBtn;
+        _popup.Placement = "Bottom";
+        _popup.StaysOpen = false;
+
+        var popPanel = new Border();
+        popPanel.Width = 236.0f;
+        popPanel.Background = new SolidColorBrush("#FF0B1120");
+        popPanel.BorderBrush = new SolidColorBrush("#FF334155");
+        popPanel.BorderThickness = new Thickness(1.0f);
+        popPanel.CornerRadius = new CornerRadius(4.0f);
+        popPanel.Padding = new Thickness(8.0f);
+
+        var chStack = new StackPanel();
+        chStack.Orientation = Orientation.Vertical;
+        chStack.Spacing = 4.0f;
+
+        string[] labels = new string[4];
+        labels[0] = "R";
+        labels[1] = "G";
+        labels[2] = "B";
+        labels[3] = "A";
+        string[] colors = new string[4];
+        colors[0] = "#FFEF4444";
+        colors[1] = "#FF22C55E";
+        colors[2] = "#FF3B82F6";
+        colors[3] = "#FF94A3B8";
+
+        ColorPicker self = this;
+        for (int i = 0; i < 4; i += 1) {
+            int chIdx = i;
+            var row = new Grid();
+            row.SetColumnDefinitions("*,68");
+            row.ColumnSpacing = 6.0f;
+
+            var sl = new Slider();
+            sl.Minimum = 0.0f;
+            sl.Maximum = (i < 3 && _isHdr) ? 16.0f : 1.0f;
+            sl.SmallChange = 0.02f;
+            sl.LargeChange = 0.1f;
+            sl.VerticalAlignment = VerticalAlignment.Center;
+            UIElement.SetGridColumn(sl, 0);
+            row.AddChild(sl);
+
+            var sc = new NumericScrubber();
+            sc.Label = labels[i];
+            sc.LabelBrush = new SolidColorBrush(colors[i]);
+            sc.Minimum = 0.0f;
+            sc.Maximum = (i < 3 && _isHdr) ? 16.0f : 1.0f;
+            sc.Step = 0.02f;
+            sc.Decimals = 2;
+            UIElement.SetGridColumn(sc, 1);
+            row.AddChild(sc);
+
+            sl.ValueChanged += (object s, RoutedPropertyChangedEventArgs<float> e) => {
+                self.OnChannelChangedFromSlider(chIdx, e.NewValue);
+            };
+            sl.MouseLeftButtonUp += (object s, MouseButtonEventArgs e) => {
+                self.RaiseCommit();
+            };
+            sc.ValueChanged += (object s, ValueEditLifecycleEventArgs e) => {
+                self.OnChannelChangedFromScrubber(chIdx, e.NewValue, false);
+            };
+            sc.EditCommitted += (object s, ValueEditLifecycleEventArgs e) => {
+                self.OnChannelChangedFromScrubber(chIdx, e.NewValue, true);
+            };
+
+            _sliders[i] = sl;
+            _scrubbers[i] = sc;
+            chStack.AddChild(row);
+        }
+
+        popPanel.Child = chStack;
+        _popup.Child = popPanel;
+
+        _swatchBtn.MouseLeftButtonDown += (object s, MouseButtonEventArgs e) => {
+            if (!self._isReadOnly) {
+                self.TogglePopup();
+                e.Handled = true;
+            }
+        };
+        _expandBtn.Click += (object s, RoutedEventArgs e) => {
+            if (!self._isReadOnly) {
+                self.TogglePopup();
+            }
+        };
+        _hexBox.KeyDown += (object s, KeyEventArgs ke) => {
+            if (ke.Key == KeyCode.Enter) {
+                self.CommitHexInput();
+                ke.Handled = true;
+            }
+        };
+        _hexBox.LostFocus += (object s, RoutedEventArgs re) => {
+            self.CommitHexInput();
+        };
+    }
+
+    public void TogglePopup() {
+        if (_popup == null) { return; }
+        _popup.IsOpen = !_popup.IsOpen;
+    }
+
+    public bool IsPickerPopupOpen() {
+        return _popup != null && _popup.IsOpen;
+    }
+
+    public void ClosePopup() {
+        if (_popup != null) { _popup.IsOpen = false; }
+    }
+
+    public TextBox HexTextBox() { return _hexBox; }
+    public Border SwatchBorder() { return _swatchBtn; }
+    public Button ExpandButton() { return _expandBtn; }
+    public NumericScrubber ChannelScrubber(int idx) {
+        if (idx < 0 || idx >= 4) { return null; }
+        return _scrubbers[idx];
+    }
+
+    public float R { get { return _r; } set { _r = Math.Maxf(0.0f, value); RefreshVisuals(); } }
+    public float G { get { return _g; } set { _g = Math.Maxf(0.0f, value); RefreshVisuals(); } }
+    public float B { get { return _b; } set { _b = Math.Maxf(0.0f, value); RefreshVisuals(); } }
+    public float A { get { return _a; } set { _a = Math.Clampf(value, 0.0f, 1.0f); RefreshVisuals(); } }
+    public bool IsHdr {
+        get { return _isHdr; }
+        set {
+            if (_isHdr == value) { return; }
+            _isHdr = value;
+            UpdateChannelRanges();
+            RefreshVisuals();
+        }
+    }
+    public bool IsMixed {
+        get { return _isMixed; }
+        set {
+            if (_isMixed == value) { return; }
+            _isMixed = value;
+            RefreshVisuals();
+        }
+    }
+    public bool IsReadOnly {
+        get { return _isReadOnly; }
+        set {
+            _isReadOnly = value;
+            if (_hexBox != null) { _hexBox.IsReadOnly = value; }
+            for (int i = 0; i < 4; i += 1) {
+                if (_scrubbers[i] != null) { _scrubbers[i].IsReadOnly = value; }
+            }
+        }
+    }
+    public string PropertyPath {
+        get { return _propertyPath; }
+        set { _propertyPath = value == null ? "" : value; }
+    }
+
+    public void SetColor(float r, float g, float b, float a, bool emit = false) {
+        float maxC = _isHdr ? 64.0f : 1.0f;
+        _r = Math.Clampf(r, 0.0f, maxC);
+        _g = Math.Clampf(g, 0.0f, maxC);
+        _b = Math.Clampf(b, 0.0f, maxC);
+        _a = Math.Clampf(a, 0.0f, 1.0f);
+        if (emit) { _isMixed = false; }
+        RefreshVisuals();
+        if (emit) {
+            RaiseEdit();
+            RaiseCommit();
+        }
+    }
+
+    private void UpdateChannelRanges() {
+        float maxRgb = _isHdr ? 16.0f : 1.0f;
+        for (int i = 0; i < 3; i += 1) {
+            if (_sliders[i] != null) { _sliders[i].Maximum = maxRgb; }
+            if (_scrubbers[i] != null) { _scrubbers[i].Maximum = maxRgb; }
+        }
+    }
+
+    private static string FormatF2(float v) {
+        bool neg = v < 0.0f;
+        float av = neg ? -v : v;
+        int scaled = EditorMath.RoundToInt(av * 100.0f);
+        int whole = scaled / 100;
+        int frac = scaled % 100;
+        string fs = EditorMath.IntToStr(frac);
+        if (fs.Length < 2) { fs = "0" + fs; }
+        return (neg ? "-" : "") + EditorMath.IntToStr(whole) + "." + fs;
+    }
+
+    public string FormatColorPayload() {
+        if (_isHdr || _r > 1.001f || _g > 1.001f || _b > 1.001f) {
+            return FormatF2(_r) + "," + FormatF2(_g) + "," + FormatF2(_b) + "," + FormatF2(_a);
+        }
+        uint rB = (uint)EditorMath.Clampi(EditorMath.RoundToInt(_r * 255.0f), 0, 255);
+        uint gB = (uint)EditorMath.Clampi(EditorMath.RoundToInt(_g * 255.0f), 0, 255);
+        uint bB = (uint)EditorMath.Clampi(EditorMath.RoundToInt(_b * 255.0f), 0, 255);
+        uint aB = (uint)EditorMath.Clampi(EditorMath.RoundToInt(_a * 255.0f), 0, 255);
+        return ParseUtil.FormatArgbHex(ParseUtil.PackArgb(aB, rB, gB, bB));
+    }
+
+    private void RefreshVisuals() {
+        _syncing = true;
+        uint rB = (uint)EditorMath.Clampi(EditorMath.RoundToInt(Math.Clampf(_r, 0.0f, 1.0f) * 255.0f), 0, 255);
+        uint gB = (uint)EditorMath.Clampi(EditorMath.RoundToInt(Math.Clampf(_g, 0.0f, 1.0f) * 255.0f), 0, 255);
+        uint bB = (uint)EditorMath.Clampi(EditorMath.RoundToInt(Math.Clampf(_b, 0.0f, 1.0f) * 255.0f), 0, 255);
+        uint aB = (uint)EditorMath.Clampi(EditorMath.RoundToInt(Math.Clampf(_a, 0.0f, 1.0f) * 255.0f), 0, 255);
+        if (_swatchBtn != null) {
+            if (_isMixed) {
+                _swatchBtn.Background = new SolidColorBrush("#FF334155");
+            } else {
+                _swatchBtn.Background = new SolidColorBrush(ParseUtil.PackArgb(aB, rB, gB, bB));
+            }
+        }
+        if (_hdrBadge != null) {
+            _hdrBadge.Visibility = _isHdr ? Visibility.Visible : Visibility.Collapsed;
+        }
+        if (_hexBox != null && !_hexBox.IsFocused) {
+            _hexBox.PlaceholderText = _isMixed ? "—" : "#AARRGGBB";
+            string targetHex = _isMixed ? "" : FormatColorPayload();
+            if (_hexBox.Text != targetHex) {
+                _hexBox.Text = targetHex;
+            }
+        }
+        float[] vals = new float[4];
+        vals[0] = _r; vals[1] = _g; vals[2] = _b; vals[3] = _a;
+        for (int i = 0; i < 4; i += 1) {
+            if (_sliders[i] != null) { _sliders[i].Value = Math.Clampf(vals[i], _sliders[i].Minimum, _sliders[i].Maximum); }
+            if (_scrubbers[i] != null) {
+                _scrubbers[i].IsMixed = _isMixed;
+                _scrubbers[i].Value = vals[i];
+            }
+        }
+        _syncing = false;
+    }
+
+    private ValueEditLifecycleEventArgs MakeArgs(EditLifecyclePhase phase) {
+        var ev = new ValueEditLifecycleEventArgs(_propertyPath, 0.0f, _r, phase, this);
+        ev.NewText = FormatColorPayload();
+        ev.ColorR = _r;
+        ev.ColorG = _g;
+        ev.ColorB = _b;
+        ev.ColorA = _a;
+        ev.ValueY = _g;
+        ev.ValueZ = _b;
+        ev.ValueW = _a;
+        ev.FloatW = _a;
+        return ev;
+    }
+
+    internal void RaiseEdit() { ColorChanged(this, MakeArgs(EditLifecyclePhase.Change)); }
+    internal void RaiseCommit() { EditCommitted(this, MakeArgs(EditLifecyclePhase.Commit)); }
+
+    internal void OnChannelChangedFromSlider(int chIdx, float val) {
+        if (_syncing || _isReadOnly) { return; }
+        _isMixed = false;
+        if (chIdx == 0) { _r = val; }
+        else if (chIdx == 1) { _g = val; }
+        else if (chIdx == 2) { _b = val; }
+        else { _a = Math.Clampf(val, 0.0f, 1.0f); }
+        RefreshVisuals();
+        RaiseEdit();
+    }
+
+    internal void OnChannelChangedFromScrubber(int chIdx, float val, bool commit) {
+        if (_syncing || _isReadOnly) { return; }
+        _isMixed = false;
+        if (chIdx == 0) { _r = Math.Maxf(0.0f, val); }
+        else if (chIdx == 1) { _g = Math.Maxf(0.0f, val); }
+        else if (chIdx == 2) { _b = Math.Maxf(0.0f, val); }
+        else { _a = Math.Clampf(val, 0.0f, 1.0f); }
+        RefreshVisuals();
+        if (commit) {
+            RaiseEdit();
+            RaiseCommit();
+        } else {
+            RaiseEdit();
+        }
+    }
+
+    internal void CommitHexInput() {
+        if (_syncing || _isReadOnly || _hexBox == null) { return; }
+        string txt = _hexBox.Text == null ? "" : _hexBox.Text.Trim();
+        if (txt.Length == 0 || txt == "—") {
+            RefreshVisuals();
+            return;
+        }
+        if (txt.StartsWith("#")) {
+            uint parsed = ParseUtil.ParseHexColor(txt, 0u);
+            if (parsed == 0u && txt != "#00000000" && txt != "#0000") {
+                RefreshVisuals();
+                return;
+            }
+            uint aB = (parsed / 16777216u) % 256u;
+            uint bB = (parsed / 65536u) % 256u;
+            uint gB = (parsed / 256u) % 256u;
+            uint rB = parsed % 256u;
+            _r = (float)rB / 255.0f;
+            _g = (float)gB / 255.0f;
+            _b = (float)bB / 255.0f;
+            _a = (float)aB / 255.0f;
+            _isMixed = false;
+            RefreshVisuals();
+            RaiseEdit();
+            RaiseCommit();
+            return;
+        }
+        string[] parts = txt.Split(",");
+        if (parts.Length >= 3) {
+            float maxC = _isHdr ? 64.0f : 1.0f;
+            _r = Math.Clampf(ParseUtil.ParseFloat(parts[0], _r), 0.0f, maxC);
+            _g = Math.Clampf(ParseUtil.ParseFloat(parts[1], _g), 0.0f, maxC);
+            _b = Math.Clampf(ParseUtil.ParseFloat(parts[2], _b), 0.0f, maxC);
+            if (parts.Length >= 4) {
+                _a = Math.Clampf(ParseUtil.ParseFloat(parts[3], _a), 0.0f, 1.0f);
+            }
+            _isMixed = false;
+            RefreshVisuals();
+            RaiseEdit();
+            RaiseCommit();
+            return;
+        }
+        RefreshVisuals();
     }
 }
 
@@ -744,15 +1230,22 @@ public class DockPane : ContentControl {
 }
 
 public class DockTabGroup : Control {
+    private static int _nextGroupSeqId = 1;
+    internal int _groupSeqId = 0;
     private DockPane[] _panes;
     private int _selectedIndex = -1;
     private Grid _rootGrid;
     private StackPanel _tabStrip;
     private Border _contentHost;
+    internal DockingWorkspace _ownerWorkspace;
+    internal string _zoneTag = "D";
+    private bool _maximizedDetached = false;
 
     public event EventHandler ActivePaneChanged;
 
     public DockTabGroup() : base() {
+        _groupSeqId = _nextGroupSeqId;
+        _nextGroupSeqId += 1;
         _panes = new DockPane[0];
         Background = new SolidColorBrush("#FF111827");
         BorderBrush = new SolidColorBrush("#FF1E293B");
@@ -784,6 +1277,47 @@ public class DockTabGroup : Control {
 
     public int PaneCount() { return _panes.Length; }
     public DockPane[] Panes() { return _panes; }
+    internal UIElement TabStripPanel() { return _tabStrip; }
+    public UIElement[] TabButtons() { return _tabStrip != null ? _tabStrip.Children() : new UIElement[0]; }
+
+    public int IndexOfPane(string paneId) {
+        if (paneId == null || paneId.Length == 0) { return -1; }
+        for (int i = 0; i < _panes.Length; i += 1) {
+            if (_panes[i].PaneId == paneId) { return i; }
+        }
+        return -1;
+    }
+
+    public bool MovePaneToIndex(int fromIdx, int toIdx) {
+        if (fromIdx < 0 || fromIdx >= _panes.Length || toIdx < 0 || toIdx >= _panes.Length || fromIdx == toIdx) {
+            return false;
+        }
+        DockPane active = ActivePane();
+        DockPane moved = _panes[fromIdx];
+        _panes.RemoveAt(fromIdx);
+        _panes.Insert(toIdx, moved);
+        if (active != null) {
+            for (int i = 0; i < _panes.Length; i += 1) {
+                if (_panes[i].PaneId == active.PaneId) {
+                    _selectedIndex = i;
+                    break;
+                }
+            }
+        }
+        RebuildTabsAndContent();
+        return true;
+    }
+
+    internal void ClearAllPanesSilent() {
+        _panes.Clear();
+        _selectedIndex = -1;
+        RebuildTabsAndContent();
+    }
+
+    internal void SetMaximizedDetached(bool detached) {
+        _maximizedDetached = detached;
+        RebuildTabsAndContent();
+    }
 
     public int SelectedIndex {
         get { return _selectedIndex; }
@@ -805,11 +1339,21 @@ public class DockTabGroup : Control {
 
     public void AddPane(DockPane pane, bool selectIt = true) {
         if (pane == null) { return; }
+        int existing = IndexOfPane(pane.PaneId);
+        if (existing >= 0) {
+            if (selectIt) { SelectedIndex = existing; }
+            return;
+        }
         _panes.Push(pane);
+        bool selChanged = false;
         if (_selectedIndex < 0 || selectIt) {
             _selectedIndex = _panes.Length - 1;
+            selChanged = true;
         }
         RebuildTabsAndContent();
+        if (selChanged) {
+            ActivePaneChanged(this, EventArgs.Empty());
+        }
     }
 
     public bool RemovePaneById(string paneId) {
@@ -817,7 +1361,9 @@ public class DockTabGroup : Control {
         for (int i = 0; i < _panes.Length; i += 1) {
             if (_panes[i].PaneId == paneId) {
                 _panes.RemoveAt(i);
-                if (_selectedIndex >= _panes.Length) {
+                if (i < _selectedIndex) {
+                    _selectedIndex -= 1;
+                } else if (_selectedIndex >= _panes.Length) {
                     _selectedIndex = _panes.Length - 1;
                 }
                 RebuildTabsAndContent();
@@ -830,7 +1376,11 @@ public class DockTabGroup : Control {
     public bool SelectPaneById(string paneId) {
         for (int i = 0; i < _panes.Length; i += 1) {
             if (_panes[i].PaneId == paneId) {
-                SelectedIndex = i;
+                if (_selectedIndex == i) {
+                    ActivePaneChanged(this, EventArgs.Empty());
+                } else {
+                    SelectedIndex = i;
+                }
                 return true;
             }
         }
@@ -860,13 +1410,20 @@ public class DockTabGroup : Control {
             tabBtn.Child = lbl;
 
             tabBtn.MouseLeftButtonDown += (object s, MouseButtonEventArgs e) => {
+                if (self._ownerWorkspace != null) {
+                    self._ownerWorkspace.PrepareTabDragSlots(self);
+                }
                 self.SelectedIndex = capturedIdx;
+                if (self._ownerWorkspace != null) {
+                    self._ownerWorkspace.BeginTabDragCandidate(self, p, e.X, e.Y);
+                }
                 e.Handled = true;
             };
             _tabStrip.AddChild(tabBtn);
         }
 
         _contentHost.Child = null;
+        if (_maximizedDetached) { return; }
         DockPane cur = ActivePane();
         if (cur != null) {
             object rawContent = cur.Content;
@@ -880,6 +1437,8 @@ public class DockTabGroup : Control {
 }
 
 public class DockSplitNode : Control {
+    private static int _nextSplitSeqId = 1;
+    internal int _splitSeqId = 0;
     private Orientation _orientation = Orientation.Horizontal;
     private float _splitRatio = 0.5f;
     private UIElement _first;
@@ -888,11 +1447,15 @@ public class DockSplitNode : Control {
     private Thumb _splitter;
 
     public DockSplitNode() : base() {
+        _splitSeqId = _nextSplitSeqId;
+        _nextSplitSeqId += 1;
         InitSplitVisuals();
         RebuildSplitLayout();
     }
 
     public DockSplitNode(Orientation orientation, float ratio, UIElement first, UIElement second) : base() {
+        _splitSeqId = _nextSplitSeqId;
+        _nextSplitSeqId += 1;
         _orientation = orientation;
         _splitRatio = Math.Clampf(ratio, 0.1f, 0.9f);
         _first = first;
@@ -940,6 +1503,40 @@ public class DockSplitNode : Control {
     public UIElement Second {
         get { return _second; }
         set { _second = value; RebuildSplitLayout(); }
+    }
+
+    private static bool SameSplitChild(UIElement a, UIElement b) {
+        if (a == null && b == null) { return true; }
+        if (a == null || b == null) { return false; }
+        if (a is DockTabGroup && b is DockTabGroup) {
+            return (a as DockTabGroup)._groupSeqId == (b as DockTabGroup)._groupSeqId;
+        }
+        if (a is DockSplitNode && b is DockSplitNode) {
+            return (a as DockSplitNode)._splitSeqId == (b as DockSplitNode)._splitSeqId;
+        }
+        return a.__nativeHandle == b.__nativeHandle;
+    }
+
+    internal bool ReplaceChild(UIElement oldChild, UIElement newChild) {
+        if (SameSplitChild(_first, oldChild)) {
+            _first = newChild;
+            RebuildSplitLayout();
+            return true;
+        }
+        if (SameSplitChild(_second, oldChild)) {
+            _second = newChild;
+            RebuildSplitLayout();
+            return true;
+        }
+        return false;
+    }
+
+    internal void DetachChildrenForCollapse() {
+        _first = null;
+        _second = null;
+        if (_grid != null) {
+            _grid.ClearChildren();
+        }
     }
 
     private void UpdateStarWeights() {
@@ -994,7 +1591,30 @@ public class DockSplitNode : Control {
     }
 }
 
+internal class DockLayoutNodeDesc {
+    public bool IsSplit = false;
+    public Orientation Orient = Orientation.Horizontal;
+    public float Ratio = 0.5f;
+    public DockLayoutNodeDesc First;
+    public DockLayoutNodeDesc Second;
+    public string ZoneTag = "D";
+    public string ActivePaneId = "";
+    public string[] PaneIds;
+
+    public DockLayoutNodeDesc() {
+        PaneIds = new string[0];
+    }
+}
+
+internal class DockParseCursor {
+    public string Src = "";
+    public int Pos = 0;
+    public bool Failed = false;
+}
+
 public class DockingWorkspace : Control {
+    private static int _nextWorkspaceSeqId = 1;
+    internal int _workspaceSeqId = 0;
     private Grid _hostGrid;
     private UIElement _rootNode;
     private DockTabGroup _leftGroup;
@@ -1005,36 +1625,323 @@ public class DockingWorkspace : Control {
     private DockSplitNode _centerBottomSplit;
     private DockSplitNode _centerRightSplit;
     private Dictionary<string, DockPane> _panesById;
+    private Dictionary<string, int> _paneDefaultZones;
+
+    private float _savedLeftRatio = 0.20f;
+    private float _savedRightRatio = 0.74f;
+    private float _savedBottomRatio = 0.72f;
+
+    // Maximize / Restore host
+    private string _maximizedPaneId = "";
+    internal string _lastActivatedPaneId = "";
+    private Border _maximizedHost;
+    private TextBlock _maximizedTitle;
+    private Border _maximizedContentHost;
+
+    // Tab DnD & Dock Hints Overlay
+    private Canvas _dockOverlayCanvas;
+    private Border _dropPreviewBox;
+    private Border _hintCenter;
+    private Border _hintLeft;
+    private Border _hintRight;
+    private Border _hintTop;
+    private Border _hintBottom;
+    private Border _dragGhost;
+    private TextBlock _dragGhostText;
+
+    private bool _dragCandidateActive = false;
+    private bool _isDraggingPane = false;
+    private DockTabGroup _dragSourceGroup;
+    private DockPane _dragPane;
+    private string _dragPaneId = "";
+    private float _dragStartX = 0.0f;
+    private float _dragStartY = 0.0f;
+    private DockTabGroup _dropTargetGroup;
+    private DockZone _hoveredDropZone = DockZone.Center;
+    private float _dragTabStripOriginX = 0.0f;
+    private float _dragGrabOffsetX = 0.0f;
+    private float[] _dragTabSlotWidths;
+    private bool _dragTabSlotValid = false;
+    private int _dragTabSlotGroupSeqId = -1;
+
+    public event EventHandler MaximizedStateChanged;
 
     public DockingWorkspace() : base() {
+        _workspaceSeqId = _nextWorkspaceSeqId;
+        _nextWorkspaceSeqId += 1;
         Background = new SolidColorBrush("#FF090D16");
         _panesById = new Dictionary<string, DockPane>();
+        _paneDefaultZones = new Dictionary<string, int>();
+        _dragTabSlotWidths = new float[0];
+
         _hostGrid = new Grid();
         AddChild(_hostGrid);
+
+        BuildMaximizeAndOverlayLayers();
         ResetDefaultIdeLayout();
     }
 
     public override string GetTypeName() { return "DockingWorkspace"; }
 
+    private Border CreateHintBadge(string glyph) {
+        var b = new Border();
+        b.Width = 26.0f;
+        b.Height = 26.0f;
+        b.CornerRadius = new CornerRadius(4.0f);
+        b.Background = new SolidColorBrush("#CC0F172A");
+        b.BorderBrush = new SolidColorBrush("#FF38BDF8");
+        b.BorderThickness = new Thickness(1.5f);
+        b.IsHitTestVisible = false;
+        var t = new TextBlock();
+        t.Text = glyph;
+        t.FontSize = 11.0f;
+        t.FontWeight = "Bold";
+        t.Foreground = new SolidColorBrush("#FFF8FAFC");
+        t.HorizontalAlignment = HorizontalAlignment.Center;
+        t.VerticalAlignment = VerticalAlignment.Center;
+        b.Child = t;
+        return b;
+    }
+
+    private void BuildMaximizeAndOverlayLayers() {
+        _maximizedHost = new Border();
+        _maximizedHost.Background = new SolidColorBrush("#FF0F172A");
+        _maximizedHost.BorderBrush = new SolidColorBrush("#FF38BDF8");
+        _maximizedHost.BorderThickness = new Thickness(1.0f);
+        _maximizedHost.Visibility = Visibility.Collapsed;
+        _maximizedHost.ZIndex = 100;
+        UIElement.SetGridRow(_maximizedHost, 0);
+        UIElement.SetGridColumn(_maximizedHost, 0);
+
+        var maxGrid = new Grid();
+        maxGrid.SetRowDefinitions("28,*");
+        _maximizedHost.Child = maxGrid;
+
+        var maxBar = new Border();
+        maxBar.Background = new SolidColorBrush("#FF0B1120");
+        maxBar.BorderBrush = new SolidColorBrush("#FF1E293B");
+        maxBar.BorderThickness = new Thickness(0.0f, 0.0f, 0.0f, 1.0f);
+        maxBar.Padding = new Thickness(8.0f, 2.0f, 6.0f, 2.0f);
+        UIElement.SetGridRow(maxBar, 0);
+
+        var maxBarGrid = new Grid();
+        maxBarGrid.SetColumnDefinitions("*,Auto");
+        _maximizedTitle = new TextBlock();
+        _maximizedTitle.Text = "";
+        _maximizedTitle.FontSize = 12.0f;
+        _maximizedTitle.FontWeight = "Bold";
+        _maximizedTitle.Foreground = new SolidColorBrush("#FFF8FAFC");
+        _maximizedTitle.VerticalAlignment = VerticalAlignment.Center;
+        UIElement.SetGridColumn(_maximizedTitle, 0);
+        maxBarGrid.AddChild(_maximizedTitle);
+
+        var restoreBtn = new Button();
+        var restoreTxt = new TextBlock();
+        restoreTxt.Text = "Restore";
+        restoreTxt.FontSize = 11.0f;
+        restoreBtn.Content = restoreTxt;
+        restoreBtn.Height = 22.0f;
+        restoreBtn.Padding = new Thickness(8.0f, 0.0f, 8.0f, 0.0f);
+        DockingWorkspace self = this;
+        restoreBtn.Click += (object s, RoutedEventArgs e) => {
+            self.RestoreMaximizedPane();
+        };
+        UIElement.SetGridColumn(restoreBtn, 1);
+        maxBarGrid.AddChild(restoreBtn);
+        maxBar.Child = maxBarGrid;
+        maxGrid.AddChild(maxBar);
+
+        _maximizedContentHost = new Border();
+        _maximizedContentHost.Background = new SolidColorBrush("#FF0F172A");
+        UIElement.SetGridRow(_maximizedContentHost, 1);
+        maxGrid.AddChild(_maximizedContentHost);
+
+        _dockOverlayCanvas = new Canvas();
+        _dockOverlayCanvas.IsHitTestVisible = false;
+        _dockOverlayCanvas.Visibility = Visibility.Collapsed;
+        _dockOverlayCanvas.ZIndex = 9000;
+        UIElement.SetGridRow(_dockOverlayCanvas, 0);
+        UIElement.SetGridColumn(_dockOverlayCanvas, 0);
+
+        _dropPreviewBox = new Border();
+        _dropPreviewBox.Background = new SolidColorBrush("#4038BDF8");
+        _dropPreviewBox.BorderBrush = new SolidColorBrush("#FF38BDF8");
+        _dropPreviewBox.BorderThickness = new Thickness(2.0f);
+        _dropPreviewBox.CornerRadius = new CornerRadius(3.0f);
+        _dropPreviewBox.IsHitTestVisible = false;
+        _dropPreviewBox.Visibility = Visibility.Collapsed;
+        _dockOverlayCanvas.AddChild(_dropPreviewBox);
+
+        _hintCenter = CreateHintBadge("C");
+        _hintLeft = CreateHintBadge("L");
+        _hintRight = CreateHintBadge("R");
+        _hintTop = CreateHintBadge("T");
+        _hintBottom = CreateHintBadge("B");
+        _dockOverlayCanvas.AddChild(_hintCenter);
+        _dockOverlayCanvas.AddChild(_hintLeft);
+        _dockOverlayCanvas.AddChild(_hintRight);
+        _dockOverlayCanvas.AddChild(_hintTop);
+        _dockOverlayCanvas.AddChild(_hintBottom);
+
+        _dragGhost = new Border();
+        _dragGhost.Background = new SolidColorBrush("#E61E293B");
+        _dragGhost.BorderBrush = new SolidColorBrush("#FF38BDF8");
+        _dragGhost.BorderThickness = new Thickness(1.0f);
+        _dragGhost.CornerRadius = new CornerRadius(3.0f);
+        _dragGhost.Padding = new Thickness(8.0f, 3.0f, 8.0f, 3.0f);
+        _dragGhost.IsHitTestVisible = false;
+        _dragGhostText = new TextBlock();
+        _dragGhostText.FontSize = 11.0f;
+        _dragGhostText.Foreground = new SolidColorBrush("#FFF8FAFC");
+        _dragGhost.Child = _dragGhostText;
+        _dockOverlayCanvas.AddChild(_dragGhost);
+
+        _hostGrid.AddChild(_maximizedHost);
+        _hostGrid.AddChild(_dockOverlayCanvas);
+    }
+
+    private void WireGroup(DockTabGroup grp, string zoneTag) {
+        if (grp == null) { return; }
+        grp._ownerWorkspace = this;
+        grp._zoneTag = zoneTag;
+        DockingWorkspace self = this;
+        DockTabGroup capturedGrp = grp;
+        grp.ActivePaneChanged += (object s, EventArgs e) => {
+            DockPane ap = capturedGrp.ActivePane();
+            if (ap != null && ap.PaneId != null && ap.PaneId.Length > 0) {
+                self._lastActivatedPaneId = ap.PaneId;
+            }
+        };
+    }
+
+    private static bool SameGroup(DockTabGroup a, DockTabGroup b) {
+        if (a == null && b == null) { return true; }
+        if (a == null || b == null) { return false; }
+        return a._groupSeqId == b._groupSeqId;
+    }
+
+    private static bool SameSplit(DockSplitNode a, DockSplitNode b) {
+        if (a == null && b == null) { return true; }
+        if (a == null || b == null) { return false; }
+        return a._splitSeqId == b._splitSeqId;
+    }
+
+    private static bool NodeIsGroup(UIElement node, DockTabGroup g) {
+        if (node == null || g == null) { return false; }
+        if (!(node is DockTabGroup)) { return false; }
+        return (node as DockTabGroup)._groupSeqId == g._groupSeqId;
+    }
+
+    private static bool NodeIsSplit(UIElement node, DockSplitNode s) {
+        if (node == null || s == null) { return false; }
+        if (!(node is DockSplitNode)) { return false; }
+        return (node as DockSplitNode)._splitSeqId == s._splitSeqId;
+    }
+
+    private static bool SameUi(UIElement a, UIElement b) {
+        if (a == null && b == null) { return true; }
+        if (a == null || b == null) { return false; }
+        if (a is DockTabGroup && b is DockTabGroup) {
+            return (a as DockTabGroup)._groupSeqId == (b as DockTabGroup)._groupSeqId;
+        }
+        if (a is DockSplitNode && b is DockSplitNode) {
+            return (a as DockSplitNode)._splitSeqId == (b as DockSplitNode)._splitSeqId;
+        }
+        return a.__nativeHandle == b.__nativeHandle;
+    }
+
+    private static int ZoneToInt(DockZone zone) {
+        if (zone == DockZone.Left) { return 1; }
+        if (zone == DockZone.Right) { return 2; }
+        if (zone == DockZone.Top) { return 3; }
+        if (zone == DockZone.Bottom) { return 4; }
+        return 0;
+    }
+
+    private void WireTreeGroups(UIElement node) {
+        if (node == null) { return; }
+        if (node is DockTabGroup) {
+            var grp = node as DockTabGroup;
+            if (grp._ownerWorkspace == null || grp._ownerWorkspace._workspaceSeqId != _workspaceSeqId) {
+                WireGroup(grp, grp._zoneTag);
+            }
+            return;
+        }
+        if (node is DockSplitNode) {
+            var sp = node as DockSplitNode;
+            WireTreeGroups(sp.First);
+            WireTreeGroups(sp.Second);
+        }
+    }
+
     public void ResetDefaultIdeLayout() {
+        if (_maximizedPaneId.Length > 0) {
+            RestoreMaximizedPane();
+        }
+        string[] keys = CollectPaneIdKeys();
+
         _leftGroup = new DockTabGroup();
         _centerGroup = new DockTabGroup();
         _rightGroup = new DockTabGroup();
         _bottomGroup = new DockTabGroup();
 
-        _centerBottomSplit = new DockSplitNode(Orientation.Vertical, 0.72f, _centerGroup, _bottomGroup);
-        _centerRightSplit = new DockSplitNode(Orientation.Horizontal, 0.74f, _centerBottomSplit, _rightGroup);
-        _mainHorizSplit = new DockSplitNode(Orientation.Horizontal, 0.20f, _leftGroup, _centerRightSplit);
+        WireGroup(_leftGroup, "L");
+        WireGroup(_centerGroup, "C");
+        WireGroup(_rightGroup, "R");
+        WireGroup(_bottomGroup, "B");
+
+        _centerBottomSplit = new DockSplitNode(Orientation.Vertical, _savedBottomRatio, _centerGroup, _bottomGroup);
+        _centerRightSplit = new DockSplitNode(Orientation.Horizontal, _savedRightRatio, _centerBottomSplit, _rightGroup);
+        _mainHorizSplit = new DockSplitNode(Orientation.Horizontal, _savedLeftRatio, _leftGroup, _centerRightSplit);
         SetRootDockNode(_mainHorizSplit);
+
+        for (int i = 0; i < keys.Length; i += 1) {
+            string pid = keys[i];
+            if (!_panesById.ContainsKey(pid)) { continue; }
+            DockPane p = _panesById[pid];
+            DockZone z = DockZone.Center;
+            if (_paneDefaultZones.ContainsKey(pid)) {
+                int zi = _paneDefaultZones[pid];
+                if (zi == 1) { z = DockZone.Left; }
+                else if (zi == 2) { z = DockZone.Right; }
+                else if (zi == 3) { z = DockZone.Top; }
+                else if (zi == 4) { z = DockZone.Bottom; }
+            }
+            ZoneGroup(z).AddPane(p, false);
+        }
+    }
+
+    private string[] CollectPaneIdKeys() {
+        var keys = new string[0];
+        DockTabGroup[] groups = CollectAllTabGroups();
+        for (int gi = 0; gi < groups.Length; gi += 1) {
+            DockPane[] ps = groups[gi].Panes();
+            for (int pi = 0; pi < ps.Length; pi += 1) {
+                if (ps[pi].PaneId != null && ps[pi].PaneId.Length > 0) {
+                    keys.Push(ps[pi].PaneId);
+                }
+            }
+        }
+        return keys;
     }
 
     public UIElement RootDockNode() { return _rootNode; }
 
     public void SetRootDockNode(UIElement node) {
+        if (_rootNode != null && _hostGrid != null) {
+            _hostGrid.RemoveChild(_rootNode);
+        }
         _rootNode = node;
-        _hostGrid.ClearChildren();
-        if (_rootNode != null) {
-            _hostGrid.AddChild(_rootNode);
+        if (_rootNode != null && _hostGrid != null) {
+            UIElement.SetGridRow(_rootNode, 0);
+            UIElement.SetGridColumn(_rootNode, 0);
+            _hostGrid.InsertChild(0, _rootNode);
+            if (_maximizedPaneId.Length > 0) {
+                _rootNode.Visibility = Visibility.Collapsed;
+            } else {
+                _rootNode.Visibility = Visibility.Visible;
+            }
+            WireTreeGroups(_rootNode);
         }
     }
 
@@ -1045,67 +1952,1031 @@ public class DockingWorkspace : Control {
         return _centerGroup;
     }
 
+    private void CollectTabGroupsRecursive(UIElement node, DockTabGroup[] outGroups) {
+        if (node == null) { return; }
+        if (node is DockTabGroup) {
+            outGroups.Push(node as DockTabGroup);
+            return;
+        }
+        if (node is DockSplitNode) {
+            var sp = node as DockSplitNode;
+            CollectTabGroupsRecursive(sp.First, outGroups);
+            CollectTabGroupsRecursive(sp.Second, outGroups);
+        }
+    }
+
+    private DockTabGroup[] CollectAllTabGroups() {
+        var res = new DockTabGroup[0];
+        CollectTabGroupsRecursive(_rootNode, res);
+        return res;
+    }
+
+    private bool IsNodeInTree(UIElement cur, UIElement target) {
+        if (cur == null || target == null) { return false; }
+        if (SameUi(cur, target)) { return true; }
+        if (cur is DockSplitNode) {
+            var sp = cur as DockSplitNode;
+            return IsNodeInTree(sp.First, target) || IsNodeInTree(sp.Second, target);
+        }
+        return false;
+    }
+
+    private DockSplitNode FindParentSplit(UIElement cur, UIElement target) {
+        if (cur == null || target == null) { return null; }
+        if (cur is DockSplitNode) {
+            var sp = cur as DockSplitNode;
+            if (SameUi(sp.First, target) || SameUi(sp.Second, target)) { return sp; }
+            DockSplitNode leftFound = FindParentSplit(sp.First, target);
+            if (leftFound != null) { return leftFound; }
+            return FindParentSplit(sp.Second, target);
+        }
+        return null;
+    }
+
+    private DockTabGroup FindGroupContainingPane(string paneId) {
+        if (paneId == null || paneId.Length == 0) { return null; }
+        DockTabGroup[] groups = CollectAllTabGroups();
+        for (int i = 0; i < groups.Length; i += 1) {
+            if (groups[i].IndexOfPane(paneId) >= 0) {
+                return groups[i];
+            }
+        }
+        return null;
+    }
+
+    private void CollapseEmptyGroup(DockTabGroup emptyGroup) {
+        if (emptyGroup == null || NodeIsGroup(_rootNode, emptyGroup)) { return; }
+        DockSplitNode parent = FindParentSplit(_rootNode, emptyGroup);
+        if (parent == null) { return; }
+        UIElement sibling = NodeIsGroup(parent.First, emptyGroup) ? parent.Second : parent.First;
+        if (NodeIsSplit(_rootNode, parent)) {
+            parent.DetachChildrenForCollapse();
+            SetRootDockNode(sibling);
+        } else {
+            DockSplitNode grand = FindParentSplit(_rootNode, parent);
+            parent.DetachChildrenForCollapse();
+            if (grand != null) {
+                grand.ReplaceChild(parent, sibling);
+            }
+        }
+        if (SameSplit(_mainHorizSplit, parent)) { _mainHorizSplit = null; }
+        if (SameSplit(_centerRightSplit, parent)) { _centerRightSplit = null; }
+        if (SameSplit(_centerBottomSplit, parent)) { _centerBottomSplit = null; }
+    }
+
+    private DockTabGroup EnsureZoneGroupAttached(DockZone zone) {
+        DockTabGroup target = ZoneGroup(zone);
+        if (target == null) {
+            target = new DockTabGroup();
+            if (zone == DockZone.Left) { _leftGroup = target; WireGroup(target, "L"); }
+            else if (zone == DockZone.Right) { _rightGroup = target; WireGroup(target, "R"); }
+            else if (zone == DockZone.Bottom) { _bottomGroup = target; WireGroup(target, "B"); }
+            else { _centerGroup = target; WireGroup(target, "C"); }
+        }
+        if (_rootNode == null) {
+            SetRootDockNode(target);
+            return target;
+        }
+        if (IsNodeInTree(_rootNode, target)) {
+            return target;
+        }
+        if (_rootNode is DockTabGroup && (_rootNode as DockTabGroup).PaneCount() == 0) {
+            SetRootDockNode(target);
+            return target;
+        }
+        if (zone == DockZone.Left) {
+            var sp = new DockSplitNode(Orientation.Horizontal, _savedLeftRatio, target, _rootNode);
+            if (_mainHorizSplit == null || !IsNodeInTree(_rootNode, _mainHorizSplit)) {
+                _mainHorizSplit = sp;
+            }
+            SetRootDockNode(sp);
+        } else if (zone == DockZone.Right) {
+            var sp = new DockSplitNode(Orientation.Horizontal, _savedRightRatio, _rootNode, target);
+            if (_centerRightSplit == null || !IsNodeInTree(_rootNode, _centerRightSplit)) {
+                _centerRightSplit = sp;
+            }
+            SetRootDockNode(sp);
+        } else if (zone == DockZone.Bottom) {
+            var sp = new DockSplitNode(Orientation.Vertical, _savedBottomRatio, _rootNode, target);
+            if (_centerBottomSplit == null || !IsNodeInTree(_rootNode, _centerBottomSplit)) {
+                _centerBottomSplit = sp;
+            }
+            SetRootDockNode(sp);
+        } else if (zone == DockZone.Top) {
+            var sp = new DockSplitNode(Orientation.Vertical, 0.28f, target, _rootNode);
+            SetRootDockNode(sp);
+        } else {
+            // Center was collapsed out: attach to root via split if root is another zone
+            if (NodeIsGroup(_rootNode, _leftGroup)) {
+                var sp = new DockSplitNode(Orientation.Horizontal, _savedLeftRatio, _leftGroup, target);
+                if (_mainHorizSplit == null || !IsNodeInTree(_rootNode, _mainHorizSplit)) {
+                    _mainHorizSplit = sp;
+                }
+                SetRootDockNode(sp);
+            } else if (NodeIsGroup(_rootNode, _rightGroup)) {
+                var sp = new DockSplitNode(Orientation.Horizontal, _savedRightRatio, target, _rightGroup);
+                if (_centerRightSplit == null || !IsNodeInTree(_rootNode, _centerRightSplit)) {
+                    _centerRightSplit = sp;
+                }
+                SetRootDockNode(sp);
+            } else if (NodeIsGroup(_rootNode, _bottomGroup)) {
+                var sp = new DockSplitNode(Orientation.Vertical, _savedBottomRatio, target, _bottomGroup);
+                if (_centerBottomSplit == null || !IsNodeInTree(_rootNode, _centerBottomSplit)) {
+                    _centerBottomSplit = sp;
+                }
+                SetRootDockNode(sp);
+            } else if (_mainHorizSplit == null || !IsNodeInTree(_rootNode, _mainHorizSplit)) {
+                var sp = new DockSplitNode(Orientation.Horizontal, _savedLeftRatio, _rootNode, target);
+                _mainHorizSplit = sp;
+                SetRootDockNode(sp);
+            } else {
+                var sp = new DockSplitNode(Orientation.Horizontal, 0.5f, _rootNode, target);
+                SetRootDockNode(sp);
+            }
+        }
+        return target;
+    }
+
     public DockPane RegisterPane(string paneId, string title, UIElement content, DockZone zone = DockZone.Center) {
+        if (paneId != null && paneId.Length > 0 && _panesById.ContainsKey(paneId)) {
+            UnregisterPane(paneId);
+        }
         var pane = new DockPane(paneId, title, content);
         if (paneId != null && paneId.Length > 0) {
             _panesById[paneId] = pane;
+            _paneDefaultZones[paneId] = ZoneToInt(zone);
         }
-        DockTabGroup grp = ZoneGroup(zone);
+        DockTabGroup grp = EnsureZoneGroupAttached(zone);
         if (grp != null) {
             grp.AddPane(pane, true);
+        }
+        if (paneId != null && paneId.Length > 0) {
+            _lastActivatedPaneId = paneId;
         }
         return pane;
     }
 
+    public bool UnregisterPane(string paneId) {
+        if (paneId == null || paneId.Length == 0 || !_panesById.ContainsKey(paneId)) {
+            return false;
+        }
+        if (_maximizedPaneId == paneId) {
+            RestoreMaximizedPane();
+        }
+        DockTabGroup grp = FindGroupContainingPane(paneId);
+        _panesById.Remove(paneId);
+        if (_paneDefaultZones.ContainsKey(paneId)) {
+            _paneDefaultZones.Remove(paneId);
+        }
+        if (grp != null) {
+            grp.RemovePaneById(paneId);
+            if (grp.PaneCount() == 0) {
+                CollapseEmptyGroup(grp);
+            }
+        }
+        if (_lastActivatedPaneId == paneId) {
+            _lastActivatedPaneId = "";
+        }
+        return true;
+    }
+
     public bool ActivatePane(string paneId) {
-        if (_leftGroup != null && _leftGroup.SelectPaneById(paneId)) { return true; }
-        if (_centerGroup != null && _centerGroup.SelectPaneById(paneId)) { return true; }
-        if (_rightGroup != null && _rightGroup.SelectPaneById(paneId)) { return true; }
-        if (_bottomGroup != null && _bottomGroup.SelectPaneById(paneId)) { return true; }
+        if (paneId == null || paneId.Length == 0) { return false; }
+        DockTabGroup[] groups = CollectAllTabGroups();
+        for (int i = 0; i < groups.Length; i += 1) {
+            if (groups[i].SelectPaneById(paneId)) {
+                _lastActivatedPaneId = paneId;
+                return true;
+            }
+        }
         return false;
     }
 
     public bool MovePaneToZone(string paneId, DockZone targetZone) {
-        if (!_panesById.ContainsKey(paneId)) { return false; }
+        if (paneId == null || paneId.Length == 0 || !_panesById.ContainsKey(paneId)) { return false; }
+        if (_maximizedPaneId == paneId) {
+            RestoreMaximizedPane();
+        }
         DockPane pane = _panesById[paneId];
-        if (_leftGroup != null) { _leftGroup.RemovePaneById(paneId); }
-        if (_centerGroup != null) { _centerGroup.RemovePaneById(paneId); }
-        if (_rightGroup != null) { _rightGroup.RemovePaneById(paneId); }
-        if (_bottomGroup != null) { _bottomGroup.RemovePaneById(paneId); }
-        DockTabGroup dst = ZoneGroup(targetZone);
+        DockTabGroup src = FindGroupContainingPane(paneId);
+        DockTabGroup dst = EnsureZoneGroupAttached(targetZone);
         if (dst == null) { return false; }
+        if (SameGroup(src, dst)) {
+            dst.SelectPaneById(paneId);
+            return true;
+        }
+        if (src != null) {
+            src.RemovePaneById(paneId);
+        }
         dst.AddPane(pane, true);
+        if (src != null && src.PaneCount() == 0) {
+            CollapseEmptyGroup(src);
+        }
+        _lastActivatedPaneId = paneId;
         return true;
     }
 
+    private void SplitGroupWithPane(DockTabGroup targetGroup, DockPane pane, DockTabGroup sourceGroup, DockZone side) {
+        if (targetGroup == null || pane == null) { return; }
+        if (sourceGroup != null) {
+            sourceGroup.RemovePaneById(pane.PaneId);
+        }
+        var newGrp = new DockTabGroup();
+        WireGroup(newGrp, "D");
+        newGrp.AddPane(pane, true);
+
+        Orientation orient = (side == DockZone.Left || side == DockZone.Right) ? Orientation.Horizontal : Orientation.Vertical;
+        UIElement firstChild = (side == DockZone.Left || side == DockZone.Top) ? (UIElement)newGrp : (UIElement)targetGroup;
+        UIElement secondChild = (side == DockZone.Left || side == DockZone.Top) ? (UIElement)targetGroup : (UIElement)newGrp;
+
+        DockSplitNode parent = FindParentSplit(_rootNode, targetGroup);
+        var newSplit = new DockSplitNode(orient, 0.5f, firstChild, secondChild);
+        if (parent == null) {
+            SetRootDockNode(newSplit);
+        } else {
+            parent.ReplaceChild(targetGroup, newSplit);
+        }
+
+        if (sourceGroup != null && !SameGroup(sourceGroup, targetGroup) && sourceGroup.PaneCount() == 0) {
+            CollapseEmptyGroup(sourceGroup);
+        }
+        _lastActivatedPaneId = pane.PaneId;
+    }
+
+    public bool DockPaneRelativeTo(string paneId, string targetPaneId, DockZone zone) {
+        if (paneId == null || paneId.Length == 0 || !_panesById.ContainsKey(paneId)) { return false; }
+        DockPane pane = _panesById[paneId];
+        DockTabGroup src = FindGroupContainingPane(paneId);
+        DockTabGroup dst = FindGroupContainingPane(targetPaneId);
+        if (dst == null) { return false; }
+        if (_maximizedPaneId == paneId) { RestoreMaximizedPane(); }
+        if (zone == DockZone.Center) {
+            if (SameGroup(src, dst)) {
+                dst.SelectPaneById(paneId);
+                return true;
+            }
+            if (src != null) { src.RemovePaneById(paneId); }
+            dst.AddPane(pane, true);
+            if (src != null && src.PaneCount() == 0) { CollapseEmptyGroup(src); }
+            _lastActivatedPaneId = paneId;
+            return true;
+        }
+        if (SameGroup(src, dst) && src.PaneCount() <= 1) { return false; }
+        SplitGroupWithPane(dst, pane, src, zone);
+        return true;
+    }
+
+    // ---- Maximize / Restore ----
+
+    public string MaximizedPaneId { get { return _maximizedPaneId; } }
+    public bool IsPaneMaximized { get { return _maximizedPaneId.Length > 0; } }
+
+    public bool MaximizePane(string paneId) {
+        if (paneId == null || paneId.Length == 0 || !_panesById.ContainsKey(paneId)) { return false; }
+        if (_maximizedPaneId == paneId) { return true; }
+        if (_maximizedPaneId.Length > 0) {
+            RestoreMaximizedPane();
+        }
+        DockPane pane = _panesById[paneId];
+        DockTabGroup owner = FindGroupContainingPane(paneId);
+        if (owner == null) { return false; }
+        owner.SelectPaneById(paneId);
+        owner.SetMaximizedDetached(true);
+
+        _maximizedPaneId = paneId;
+        _lastActivatedPaneId = paneId;
+        if (_maximizedTitle != null) { _maximizedTitle.Text = pane.Title; }
+        if (_maximizedContentHost != null) {
+            object raw = pane.Content;
+            if (raw is UIElement) {
+                _maximizedContentHost.Child = raw as UIElement;
+            } else {
+                _maximizedContentHost.Child = pane;
+            }
+        }
+        if (_rootNode != null) { _rootNode.Visibility = Visibility.Collapsed; }
+        if (_maximizedHost != null) { _maximizedHost.Visibility = Visibility.Visible; }
+        MaximizedStateChanged(this, EventArgs.Empty());
+        return true;
+    }
+
+    public bool RestoreMaximizedPane() {
+        if (_maximizedPaneId.Length == 0) { return false; }
+        string prevId = _maximizedPaneId;
+        _maximizedPaneId = "";
+        if (_maximizedContentHost != null) { _maximizedContentHost.Child = null; }
+        if (_maximizedHost != null) { _maximizedHost.Visibility = Visibility.Collapsed; }
+        if (_rootNode != null) { _rootNode.Visibility = Visibility.Visible; }
+        DockTabGroup owner = FindGroupContainingPane(prevId);
+        if (owner != null) {
+            owner.SetMaximizedDetached(false);
+        }
+        MaximizedStateChanged(this, EventArgs.Empty());
+        return true;
+    }
+
+    public bool ToggleMaximizeActivePane() {
+        if (_maximizedPaneId.Length > 0) {
+            return RestoreMaximizedPane();
+        }
+        string targetId = "";
+        if (_lastActivatedPaneId.Length > 0 && _panesById.ContainsKey(_lastActivatedPaneId)) {
+            targetId = _lastActivatedPaneId;
+        } else if (_centerGroup != null && _centerGroup.ActivePane() != null) {
+            targetId = _centerGroup.ActivePane().PaneId;
+        } else {
+            DockTabGroup[] groups = CollectAllTabGroups();
+            for (int i = 0; i < groups.Length; i += 1) {
+                DockPane ap = groups[i].ActivePane();
+                if (ap != null && ap.PaneId.Length > 0) {
+                    targetId = ap.PaneId;
+                    break;
+                }
+            }
+        }
+        if (targetId.Length == 0) { return false; }
+        return MaximizePane(targetId);
+    }
+
+    // ---- Tab Drag & Drop + Dock Hints Overlay ----
+
+    public bool IsDraggingPane { get { return _isDraggingPane; } }
+    public string DragPaneId { get { return _isDraggingPane ? _dragPaneId : ""; } }
+    public DockZone HoveredDropZone { get { return _hoveredDropZone; } }
+    public bool IsDockOverlayVisible { get { return _dockOverlayCanvas != null && _dockOverlayCanvas.Visibility == Visibility.Visible; } }
+
+    private bool TryCaptureDragTabSlots(DockTabGroup grp) {
+        if (grp == null) { return false; }
+        UIElement[] btns = grp.TabButtons();
+        if (btns.Length == 0) { return false; }
+        float firstW = btns[0].ActualWidth > 1.0f ? btns[0].ActualWidth : btns[0].ScreenBoundsWidth;
+        if (firstW <= 1.0f) { return false; }
+        var widths = new float[btns.Length];
+        for (int i = 0; i < btns.Length; i += 1) {
+            float w = btns[i].ActualWidth > 1.0f ? btns[i].ActualWidth : btns[i].ScreenBoundsWidth;
+            if (w <= 1.0f) { return false; }
+            widths[i] = w;
+        }
+        _dragTabStripOriginX = btns[0].ViewportX;
+        _dragTabSlotWidths = widths;
+        _dragTabSlotValid = true;
+        _dragTabSlotGroupSeqId = grp._groupSeqId;
+        return true;
+    }
+
+    internal void PrepareTabDragSlots(DockTabGroup grp) {
+        _dragTabSlotValid = false;
+        _dragTabSlotWidths = new float[0];
+        _dragTabSlotGroupSeqId = -1;
+        _dragGrabOffsetX = 0.0f;
+        TryCaptureDragTabSlots(grp);
+    }
+
+    internal void BeginTabDragCandidate(DockTabGroup srcGroup, DockPane pane, float screenX, float screenY) {
+        if (srcGroup == null || pane == null || _maximizedPaneId.Length > 0) { return; }
+        _dragCandidateActive = true;
+        _isDraggingPane = false;
+        _dragSourceGroup = srcGroup;
+        _dragPane = pane;
+        _dragPaneId = pane.PaneId;
+        _dragStartX = screenX;
+        _dragStartY = screenY;
+        _dropTargetGroup = null;
+        _hoveredDropZone = DockZone.Center;
+        if (!TryCaptureDragTabSlots(srcGroup)) {
+            if (_dragTabSlotGroupSeqId != srcGroup._groupSeqId || _dragTabSlotWidths.Length != srcGroup.PaneCount()) {
+                _dragTabSlotValid = false;
+                _dragTabSlotWidths = new float[0];
+            }
+        }
+        _dragGrabOffsetX = 0.0f;
+        int dragIdx = srcGroup.IndexOfPane(pane.PaneId);
+        if (_dragTabSlotValid && dragIdx >= 0 && dragIdx < _dragTabSlotWidths.Length) {
+            float slotLeft = _dragTabStripOriginX;
+            for (int si = 0; si < dragIdx; si += 1) {
+                slotLeft = slotLeft + _dragTabSlotWidths[si] + 2.0f;
+            }
+            _dragGrabOffsetX = Math.Clampf(screenX - slotLeft, 0.0f, _dragTabSlotWidths[dragIdx]);
+        }
+        CaptureMouse();
+    }
+
+    private void SetOverlayHintsVisible(bool vis) {
+        Visibility v = vis ? Visibility.Visible : Visibility.Collapsed;
+        if (_dropPreviewBox != null) { _dropPreviewBox.Visibility = v; }
+        if (_hintCenter != null) { _hintCenter.Visibility = v; }
+        if (_hintLeft != null) { _hintLeft.Visibility = v; }
+        if (_hintRight != null) { _hintRight.Visibility = v; }
+        if (_hintTop != null) { _hintTop.Visibility = v; }
+        if (_hintBottom != null) { _hintBottom.Visibility = v; }
+    }
+
+    private void UpdateOverlayForTarget(DockTabGroup target, DockZone zone) {
+        if (_dockOverlayCanvas == null || target == null) {
+            SetOverlayHintsVisible(false);
+            return;
+        }
+        SetOverlayHintsVisible(true);
+
+        float gx = target.LayoutX;
+        float gy = target.LayoutY;
+        if (ParseUtil.IsValidHandle(_dockOverlayCanvas.__nativeHandle)) {
+            gx = Visual_ScreenToLocal(_dockOverlayCanvas.__nativeHandle, target.ViewportX, target.ViewportY, 0);
+            gy = Visual_ScreenToLocal(_dockOverlayCanvas.__nativeHandle, target.ViewportX, target.ViewportY, 1);
+        }
+        float gw = Math.Maxf(20.0f, target.ActualWidth > 1.0f ? target.ActualWidth : target.ScreenBoundsWidth);
+        float gh = Math.Maxf(20.0f, target.ActualHeight > 1.0f ? target.ActualHeight : target.ScreenBoundsHeight);
+
+        float px = gx;
+        float py = gy;
+        float pw = gw;
+        float ph = gh;
+        if (zone == DockZone.Left) { pw = gw * 0.5f; }
+        else if (zone == DockZone.Right) { px = gx + gw * 0.5f; pw = gw * 0.5f; }
+        else if (zone == DockZone.Top) { ph = gh * 0.5f; }
+        else if (zone == DockZone.Bottom) { py = gy + gh * 0.5f; ph = gh * 0.5f; }
+
+        UIElement.SetCanvasLeft(_dropPreviewBox, px);
+        UIElement.SetCanvasTop(_dropPreviewBox, py);
+        _dropPreviewBox.Width = pw;
+        _dropPreviewBox.Height = ph;
+
+        float cx = gx + gw * 0.5f - 13.0f;
+        float cy = gy + gh * 0.5f - 13.0f;
+        UIElement.SetCanvasLeft(_hintCenter, cx);
+        UIElement.SetCanvasTop(_hintCenter, cy);
+        UIElement.SetCanvasLeft(_hintLeft, cx - 32.0f);
+        UIElement.SetCanvasTop(_hintLeft, cy);
+        UIElement.SetCanvasLeft(_hintRight, cx + 32.0f);
+        UIElement.SetCanvasTop(_hintRight, cy);
+        UIElement.SetCanvasLeft(_hintTop, cx);
+        UIElement.SetCanvasTop(_hintTop, cy - 32.0f);
+        UIElement.SetCanvasLeft(_hintBottom, cx);
+        UIElement.SetCanvasTop(_hintBottom, cy + 32.0f);
+
+        string activeBg = "#FF0284C7";
+        string idleBg = "#CC0F172A";
+        _hintCenter.Background = new SolidColorBrush(zone == DockZone.Center ? activeBg : idleBg);
+        _hintLeft.Background = new SolidColorBrush(zone == DockZone.Left ? activeBg : idleBg);
+        _hintRight.Background = new SolidColorBrush(zone == DockZone.Right ? activeBg : idleBg);
+        _hintTop.Background = new SolidColorBrush(zone == DockZone.Top ? activeBg : idleBg);
+        _hintBottom.Background = new SolidColorBrush(zone == DockZone.Bottom ? activeBg : idleBg);
+    }
+
+    public override void OnMouseMove(MouseEventArgs e) {
+        base.OnMouseMove(e);
+        if (!_dragCandidateActive) { return; }
+        float dx = e.X - _dragStartX;
+        float dy = e.Y - _dragStartY;
+        if (!_isDraggingPane) {
+            if ((dx * dx + dy * dy) < 25.0f) { return; }
+            _isDraggingPane = true;
+            if (_dockOverlayCanvas != null) {
+                _dockOverlayCanvas.Visibility = Visibility.Visible;
+            }
+            if (_dragGhostText != null && _dragPane != null) {
+                _dragGhostText.Text = _dragPane.Title;
+            }
+        }
+        if (_dragGhost != null && _dockOverlayCanvas != null) {
+            float ox = ParseUtil.IsValidHandle(_dockOverlayCanvas.__nativeHandle) ? Visual_ScreenToLocal(_dockOverlayCanvas.__nativeHandle, e.X, e.Y, 0) : e.X;
+            float oy = ParseUtil.IsValidHandle(_dockOverlayCanvas.__nativeHandle) ? Visual_ScreenToLocal(_dockOverlayCanvas.__nativeHandle, e.X, e.Y, 1) : e.Y;
+            UIElement.SetCanvasLeft(_dragGhost, ox + 12.0f);
+            UIElement.SetCanvasTop(_dragGhost, oy + 12.0f);
+        }
+
+        // Case A: Intra-group horizontal tab reordering
+        if (_dragSourceGroup != null && IsNodeInTree(_rootNode, _dragSourceGroup) && _dragSourceGroup.PaneCount() > 1 && ParseUtil.IsValidHandle(_dragSourceGroup.__nativeHandle)) {
+            float sx = Visual_ScreenToLocal(_dragSourceGroup.__nativeHandle, e.X, e.Y, 0);
+            float sy = Visual_ScreenToLocal(_dragSourceGroup.__nativeHandle, e.X, e.Y, 1);
+            float sw = _dragSourceGroup.ActualWidth > 1.0f ? _dragSourceGroup.ActualWidth : _dragSourceGroup.ScreenBoundsWidth;
+            if (sy >= -8.0f && sy <= 34.0f && sx >= -8.0f && sx <= sw + 8.0f) {
+                UIElement[] btns = _dragSourceGroup.TabButtons();
+                if (btns.Length > 1) {
+                    TryCaptureDragTabSlots(_dragSourceGroup);
+                    int curIdx = _dragSourceGroup.IndexOfPane(_dragPaneId);
+                    if (curIdx >= 0) {
+                        int targetIdx = curIdx;
+                        if (_dragTabSlotValid && _dragTabSlotWidths.Length == btns.Length) {
+                            int nSlots = _dragTabSlotWidths.Length;
+                            var slotLefts = new float[nSlots];
+                            float accX = _dragTabStripOriginX;
+                            for (int si = 0; si < nSlots; si += 1) {
+                                slotLefts[si] = accX;
+                                accX = accX + _dragTabSlotWidths[si] + 2.0f;
+                            }
+                            float ghostLeft = e.X - _dragGrabOffsetX;
+                            for (int bi = 0; bi < curIdx; bi += 1) {
+                                float bw = _dragTabSlotWidths[bi];
+                                float thresh = slotLefts[bi] + bw * 0.5f;
+                                if (ghostLeft <= thresh) {
+                                    targetIdx = bi;
+                                    break;
+                                }
+                            }
+                            if (targetIdx == curIdx) {
+                                for (int bi = curIdx + 1; bi < nSlots; bi += 1) {
+                                    float bw = _dragTabSlotWidths[bi];
+                                    float thresh = slotLefts[bi] + bw * 0.5f;
+                                    if (e.X >= thresh) {
+                                        targetIdx = bi;
+                                    }
+                                }
+                            }
+                        } else {
+                            targetIdx = btns.Length - 1;
+                            for (int bi = 0; bi < btns.Length; bi += 1) {
+                                float bw = btns[bi].ActualWidth > 1.0f ? btns[bi].ActualWidth : btns[bi].ScreenBoundsWidth;
+                                float mid = btns[bi].ViewportX + bw * 0.5f;
+                                if (e.X < mid) {
+                                    targetIdx = bi;
+                                    break;
+                                }
+                            }
+                        }
+                        if (targetIdx != curIdx && _dragSourceGroup.MovePaneToIndex(curIdx, targetIdx)) {
+                            if (_dragTabSlotValid && _dragTabSlotWidths.Length == btns.Length) {
+                                float movedW = _dragTabSlotWidths[curIdx];
+                                _dragTabSlotWidths.RemoveAt(curIdx);
+                                _dragTabSlotWidths.Insert(targetIdx, movedW);
+                            }
+                        }
+                    }
+                }
+                _dropTargetGroup = null;
+                _hoveredDropZone = DockZone.Center;
+                SetOverlayHintsVisible(false);
+                return;
+            }
+        }
+
+        // Case B: Cross-zone / split target
+        DockTabGroup[] groups = CollectAllTabGroups();
+        DockTabGroup hitGroup = null;
+        float hitLx = 0.0f;
+        float hitLy = 0.0f;
+        for (int i = 0; i < groups.Length; i += 1) {
+            DockTabGroup g = groups[i];
+            if (!ParseUtil.IsValidHandle(g.__nativeHandle)) { continue; }
+            float lx = Visual_ScreenToLocal(g.__nativeHandle, e.X, e.Y, 0);
+            float ly = Visual_ScreenToLocal(g.__nativeHandle, e.X, e.Y, 1);
+            float gw = g.ActualWidth > 1.0f ? g.ActualWidth : g.ScreenBoundsWidth;
+            float gh = g.ActualHeight > 1.0f ? g.ActualHeight : g.ScreenBoundsHeight;
+            if (lx >= 0.0f && lx <= gw && ly >= 0.0f && ly <= gh) {
+                hitGroup = g;
+                hitLx = lx;
+                hitLy = ly;
+                break;
+            }
+        }
+
+        if (hitGroup == null) {
+            _dropTargetGroup = null;
+            SetOverlayHintsVisible(false);
+            return;
+        }
+
+        float w = hitGroup.ActualWidth > 1.0f ? hitGroup.ActualWidth : hitGroup.ScreenBoundsWidth;
+        float h = hitGroup.ActualHeight > 1.0f ? hitGroup.ActualHeight : hitGroup.ScreenBoundsHeight;
+        DockZone zone = DockZone.Center;
+        if (hitLy <= 32.0f) {
+            zone = DockZone.Center;
+        } else if (hitLx < w * 0.25f) {
+            zone = DockZone.Left;
+        } else if (hitLx > w * 0.75f) {
+            zone = DockZone.Right;
+        } else if (hitLy < h * 0.25f) {
+            zone = DockZone.Top;
+        } else if (hitLy > h * 0.75f) {
+            zone = DockZone.Bottom;
+        }
+        if (SameGroup(hitGroup, _dragSourceGroup) && _dragSourceGroup.PaneCount() <= 1) {
+            zone = DockZone.Center;
+        }
+
+        _dropTargetGroup = hitGroup;
+        _hoveredDropZone = zone;
+        UpdateOverlayForTarget(hitGroup, zone);
+    }
+
+    public override void OnMouseLeftButtonUp(MouseButtonEventArgs e) {
+        base.OnMouseLeftButtonUp(e);
+        if (!_dragCandidateActive) { return; }
+        bool wasDragging = _isDraggingPane;
+        DockTabGroup srcGrp = _dragSourceGroup;
+        DockTabGroup dstGrp = _dropTargetGroup;
+        DockPane pane = _dragPane;
+        string paneId = _dragPaneId;
+        DockZone dropZone = _hoveredDropZone;
+
+        _dragCandidateActive = false;
+        _isDraggingPane = false;
+        _dragSourceGroup = null;
+        _dropTargetGroup = null;
+        _dragPane = null;
+        _dragPaneId = "";
+        _hoveredDropZone = DockZone.Center;
+        _dragTabSlotValid = false;
+        _dragTabSlotWidths = new float[0];
+        _dragTabSlotGroupSeqId = -1;
+        _dragGrabOffsetX = 0.0f;
+        SetOverlayHintsVisible(false);
+        if (_dockOverlayCanvas != null) {
+            _dockOverlayCanvas.Visibility = Visibility.Collapsed;
+        }
+        ReleaseMouseCapture();
+
+        if (!wasDragging || dstGrp == null || pane == null) { return; }
+        if (dropZone == DockZone.Center) {
+            if (!SameGroup(dstGrp, srcGrp)) {
+                if (srcGrp != null) { srcGrp.RemovePaneById(paneId); }
+                dstGrp.AddPane(pane, true);
+                if (srcGrp != null && srcGrp.PaneCount() == 0) {
+                    CollapseEmptyGroup(srcGrp);
+                }
+                _lastActivatedPaneId = paneId;
+            }
+        } else {
+            if (SameGroup(srcGrp, dstGrp) && srcGrp.PaneCount() <= 1) { return; }
+            SplitGroupWithPane(dstGrp, pane, srcGrp, dropZone);
+        }
+        e.Handled = true;
+    }
+
     public float LeftSplitRatio {
-        get { return _mainHorizSplit != null ? _mainHorizSplit.SplitRatio : 0.20f; }
-        set { if (_mainHorizSplit != null) { _mainHorizSplit.SplitRatio = value; } }
+        get { return _mainHorizSplit != null ? _mainHorizSplit.SplitRatio : _savedLeftRatio; }
+        set {
+            _savedLeftRatio = Math.Clampf(value, 0.1f, 0.9f);
+            if (_mainHorizSplit != null) { _mainHorizSplit.SplitRatio = _savedLeftRatio; }
+        }
     }
     public float RightSplitRatio {
-        get { return _centerRightSplit != null ? _centerRightSplit.SplitRatio : 0.74f; }
-        set { if (_centerRightSplit != null) { _centerRightSplit.SplitRatio = value; } }
+        get { return _centerRightSplit != null ? _centerRightSplit.SplitRatio : _savedRightRatio; }
+        set {
+            _savedRightRatio = Math.Clampf(value, 0.1f, 0.9f);
+            if (_centerRightSplit != null) { _centerRightSplit.SplitRatio = _savedRightRatio; }
+        }
     }
     public float BottomSplitRatio {
-        get { return _centerBottomSplit != null ? _centerBottomSplit.SplitRatio : 0.72f; }
-        set { if (_centerBottomSplit != null) { _centerBottomSplit.SplitRatio = value; } }
+        get { return _centerBottomSplit != null ? _centerBottomSplit.SplitRatio : _savedBottomRatio; }
+        set {
+            _savedBottomRatio = Math.Clampf(value, 0.1f, 0.9f);
+            if (_centerBottomSplit != null) { _centerBottomSplit.SplitRatio = _savedBottomRatio; }
+        }
+    }
+
+    // ---- Serialization (aero-dock-v2: & aero-dock-v1: compatibility; ZERO "|" chars!) ----
+
+    private static string EscapeDockToken(string s) {
+        if (s == null || s.Length == 0) { return ""; }
+        string outStr = "";
+        for (int i = 0; i < s.Length; i += 1) {
+            string ch = s.Substring(i, 1);
+            if (ch == "%") { outStr = outStr + "%25"; }
+            else if (ch == ",") { outStr = outStr + "%2C"; }
+            else if (ch == "(") { outStr = outStr + "%28"; }
+            else if (ch == ")") { outStr = outStr + "%29"; }
+            else if (ch == ";") { outStr = outStr + "%3B"; }
+            else if (ch == "|") { outStr = outStr + "%7C"; }
+            else if (ch == "=") { outStr = outStr + "%3D"; }
+            else { outStr = outStr + ch; }
+        }
+        return outStr;
+    }
+
+    private static string UnescapeDockToken(string s) {
+        if (s == null || s.Length == 0) { return ""; }
+        string outStr = "";
+        int i = 0;
+        while (i < s.Length) {
+            if (i + 2 < s.Length && s.Substring(i, 1) == "%") {
+                string code = s.Substring(i + 1, 2).ToUpper();
+                if (code == "25") { outStr = outStr + "%"; i += 3; continue; }
+                if (code == "2C") { outStr = outStr + ","; i += 3; continue; }
+                if (code == "28") { outStr = outStr + "("; i += 3; continue; }
+                if (code == "29") { outStr = outStr + ")"; i += 3; continue; }
+                if (code == "3B") { outStr = outStr + ";"; i += 3; continue; }
+                if (code == "7C") { outStr = outStr + "|"; i += 3; continue; }
+                if (code == "3D") { outStr = outStr + "="; i += 3; continue; }
+            }
+            outStr = outStr + s.Substring(i, 1);
+            i += 1;
+        }
+        return outStr;
+    }
+
+    private string SerializeNodeV2(UIElement node) {
+        if (node is DockSplitNode) {
+            var sp = node as DockSplitNode;
+            string ori = sp.Orientation == Orientation.Horizontal ? "H" : "V";
+            int milli = EditorMath.RoundToInt(sp.SplitRatio * 1000.0f);
+            return "S(" + ori + "," + EditorMath.IntToStr(milli) + "," + SerializeNodeV2(sp.First) + "," + SerializeNodeV2(sp.Second) + ")";
+        }
+        if (node is DockTabGroup) {
+            var g = node as DockTabGroup;
+            string tag = (g._zoneTag != null && g._zoneTag.Length > 0) ? g._zoneTag : "D";
+            DockPane ap = g.ActivePane();
+            string activeId = ap != null ? EscapeDockToken(ap.PaneId) : "";
+            string res = "G(" + tag + "," + activeId;
+            DockPane[] ps = g.Panes();
+            for (int i = 0; i < ps.Length; i += 1) {
+                res = res + "," + EscapeDockToken(ps[i].PaneId);
+            }
+            res = res + ")";
+            return res;
+        }
+        return "G(D,)";
     }
 
     public string SerializeLayout() {
-        int lPct = EditorMath.RoundToInt(LeftSplitRatio * 1000.0f);
-        int rPct = EditorMath.RoundToInt(RightSplitRatio * 1000.0f);
-        int bPct = EditorMath.RoundToInt(BottomSplitRatio * 1000.0f);
-        return "aero-dock-v1:" + EditorMath.IntToStr(lPct) + "," + EditorMath.IntToStr(rPct) + "," + EditorMath.IntToStr(bPct);
+        string treeSpec = _rootNode != null ? SerializeNodeV2(_rootNode) : "G(C,)";
+        string spec = "aero-dock-v2:" + treeSpec;
+        if (_maximizedPaneId.Length > 0) {
+            spec = spec + ";max=" + EscapeDockToken(_maximizedPaneId);
+        }
+        return spec;
+    }
+
+    private static string ReadTokenUntil(DockParseCursor c, string stopChars) {
+        int start = c.Pos;
+        while (c.Pos < c.Src.Length) {
+            string ch = c.Src.Substring(c.Pos, 1);
+            if (stopChars.Contains(ch)) { break; }
+            c.Pos += 1;
+        }
+        return c.Src.Substring(start, c.Pos - start);
+    }
+
+    private static bool ExpectChar(DockParseCursor c, string expected) {
+        if (c.Pos >= c.Src.Length || c.Src.Substring(c.Pos, 1) != expected) {
+            c.Failed = true;
+            return false;
+        }
+        c.Pos += 1;
+        return true;
+    }
+
+    private static int ParseStrictNonNegInt(string raw) {
+        if (raw == null || raw.Length == 0) { return -1; }
+        int acc = 0;
+        for (int i = 0; i < raw.Length; i += 1) {
+            int d = ParseUtil.DigitValue(raw.Substring(i, 1));
+            if (d < 0) { return -1; }
+            if (acc > 100000000) { return -1; }
+            acc = acc * 10 + d;
+        }
+        return acc;
+    }
+
+    private static float ParseStrictV1RatioMilli(string raw) {
+        if (raw == null) { return -1.0f; }
+        string s = raw.Trim();
+        if (s.Length == 0) { return -1.0f; }
+        bool seenDot = false;
+        bool anyDigit = false;
+        for (int i = 0; i < s.Length; i += 1) {
+            string ch = s.Substring(i, 1);
+            if (ch == ".") {
+                if (seenDot || i == 0 || i == s.Length - 1) { return -1.0f; }
+                seenDot = true;
+            } else {
+                if (ParseUtil.DigitValue(ch) < 0) { return -1.0f; }
+                anyDigit = true;
+            }
+        }
+        if (!anyDigit) { return -1.0f; }
+        float val = ParseUtil.ParseFloat(s, -1.0f);
+        if (val <= 0.0f || val >= 1000.0f) { return -1.0f; }
+        return val;
+    }
+
+    private static DockLayoutNodeDesc ParseNodeV2(DockParseCursor c) {
+        if (c.Failed || c.Pos >= c.Src.Length) { c.Failed = true; return null; }
+        string kind = c.Src.Substring(c.Pos, 1);
+        c.Pos += 1;
+        if (!ExpectChar(c, "(")) { return null; }
+
+        if (kind == "S") {
+            var desc = new DockLayoutNodeDesc();
+            desc.IsSplit = true;
+            string ori = ReadTokenUntil(c, ",");
+            if (ori == "H") { desc.Orient = Orientation.Horizontal; }
+            else if (ori == "V") { desc.Orient = Orientation.Vertical; }
+            else { c.Failed = true; return null; }
+            if (!ExpectChar(c, ",")) { return null; }
+
+            string milliStr = ReadTokenUntil(c, ",");
+            int milli = ParseStrictNonNegInt(milliStr);
+            if (milli <= 0 || milli >= 1000) { c.Failed = true; return null; }
+            desc.Ratio = Math.Clampf((float)milli / 1000.0f, 0.1f, 0.9f);
+            if (!ExpectChar(c, ",")) { return null; }
+
+            desc.First = ParseNodeV2(c);
+            if (c.Failed || !ExpectChar(c, ",")) { c.Failed = true; return null; }
+            desc.Second = ParseNodeV2(c);
+            if (c.Failed || !ExpectChar(c, ")")) { c.Failed = true; return null; }
+            return desc;
+        }
+
+        if (kind == "G") {
+            var desc = new DockLayoutNodeDesc();
+            desc.IsSplit = false;
+            desc.ZoneTag = ReadTokenUntil(c, ",");
+            if (desc.ZoneTag.Length == 0) { desc.ZoneTag = "D"; }
+            if (!ExpectChar(c, ",")) { return null; }
+
+            desc.ActivePaneId = UnescapeDockToken(ReadTokenUntil(c, ",)"));
+            while (!c.Failed && c.Pos < c.Src.Length && c.Src.Substring(c.Pos, 1) == ",") {
+                c.Pos += 1;
+                string pid = UnescapeDockToken(ReadTokenUntil(c, ",)"));
+                if (pid.Length > 0) {
+                    desc.PaneIds.Push(pid);
+                }
+            }
+            if (!ExpectChar(c, ")")) { return null; }
+            return desc;
+        }
+
+        c.Failed = true;
+        return null;
+    }
+
+    private bool IsDefaultFourZoneTopology() {
+        return NodeIsSplit(_rootNode, _mainHorizSplit) &&
+               _mainHorizSplit != null &&
+               NodeIsGroup(_mainHorizSplit.First, _leftGroup) &&
+               NodeIsSplit(_mainHorizSplit.Second, _centerRightSplit) &&
+               _centerRightSplit != null &&
+               NodeIsSplit(_centerRightSplit.First, _centerBottomSplit) &&
+               NodeIsGroup(_centerRightSplit.Second, _rightGroup) &&
+               _centerBottomSplit != null &&
+               NodeIsGroup(_centerBottomSplit.First, _centerGroup) &&
+               NodeIsGroup(_centerBottomSplit.Second, _bottomGroup);
+    }
+
+    private UIElement MaterializeNodeV2(
+        DockLayoutNodeDesc desc,
+        Dictionary<string, bool> usedTags,
+        Dictionary<string, bool> placedPanes,
+        DockTabGroup[] createdGroups) {
+        if (desc == null) { return null; }
+        if (desc.IsSplit) {
+            UIElement first = MaterializeNodeV2(desc.First, usedTags, placedPanes, createdGroups);
+            UIElement second = MaterializeNodeV2(desc.Second, usedTags, placedPanes, createdGroups);
+            return new DockSplitNode(desc.Orient, desc.Ratio, first, second);
+        }
+
+        DockTabGroup grp = null;
+        string tag = desc.ZoneTag;
+        if ((tag == "L" || tag == "C" || tag == "R" || tag == "B") && !usedTags.ContainsKey(tag)) {
+            usedTags[tag] = true;
+            if (tag == "L") { grp = _leftGroup; }
+            else if (tag == "C") { grp = _centerGroup; }
+            else if (tag == "R") { grp = _rightGroup; }
+            else if (tag == "B") { grp = _bottomGroup; }
+        }
+        if (grp == null) {
+            grp = new DockTabGroup();
+            WireGroup(grp, tag);
+        } else {
+            grp.ClearAllPanesSilent();
+            grp._zoneTag = tag;
+        }
+        createdGroups.Push(grp);
+
+        for (int i = 0; i < desc.PaneIds.Length; i += 1) {
+            string pid = desc.PaneIds[i];
+            if (_panesById.ContainsKey(pid) && !placedPanes.ContainsKey(pid)) {
+                placedPanes[pid] = true;
+                grp.AddPane(_panesById[pid], false);
+            }
+        }
+        if (desc.ActivePaneId.Length > 0) {
+            grp.SelectPaneById(desc.ActivePaneId);
+        } else if (grp.PaneCount() > 0 && grp.SelectedIndex < 0) {
+            grp.SelectedIndex = 0;
+        }
+        return grp;
     }
 
     public bool DeserializeLayout(string spec) {
-        if (spec == null || !spec.StartsWith("aero-dock-v1:")) { return false; }
-        string body = spec.Substring(13);
-        string[] parts = body.Split(",");
-        if (parts.Length < 3) { return false; }
-        LeftSplitRatio = ParseUtil.ParseFloat(parts[0], 200.0f) / 1000.0f;
-        RightSplitRatio = ParseUtil.ParseFloat(parts[1], 740.0f) / 1000.0f;
-        BottomSplitRatio = ParseUtil.ParseFloat(parts[2], 720.0f) / 1000.0f;
+        if (spec == null || spec.Length == 0) { return false; }
+
+        if (spec.StartsWith("aero-dock-v1:")) {
+            string body = spec.Substring(13);
+            string[] parts = body.Split(",");
+            if (parts.Length != 3) { return false; }
+            float v0 = ParseStrictV1RatioMilli(parts[0]);
+            float v1 = ParseStrictV1RatioMilli(parts[1]);
+            float v2 = ParseStrictV1RatioMilli(parts[2]);
+            if (v0 <= 0.0f || v1 <= 0.0f || v2 <= 0.0f) { return false; }
+
+            RestoreMaximizedPane();
+            if (!IsDefaultFourZoneTopology()) {
+                ResetDefaultIdeLayout();
+            }
+            LeftSplitRatio = v0 / 1000.0f;
+            RightSplitRatio = v1 / 1000.0f;
+            BottomSplitRatio = v2 / 1000.0f;
+            return true;
+        }
+
+        if (!spec.StartsWith("aero-dock-v2:")) { return false; }
+        string fullBody = spec.Substring(13);
+        string treePart = fullBody;
+        string maxPaneId = "";
+        int semiIdx = fullBody.IndexOf(";");
+        if (semiIdx >= 0) {
+            treePart = fullBody.Substring(0, semiIdx);
+            string metaPart = fullBody.Substring(semiIdx + 1);
+            if (metaPart.Length == 0) { return false; }
+            string[] clauses = metaPart.Split(";");
+            bool seenMax = false;
+            for (int ci = 0; ci < clauses.Length; ci += 1) {
+                string cl = clauses[ci];
+                if (cl.Length == 0) { return false; }
+                if (cl.StartsWith("max=")) {
+                    if (seenMax) { return false; }
+                    string rawMax = cl.Substring(4);
+                    if (rawMax.Length == 0) { return false; }
+                    maxPaneId = UnescapeDockToken(rawMax);
+                    seenMax = true;
+                } else {
+                    return false;
+                }
+            }
+        }
+        if (treePart.Length == 0) { return false; }
+
+        var cursor = new DockParseCursor();
+        cursor.Src = treePart;
+        cursor.Pos = 0;
+        DockLayoutNodeDesc ast = ParseNodeV2(cursor);
+        if (cursor.Failed || ast == null || cursor.Pos != treePart.Length) {
+            return false;
+        }
+
+        // Validated AST: apply atomically
+        RestoreMaximizedPane();
+
+        string[] allKnownIds = CollectPaneIdKeys();
+        var usedTags = new Dictionary<string, bool>();
+        var placedPanes = new Dictionary<string, bool>();
+        var createdGroups = new DockTabGroup[0];
+
+        if (_leftGroup == null) { _leftGroup = new DockTabGroup(); WireGroup(_leftGroup, "L"); }
+        if (_centerGroup == null) { _centerGroup = new DockTabGroup(); WireGroup(_centerGroup, "C"); }
+        if (_rightGroup == null) { _rightGroup = new DockTabGroup(); WireGroup(_rightGroup, "R"); }
+        if (_bottomGroup == null) { _bottomGroup = new DockTabGroup(); WireGroup(_bottomGroup, "B"); }
+
+        UIElement newRoot = MaterializeNodeV2(ast, usedTags, placedPanes, createdGroups);
+        if (newRoot == null || createdGroups.Length == 0) { return false; }
+
+        // Ensure no registered pane is lost if it wasn't present in the saved layout
+        DockTabGroup fallbackGroup = IsNodeInTree(newRoot, _centerGroup) ? _centerGroup : createdGroups[0];
+        for (int i = 0; i < allKnownIds.Length; i += 1) {
+            string pid = allKnownIds[i];
+            if (!placedPanes.ContainsKey(pid) && _panesById.ContainsKey(pid)) {
+                placedPanes[pid] = true;
+                fallbackGroup.AddPane(_panesById[pid], false);
+            }
+        }
+
+        SetRootDockNode(newRoot);
+
+        if (allKnownIds.Length > 0) {
+            for (int gi = 0; gi < createdGroups.Length; gi += 1) {
+                if (createdGroups[gi].PaneCount() == 0 && !NodeIsGroup(_rootNode, createdGroups[gi])) {
+                    CollapseEmptyGroup(createdGroups[gi]);
+                }
+            }
+        }
+
+        // Rebind default 4-zone split pointers if root matches standard topology
+        _mainHorizSplit = null;
+        _centerRightSplit = null;
+        _centerBottomSplit = null;
+        if (_rootNode is DockSplitNode) {
+            var mh = _rootNode as DockSplitNode;
+            if (NodeIsGroup(mh.First, _leftGroup) && mh.Second is DockSplitNode) {
+                var cr = mh.Second as DockSplitNode;
+                if (NodeIsGroup(cr.Second, _rightGroup) && cr.First is DockSplitNode) {
+                    var cb = cr.First as DockSplitNode;
+                    if (NodeIsGroup(cb.First, _centerGroup) && NodeIsGroup(cb.Second, _bottomGroup)) {
+                        _mainHorizSplit = mh;
+                        _centerRightSplit = cr;
+                        _centerBottomSplit = cb;
+                        _savedLeftRatio = mh.SplitRatio;
+                        _savedRightRatio = cr.SplitRatio;
+                        _savedBottomRatio = cb.SplitRatio;
+                    }
+                }
+            }
+        }
+
+        if (maxPaneId.Length > 0 && _panesById.ContainsKey(maxPaneId)) {
+            MaximizePane(maxPaneId);
+        }
         return true;
     }
 }
@@ -1930,6 +3801,7 @@ public class InspectorPropertyItem : DependencyObject {
     public float FloatX { get; set; } = 0.0f;
     public float FloatY { get; set; } = 0.0f;
     public float FloatZ { get; set; } = 0.0f;
+    public float FloatW { get; set; } = 1.0f;
     public bool BoolValue { get; set; } = false;
     public string StringValue { get; set; } = "";
     public float MinValue { get; set; } = -1000000.0f;
@@ -1939,13 +3811,110 @@ public class InspectorPropertyItem : DependencyObject {
     public bool IsMixedValue { get; set; } = false;
     public bool IsReadOnly { get; set; } = false;
 
-    public InspectorPropertyItem() {}
+    public float ColorR { get; set; } = 1.0f;
+    public float ColorG { get; set; } = 1.0f;
+    public float ColorB { get; set; } = 1.0f;
+    public float ColorA { get; set; } = 1.0f;
+    public bool ColorHdr { get; set; } = false;
+    public int IntValue { get; set; } = 0;
+    public string[] EnumOptions { get; set; }
+    public string AssetFilter { get; set; } = "";
+    public string CustomHostId { get; set; } = "";
+    public string GroupKey { get; set; } = "";
+    public string HeaderText { get; set; } = "";
+    public bool CanRemoveCard { get; set; } = false;
+
+    public InspectorPropertyItem() {
+        EnumOptions = new string[0];
+    }
     public InspectorPropertyItem(string category, string path, string displayName, string typeKind) {
+        EnumOptions = new string[0];
         Category = category == null ? "General" : category;
         PropertyPath = path == null ? "" : path;
         DisplayName = displayName == null ? PropertyPath : displayName;
         TypeKind = typeKind == null ? "float" : typeKind;
     }
+}
+
+internal class PropertyGridRowEntry {
+    public string Key = "";
+    public string CardKey = "";
+    public string TypeKind = "float";
+    public InspectorPropertyItem Item;
+
+    public StackPanel WrapperPanel;
+    public Border HeaderBorder;
+    public TextBlock HeaderLabel;
+    public Border RowRoot;
+    public Grid RowGrid;
+    public TextBlock NameLabel;
+    public Button RevertButton;
+
+    public UIElement EditorRoot;
+    public NumericScrubber Scrubber;
+    public Slider RangeSlider;
+    public NumericScrubber RangeScrubber;
+    public Vector2Field Vec2;
+    public Vector3Field Vec3;
+    public ColorPicker ColorEd;
+    public ComboBox Combo;
+    public CheckBox Check;
+    public TextBox TextEd;
+    public TextBox AssetText;
+    public WrapPanel LayerWrap;
+    public Button[] LayerButtons;
+    public TextBlock LayerSummary;
+    public Border CustomHostBox;
+
+    public string[] EnumNames;
+    public int[] EnumValues;
+    public string CachedEnumSig = "";
+    public string CachedLayerSig = "";
+    public bool Syncing = false;
+
+    public PropertyGridRowEntry() {
+        LayerButtons = new Button[0];
+        EnumNames = new string[0];
+        EnumValues = new int[0];
+    }
+
+    public bool HasActiveFocus() {
+        if (TextEd != null && TextEd.IsKeyboardFocusWithin) { return true; }
+        if (AssetText != null && AssetText.IsKeyboardFocusWithin) { return true; }
+        if (Scrubber != null && (Scrubber.IsInlineEditing() || Scrubber.IsKeyboardFocusWithin)) { return true; }
+        if (RangeScrubber != null && (RangeScrubber.IsInlineEditing() || RangeScrubber.IsKeyboardFocusWithin)) { return true; }
+        if (Vec2 != null && Vec2.IsKeyboardFocusWithin) { return true; }
+        if (Vec3 != null && Vec3.IsKeyboardFocusWithin) { return true; }
+        if (ColorEd != null && (ColorEd.IsPickerPopupOpen() || ColorEd.IsKeyboardFocusWithin)) { return true; }
+        if (Combo != null && Combo.IsDropDownOpen) { return true; }
+        return false;
+    }
+}
+
+internal class PropertyGridElementList {
+    public UIElement[] Items;
+    public PropertyGridElementList() {
+        Items = new UIElement[0];
+    }
+}
+
+internal class PropertyGridCardEntry {
+    public string CardKey = "";
+    public string Category = "";
+    public bool IsExpanded = true;
+    public bool CanRemove = false;
+
+    public Border CardRoot;
+    public StackPanel CardStack;
+    public Border HeaderBorder;
+    public Button ToggleBtn;
+    public TextBlock ChevronText;
+    public TextBlock TitleLabel;
+    public Button ResetBtn;
+    public Button CopyBtn;
+    public Button PasteBtn;
+    public Button RemoveBtn;
+    public StackPanel BodyPanel;
 }
 
 public class PropertyGrid : Control {
@@ -1956,12 +3925,29 @@ public class PropertyGrid : Control {
     private ScrollViewer _scrollViewer;
     private StackPanel _rowsPanel;
 
+    private Dictionary<string, PropertyGridRowEntry> _rowsByKey;
+    private Dictionary<string, PropertyGridCardEntry> _cardsByKey;
+    private Dictionary<string, bool> _cardCollapsedState;
+    private Dictionary<string, Border> _customHostsById;
+    private Dictionary<string, UIElement> _customHostContentById;
+    private string[] _orderedRowKeys;
+    private int _visibleRowCount = 0;
+
     public event ValueEditEventHandler PropertyEdited;
     public event ValueEditEventHandler PropertyCommitted;
     public event ValueEditEventHandler PropertyRevertRequested;
+    public event PropertyCardActionEventHandler PropertyCardActionRequested;
+    public event PropertyAssetActionEventHandler PropertyAssetPickRequested;
 
     public PropertyGrid() : base() {
         _items = new InspectorPropertyItem[0];
+        _rowsByKey = new Dictionary<string, PropertyGridRowEntry>();
+        _cardsByKey = new Dictionary<string, PropertyGridCardEntry>();
+        _cardCollapsedState = new Dictionary<string, bool>();
+        _customHostsById = new Dictionary<string, Border>();
+        _customHostContentById = new Dictionary<string, UIElement>();
+        _orderedRowKeys = new string[0];
+
         Background = new SolidColorBrush("#FF0F172A");
 
         _rootGrid = new Grid();
@@ -1991,7 +3977,7 @@ public class PropertyGrid : Control {
         UIElement.SetGridRow(_scrollViewer, 1);
         _rowsPanel = new StackPanel();
         _rowsPanel.Orientation = Orientation.Vertical;
-        _rowsPanel.Spacing = 2.0f;
+        _rowsPanel.Spacing = 4.0f;
         _rowsPanel.Margin = new Thickness(4.0f);
         _scrollViewer.Content = _rowsPanel;
         _rootGrid.AddChild(_scrollViewer);
@@ -2001,174 +3987,1146 @@ public class PropertyGrid : Control {
 
     internal void ApplySearchFilterText(string txt) {
         _filterText = txt == null ? "" : txt.Trim().ToLower();
-        RebuildRows();
+        ReconcileRows();
     }
 
     internal void RaisePropertyEdited(ValueEditLifecycleEventArgs ev) { PropertyEdited(this, ev); }
     internal void RaisePropertyCommitted(ValueEditLifecycleEventArgs ev) { PropertyCommitted(this, ev); }
     internal void RaisePropertyRevert(ValueEditLifecycleEventArgs ev) { PropertyRevertRequested(this, ev); }
+    internal void RaiseAssetAction(PropertyAssetActionEventArgs ev) { PropertyAssetPickRequested(this, ev); }
 
     public string FilterText {
         get { return _filterText; }
         set {
-            _filterText = value == null ? "" : value.Trim().ToLower();
-            if (_searchBox != null && _searchBox.Text != value) { _searchBox.Text = value; }
-            RebuildRows();
+            string raw = value == null ? "" : value;
+            _filterText = raw.Trim().ToLower();
+            if (_searchBox != null && _searchBox.Text != raw) {
+                _searchBox.Text = raw;
+            } else {
+                ReconcileRows();
+            }
         }
     }
 
     public int VisibleRowCount() {
-        return _rowsPanel != null ? _rowsPanel.Children().Length : 0;
+        return _visibleRowCount;
     }
 
     public void SetProperties(InspectorPropertyItem[] items) {
         _items = items == null ? new InspectorPropertyItem[0] : items;
-        RebuildRows();
+        ReconcileRows();
+    }
+
+    public UIElement GetRowEditor(string propertyPath) {
+        if (propertyPath == null || propertyPath.Length == 0) { return null; }
+        for (int i = 0; i < _orderedRowKeys.Length; i += 1) {
+            string k = _orderedRowKeys[i];
+            if (_rowsByKey.ContainsKey(k)) {
+                PropertyGridRowEntry e = _rowsByKey[k];
+                if (e.Item != null && e.Item.PropertyPath == propertyPath) {
+                    return e.EditorRoot;
+                }
+            }
+        }
+        return null;
+    }
+
+    public UIElement GetCustomHostContainer(string customHostId) {
+        if (customHostId == null || customHostId.Length == 0) { return null; }
+        if (_customHostsById.ContainsKey(customHostId)) {
+            return _customHostsById[customHostId];
+        }
+        return null;
+    }
+
+    public void SetCustomHostContent(string customHostId, UIElement content) {
+        if (customHostId == null || customHostId.Length == 0) { return; }
+        if (content == null) {
+            if (_customHostContentById.ContainsKey(customHostId)) {
+                _customHostContentById.Remove(customHostId);
+            }
+        } else {
+            _customHostContentById[customHostId] = content;
+        }
+        if (_customHostsById.ContainsKey(customHostId)) {
+            Border b = _customHostsById[customHostId];
+            if (b != null) {
+                b.Child = content;
+            }
+        }
+    }
+
+    public bool IsCardExpanded(string groupOrCategoryKey) {
+        if (groupOrCategoryKey == null || groupOrCategoryKey.Length == 0) { return true; }
+        if (_cardCollapsedState.ContainsKey(groupOrCategoryKey)) {
+            return !_cardCollapsedState[groupOrCategoryKey];
+        }
+        return true;
+    }
+
+    public void SetCardExpanded(string groupOrCategoryKey, bool expanded) {
+        if (groupOrCategoryKey == null || groupOrCategoryKey.Length == 0) { return; }
+        _cardCollapsedState[groupOrCategoryKey] = !expanded;
+        if (_cardsByKey.ContainsKey(groupOrCategoryKey)) {
+            ApplyCardExpandedVisual(_cardsByKey[groupOrCategoryKey], expanded);
+        }
+        RecountVisibleRows();
+    }
+
+    public void TriggerCardAction(string groupOrCategoryKey, string action) {
+        if (groupOrCategoryKey == null || action == null) { return; }
+        string cat = groupOrCategoryKey;
+        if (_cardsByKey.ContainsKey(groupOrCategoryKey)) {
+            cat = _cardsByKey[groupOrCategoryKey].Category;
+        }
+        PropertyCardActionRequested(this, new PropertyCardActionEventArgs(groupOrCategoryKey, cat, action, this));
+    }
+
+    public void AssignAssetPath(string propertyPath, string assetPath) {
+        if (propertyPath == null || propertyPath.Length == 0) { return; }
+        string nextPath = assetPath == null ? "" : assetPath;
+        for (int i = 0; i < _orderedRowKeys.Length; i += 1) {
+            string k = _orderedRowKeys[i];
+            if (!_rowsByKey.ContainsKey(k)) { continue; }
+            PropertyGridRowEntry entry = _rowsByKey[k];
+            if (entry.Item == null || entry.Item.PropertyPath != propertyPath) { continue; }
+            if (entry.Item.IsReadOnly) { return; }
+            string oldTxt = entry.Item.StringValue;
+            entry.Item.StringValue = nextPath;
+            entry.Item.IsMixedValue = false;
+            if (entry.AssetText != null) {
+                entry.Syncing = true;
+                entry.AssetText.Text = nextPath;
+                entry.AssetText.PlaceholderText = entry.Item.AssetFilter.Length > 0 ? ("Asset (" + entry.Item.AssetFilter + ")") : "None (Asset)";
+                entry.Syncing = false;
+            }
+            PropertyAssetPickRequested(this, new PropertyAssetActionEventArgs(propertyPath, "Drop", entry.Item.AssetFilter, nextPath, this));
+            var outEv = new ValueEditLifecycleEventArgs(propertyPath, 0.0f, 0.0f, EditLifecyclePhase.Commit, this);
+            outEv.OldText = oldTxt;
+            outEv.NewText = nextPath;
+            RaisePropertyEdited(outEv);
+            RaisePropertyCommitted(outEv);
+            break;
+        }
     }
 
     private bool MatchesFilter(InspectorPropertyItem item) {
         if (_filterText.Length == 0) { return true; }
-        if (item.DisplayName.ToLower().Contains(_filterText)) { return true; }
-        if (item.PropertyPath.ToLower().Contains(_filterText)) { return true; }
-        if (item.Category.ToLower().Contains(_filterText)) { return true; }
+        if (item.DisplayName != null && item.DisplayName.ToLower().Contains(_filterText)) { return true; }
+        if (item.PropertyPath != null && item.PropertyPath.ToLower().Contains(_filterText)) { return true; }
+        if (item.Category != null && item.Category.ToLower().Contains(_filterText)) { return true; }
+        if (item.GroupKey != null && item.GroupKey.ToLower().Contains(_filterText)) { return true; }
+        if (item.HeaderText != null && item.HeaderText.ToLower().Contains(_filterText)) { return true; }
         return false;
     }
 
-    private void RebuildRows() {
-        if (_rowsPanel == null) { return; }
-        _rowsPanel.ClearChildren();
-        string lastCategory = "";
+    private static string ResolveCardKey(InspectorPropertyItem item) {
+        if (item.GroupKey != null && item.GroupKey.Length > 0) { return item.GroupKey; }
+        if (item.Category != null && item.Category.Length > 0) { return item.Category; }
+        return "General";
+    }
+
+    private static string MakeBaseRowKey(InspectorPropertyItem item) {
+        string tk = item.TypeKind == null ? "float" : item.TypeKind;
+        if (item.PropertyPath != null && item.PropertyPath.Length > 0) {
+            return item.PropertyPath + "\n" + tk;
+        }
+        string hdr = item.HeaderText == null ? "" : item.HeaderText;
+        string cat = item.Category == null ? "General" : item.Category;
+        return "__hdr__\n" + cat + "\n" + hdr + "\n" + tk;
+    }
+
+    private static int Pow2Int(int bit) {
+        int p = 1;
+        for (int i = 0; i < bit; i += 1) { p = p * 2; }
+        return p;
+    }
+
+    private static bool HasMaskBit(int mask, int bit) {
+        if (bit < 0 || bit > 31) { return false; }
+        if (bit == 31) { return mask < 0; }
+        int low31 = mask < 0 ? ((mask + 2147483647) + 1) : mask;
+        int p = Pow2Int(bit);
+        return ((low31 / p) % 2) != 0;
+    }
+
+    internal static int ToggleMaskBit(int mask, int bit) {
+        if (bit < 0 || bit > 31) { return mask; }
+        if (bit == 31) {
+            return mask < 0 ? ((mask + 2147483647) + 1) : ((mask - 2147483647) - 1);
+        }
+        int low31 = mask < 0 ? ((mask + 2147483647) + 1) : mask;
+        int p = Pow2Int(bit);
+        if (((low31 / p) % 2) != 0) {
+            return mask - p;
+        }
+        return mask + p;
+    }
+
+    internal static string FormatCompactFloat(float v) {
+        bool neg = v < 0.0f;
+        float av = neg ? -v : v;
+        int scaled = EditorMath.RoundToInt(av * 100.0f);
+        int whole = scaled / 100;
+        int frac = scaled % 100;
+        string fs = EditorMath.IntToStr(frac);
+        if (fs.Length < 2) { fs = "0" + fs; }
+        return (neg ? "-" : "") + EditorMath.IntToStr(whole) + "." + fs;
+    }
+
+    private static void ApplyCardExpandedVisual(PropertyGridCardEntry card, bool expanded) {
+        if (card == null) { return; }
+        card.IsExpanded = expanded;
+        if (card.ChevronText != null) {
+            card.ChevronText.Text = expanded ? "▾" : "▸";
+        }
+        if (card.BodyPanel != null) {
+            card.BodyPanel.Visibility = expanded ? Visibility.Visible : Visibility.Collapsed;
+        }
+    }
+
+    private Button MakeCardActionButton(string label, float width) {
+        var btn = new Button();
+        var txt = new TextBlock();
+        txt.Text = label;
+        txt.FontSize = 10.0f;
+        txt.Foreground = new SolidColorBrush("#FFCBD5E1");
+        btn.Content = txt;
+        btn.Width = width;
+        btn.Height = 20.0f;
+        btn.Padding = new Thickness(2.0f, 0.0f, 2.0f, 0.0f);
+        return btn;
+    }
+
+    private PropertyGridCardEntry GetOrCreateCard(string cardKey, string category) {
+        if (_cardsByKey.ContainsKey(cardKey)) {
+            PropertyGridCardEntry existing = _cardsByKey[cardKey];
+            existing.Category = category;
+            if (existing.TitleLabel != null) {
+                existing.TitleLabel.Text = category;
+            }
+            return existing;
+        }
+
+        var card = new PropertyGridCardEntry();
+        card.CardKey = cardKey;
+        card.Category = category;
+        card.IsExpanded = !_cardCollapsedState.ContainsKey(cardKey) || !_cardCollapsedState[cardKey];
+
+        card.CardRoot = new Border();
+        card.CardRoot.Background = new SolidColorBrush("#FF0F172A");
+        card.CardRoot.BorderBrush = new SolidColorBrush("#FF1E293B");
+        card.CardRoot.BorderThickness = new Thickness(1.0f);
+        card.CardRoot.CornerRadius = new CornerRadius(4.0f);
+
+        card.CardStack = new StackPanel();
+        card.CardStack.Orientation = Orientation.Vertical;
+        card.CardRoot.Child = card.CardStack;
+
+        card.HeaderBorder = new Border();
+        card.HeaderBorder.Background = new SolidColorBrush("#FF1E293B");
+        card.HeaderBorder.Padding = new Thickness(6.0f, 3.0f, 4.0f, 3.0f);
+        card.CardStack.AddChild(card.HeaderBorder);
+
+        var headerGrid = new Grid();
+        headerGrid.SetColumnDefinitions("22,*,Auto");
+        headerGrid.ColumnSpacing = 4.0f;
+        card.HeaderBorder.Child = headerGrid;
+
+        card.ToggleBtn = new Button();
+        card.ChevronText = new TextBlock();
+        card.ChevronText.Text = card.IsExpanded ? "▾" : "▸";
+        card.ChevronText.FontSize = 11.0f;
+        card.ToggleBtn.Content = card.ChevronText;
+        card.ToggleBtn.Width = 20.0f;
+        card.ToggleBtn.Height = 20.0f;
+        card.ToggleBtn.Padding = new Thickness(0.0f);
+        UIElement.SetGridColumn(card.ToggleBtn, 0);
+        headerGrid.AddChild(card.ToggleBtn);
+
+        card.TitleLabel = new TextBlock();
+        card.TitleLabel.Text = category;
+        card.TitleLabel.FontSize = 11.0f;
+        card.TitleLabel.FontWeight = "Bold";
+        card.TitleLabel.Foreground = new SolidColorBrush("#FFE2E8F0");
+        card.TitleLabel.VerticalAlignment = VerticalAlignment.Center;
+        UIElement.SetGridColumn(card.TitleLabel, 1);
+        headerGrid.AddChild(card.TitleLabel);
+
+        var actions = new StackPanel();
+        actions.Orientation = Orientation.Horizontal;
+        actions.Spacing = 2.0f;
+        card.ResetBtn = MakeCardActionButton("Reset", 38.0f);
+        card.CopyBtn = MakeCardActionButton("Copy", 34.0f);
+        card.PasteBtn = MakeCardActionButton("Paste", 38.0f);
+        card.RemoveBtn = MakeCardActionButton("×", 20.0f);
+        card.RemoveBtn.Visibility = Visibility.Collapsed;
+        actions.AddChild(card.ResetBtn);
+        actions.AddChild(card.CopyBtn);
+        actions.AddChild(card.PasteBtn);
+        actions.AddChild(card.RemoveBtn);
+        UIElement.SetGridColumn(actions, 2);
+        headerGrid.AddChild(actions);
+
+        card.BodyPanel = new StackPanel();
+        card.BodyPanel.Orientation = Orientation.Vertical;
+        card.BodyPanel.Spacing = 2.0f;
+        card.BodyPanel.Margin = new Thickness(2.0f);
+        card.CardStack.AddChild(card.BodyPanel);
+
+        ApplyCardExpandedVisual(card, card.IsExpanded);
+
         PropertyGrid self = this;
+        PropertyGridCardEntry capturedCard = card;
+        card.ToggleBtn.Click += (object s, RoutedEventArgs e) => {
+            self.SetCardExpanded(capturedCard.CardKey, !capturedCard.IsExpanded);
+        };
+        card.ResetBtn.Click += (object s, RoutedEventArgs e) => {
+            self.TriggerCardAction(capturedCard.CardKey, "Reset");
+        };
+        card.CopyBtn.Click += (object s, RoutedEventArgs e) => {
+            self.TriggerCardAction(capturedCard.CardKey, "Copy");
+        };
+        card.PasteBtn.Click += (object s, RoutedEventArgs e) => {
+            self.TriggerCardAction(capturedCard.CardKey, "Paste");
+        };
+        card.RemoveBtn.Click += (object s, RoutedEventArgs e) => {
+            self.TriggerCardAction(capturedCard.CardKey, "Remove");
+        };
+
+        _cardsByKey[cardKey] = card;
+        return card;
+    }
+
+    private static void ParseEnumOptionsIntoEntry(PropertyGridRowEntry entry, string[] opts) {
+        int n = opts == null ? 0 : opts.Length;
+        var names = new string[n];
+        var vals = new int[n];
+        string sig = "";
+        for (int i = 0; i < n; i += 1) {
+            string raw = opts[i] == null ? "" : opts[i];
+            int eq = raw.IndexOf("=");
+            if (eq > 0) {
+                names[i] = raw.Substring(0, eq);
+                vals[i] = ParseUtil.ParseInt(raw.Substring(eq + 1), i);
+            } else {
+                names[i] = raw;
+                vals[i] = i;
+            }
+            sig = sig + raw + "\n";
+        }
+        entry.EnumNames = names;
+        entry.EnumValues = vals;
+        entry.CachedEnumSig = sig;
+    }
+
+    private void SyncColorPickerFromItem(ColorPicker cp, InspectorPropertyItem item) {
+        if (cp == null || item == null) { return; }
+        float r = item.ColorR;
+        float g = item.ColorG;
+        float b = item.ColorB;
+        float a = item.ColorA;
+        if (r == 1.0f && g == 1.0f && b == 1.0f && a == 1.0f && item.StringValue != null && item.StringValue.StartsWith("#")) {
+            uint parsed = ParseUtil.ParseHexColor(item.StringValue, 0u);
+            if (parsed != 0u || item.StringValue == "#00000000" || item.StringValue == "#0000") {
+                a = (float)((parsed / 16777216u) % 256u) / 255.0f;
+                b = (float)((parsed / 65536u) % 256u) / 255.0f;
+                g = (float)((parsed / 256u) % 256u) / 255.0f;
+                r = (float)(parsed % 256u) / 255.0f;
+            }
+        }
+        cp.IsHdr = item.ColorHdr;
+        cp.IsReadOnly = item.IsReadOnly;
+        cp.PropertyPath = item.PropertyPath;
+        cp.IsMixed = item.IsMixedValue;
+        cp.SetColor(r, g, b, a, false);
+    }
+
+    internal void RefreshLayerMaskButtons(PropertyGridRowEntry entry, int maskVal, bool isMixed) {
+        if (entry == null || entry.LayerButtons == null) { return; }
+        for (int i = 0; i < entry.LayerButtons.Length; i += 1) {
+            Button btn = entry.LayerButtons[i];
+            if (btn == null) { continue; }
+            bool active = !isMixed && HasMaskBit(maskVal, i);
+            btn.Background = new SolidColorBrush(active ? "#FF0284C7" : "#FF1E293B");
+        }
+        if (entry.LayerSummary != null) {
+            entry.LayerSummary.Text = isMixed ? "—" : ("0x" + EditorMath.IntToStr(maskVal));
+        }
+    }
+
+    private PropertyGridRowEntry CreateRowEntry(string rowKey, string cardKey, InspectorPropertyItem item) {
+        var entry = new PropertyGridRowEntry();
+        entry.Key = rowKey;
+        entry.CardKey = cardKey;
+        entry.TypeKind = item.TypeKind == null ? "float" : item.TypeKind;
+        entry.Item = item;
+
+        entry.WrapperPanel = new StackPanel();
+        entry.WrapperPanel.Orientation = Orientation.Vertical;
+        entry.WrapperPanel.Spacing = 2.0f;
+
+        entry.HeaderBorder = new Border();
+        entry.HeaderBorder.Padding = new Thickness(6.0f, 4.0f, 6.0f, 2.0f);
+        entry.HeaderBorder.Background = new SolidColorBrush("#FF162032");
+        entry.HeaderBorder.CornerRadius = new CornerRadius(2.0f);
+        entry.HeaderLabel = new TextBlock();
+        entry.HeaderLabel.FontSize = 11.0f;
+        entry.HeaderLabel.FontWeight = "Bold";
+        entry.HeaderLabel.Foreground = new SolidColorBrush("#FF93C5FD");
+        entry.HeaderBorder.Child = entry.HeaderLabel;
+        entry.HeaderBorder.Visibility = Visibility.Collapsed;
+        entry.WrapperPanel.AddChild(entry.HeaderBorder);
+
+        entry.RowRoot = new Border();
+        entry.RowRoot.Padding = new Thickness(6.0f, 3.0f, 4.0f, 3.0f);
+        entry.RowRoot.Background = new SolidColorBrush("#FF111827");
+        entry.RowRoot.BorderThickness = new Thickness(3.0f, 0.0f, 0.0f, 0.0f);
+        entry.WrapperPanel.AddChild(entry.RowRoot);
+
+        entry.RowGrid = new Grid();
+        entry.RowGrid.SetColumnDefinitions("120,*,Auto");
+        entry.RowGrid.ColumnSpacing = 6.0f;
+        entry.RowRoot.Child = entry.RowGrid;
+
+        entry.NameLabel = new TextBlock();
+        entry.NameLabel.FontSize = 12.0f;
+        entry.NameLabel.VerticalAlignment = VerticalAlignment.Center;
+        UIElement.SetGridColumn(entry.NameLabel, 0);
+        entry.RowGrid.AddChild(entry.NameLabel);
+
+        PropertyGrid self = this;
+        PropertyGridRowEntry capEntry = entry;
+        string tk = entry.TypeKind;
+
+        if (tk == "float" || tk == "int") {
+            var scrub = new NumericScrubber();
+            scrub.Label = tk == "int" ? "#" : "V";
+            scrub.Decimals = tk == "int" ? 0 : 2;
+            scrub.ValueChanged += (object s, ValueEditLifecycleEventArgs ev) => {
+                if (capEntry.Syncing) { return; }
+                capEntry.Item.FloatX = ev.NewValue;
+                capEntry.Item.IntValue = EditorMath.RoundToInt(ev.NewValue);
+                capEntry.Item.IsMixedValue = false;
+                ev.IntValue = capEntry.Item.IntValue;
+                self.RaisePropertyEdited(ev);
+            };
+            scrub.EditCommitted += (object s, ValueEditLifecycleEventArgs ev) => {
+                if (capEntry.Syncing) { return; }
+                capEntry.Item.FloatX = ev.NewValue;
+                capEntry.Item.IntValue = EditorMath.RoundToInt(ev.NewValue);
+                capEntry.Item.IsMixedValue = false;
+                ev.IntValue = capEntry.Item.IntValue;
+                self.RaisePropertyCommitted(ev);
+            };
+            entry.Scrubber = scrub;
+            entry.EditorRoot = scrub;
+        } else if (tk == "float_range" || tk == "int_range") {
+            var rangeGrid = new Grid();
+            rangeGrid.SetColumnDefinitions("*,72");
+            rangeGrid.ColumnSpacing = 6.0f;
+
+            var slider = new Slider();
+            slider.VerticalAlignment = VerticalAlignment.Center;
+            slider.IsSnapToTickEnabled = (tk == "int_range");
+            UIElement.SetGridColumn(slider, 0);
+            rangeGrid.AddChild(slider);
+
+            var scrub = new NumericScrubber();
+            scrub.Label = tk == "int_range" ? "#" : "R";
+            scrub.Decimals = tk == "int_range" ? 0 : 2;
+            UIElement.SetGridColumn(scrub, 1);
+            rangeGrid.AddChild(scrub);
+
+            slider.ValueChanged += (object s, RoutedPropertyChangedEventArgs<float> ev) => {
+                if (capEntry.Syncing || capEntry.Item.IsReadOnly) { return; }
+                float nv = tk == "int_range" ? (float)EditorMath.RoundToInt(ev.NewValue) : ev.NewValue;
+                capEntry.Syncing = true;
+                scrub.IsMixed = false;
+                scrub.Value = nv;
+                capEntry.Syncing = false;
+                float oldV = capEntry.Item.FloatX;
+                capEntry.Item.FloatX = nv;
+                capEntry.Item.IntValue = EditorMath.RoundToInt(nv);
+                capEntry.Item.IsMixedValue = false;
+                var outEv = new ValueEditLifecycleEventArgs(capEntry.Item.PropertyPath, oldV, nv, EditLifecyclePhase.Change, self);
+                outEv.IntValue = capEntry.Item.IntValue;
+                self.RaisePropertyEdited(outEv);
+            };
+            slider.MouseLeftButtonUp += (object s, MouseButtonEventArgs ev) => {
+                if (capEntry.Syncing || capEntry.Item.IsReadOnly) { return; }
+                float nv = capEntry.Item.FloatX;
+                var outEv = new ValueEditLifecycleEventArgs(capEntry.Item.PropertyPath, nv, nv, EditLifecyclePhase.Commit, self);
+                outEv.IntValue = capEntry.Item.IntValue;
+                self.RaisePropertyCommitted(outEv);
+            };
+            scrub.ValueChanged += (object s, ValueEditLifecycleEventArgs ev) => {
+                if (capEntry.Syncing) { return; }
+                capEntry.Syncing = true;
+                slider.Value = Math.Clampf(ev.NewValue, slider.Minimum, slider.Maximum);
+                capEntry.Syncing = false;
+                capEntry.Item.FloatX = ev.NewValue;
+                capEntry.Item.IntValue = EditorMath.RoundToInt(ev.NewValue);
+                capEntry.Item.IsMixedValue = false;
+                ev.IntValue = capEntry.Item.IntValue;
+                self.RaisePropertyEdited(ev);
+            };
+            scrub.EditCommitted += (object s, ValueEditLifecycleEventArgs ev) => {
+                if (capEntry.Syncing) { return; }
+                capEntry.Syncing = true;
+                slider.Value = Math.Clampf(ev.NewValue, slider.Minimum, slider.Maximum);
+                capEntry.Syncing = false;
+                capEntry.Item.FloatX = ev.NewValue;
+                capEntry.Item.IntValue = EditorMath.RoundToInt(ev.NewValue);
+                capEntry.Item.IsMixedValue = false;
+                ev.IntValue = capEntry.Item.IntValue;
+                self.RaisePropertyCommitted(ev);
+            };
+
+            entry.RangeSlider = slider;
+            entry.RangeScrubber = scrub;
+            entry.EditorRoot = rangeGrid;
+        } else if (tk == "vec2") {
+            var v2 = new Vector2Field();
+            v2.VectorChanged += (object s, EventArgs ev) => {
+                if (capEntry.Syncing) { return; }
+                capEntry.Item.FloatX = v2.X;
+                capEntry.Item.FloatY = v2.Y;
+                capEntry.Item.IsMixedValue = false;
+                var outEv = new ValueEditLifecycleEventArgs(capEntry.Item.PropertyPath, 0.0f, v2.X, EditLifecyclePhase.Change, self);
+                outEv.ValueY = v2.Y;
+                outEv.NewText = PropertyGrid.FormatCompactFloat(v2.X) + "," + PropertyGrid.FormatCompactFloat(v2.Y);
+                self.RaisePropertyEdited(outEv);
+            };
+            v2.EditCommitted += (object s, EventArgs ev) => {
+                if (capEntry.Syncing) { return; }
+                capEntry.Item.FloatX = v2.X;
+                capEntry.Item.FloatY = v2.Y;
+                capEntry.Item.IsMixedValue = false;
+                var outEv = new ValueEditLifecycleEventArgs(capEntry.Item.PropertyPath, 0.0f, v2.X, EditLifecyclePhase.Commit, self);
+                outEv.ValueY = v2.Y;
+                outEv.NewText = PropertyGrid.FormatCompactFloat(v2.X) + "," + PropertyGrid.FormatCompactFloat(v2.Y);
+                self.RaisePropertyCommitted(outEv);
+            };
+            entry.Vec2 = v2;
+            entry.EditorRoot = v2;
+        } else if (tk == "vec3") {
+            var v3 = new Vector3Field();
+            v3.VectorChanged += (object s, EventArgs ev) => {
+                if (capEntry.Syncing) { return; }
+                capEntry.Item.FloatX = v3.X;
+                capEntry.Item.FloatY = v3.Y;
+                capEntry.Item.FloatZ = v3.Z;
+                capEntry.Item.IsMixedValue = false;
+                var outEv = new ValueEditLifecycleEventArgs(capEntry.Item.PropertyPath, 0.0f, v3.X, EditLifecyclePhase.Change, self);
+                outEv.ValueY = v3.Y;
+                outEv.ValueZ = v3.Z;
+                outEv.NewText = PropertyGrid.FormatCompactFloat(v3.X) + "," + PropertyGrid.FormatCompactFloat(v3.Y) + "," + PropertyGrid.FormatCompactFloat(v3.Z);
+                self.RaisePropertyEdited(outEv);
+            };
+            v3.EditCommitted += (object s, EventArgs ev) => {
+                if (capEntry.Syncing) { return; }
+                capEntry.Item.FloatX = v3.X;
+                capEntry.Item.FloatY = v3.Y;
+                capEntry.Item.FloatZ = v3.Z;
+                capEntry.Item.IsMixedValue = false;
+                var outEv = new ValueEditLifecycleEventArgs(capEntry.Item.PropertyPath, 0.0f, v3.X, EditLifecyclePhase.Commit, self);
+                outEv.ValueY = v3.Y;
+                outEv.ValueZ = v3.Z;
+                outEv.NewText = PropertyGrid.FormatCompactFloat(v3.X) + "," + PropertyGrid.FormatCompactFloat(v3.Y) + "," + PropertyGrid.FormatCompactFloat(v3.Z);
+                self.RaisePropertyCommitted(outEv);
+            };
+            entry.Vec3 = v3;
+            entry.EditorRoot = v3;
+        } else if (tk == "color") {
+            var cp = new ColorPicker();
+            cp.ColorChanged += (object s, ValueEditLifecycleEventArgs ev) => {
+                if (capEntry.Syncing) { return; }
+                capEntry.Item.ColorR = ev.ColorR;
+                capEntry.Item.ColorG = ev.ColorG;
+                capEntry.Item.ColorB = ev.ColorB;
+                capEntry.Item.ColorA = ev.ColorA;
+                capEntry.Item.FloatX = ev.ColorR;
+                capEntry.Item.FloatY = ev.ColorG;
+                capEntry.Item.FloatZ = ev.ColorB;
+                capEntry.Item.FloatW = ev.ColorA;
+                capEntry.Item.StringValue = ev.NewText;
+                capEntry.Item.IsMixedValue = false;
+                self.RaisePropertyEdited(ev);
+            };
+            cp.EditCommitted += (object s, ValueEditLifecycleEventArgs ev) => {
+                if (capEntry.Syncing) { return; }
+                capEntry.Item.ColorR = ev.ColorR;
+                capEntry.Item.ColorG = ev.ColorG;
+                capEntry.Item.ColorB = ev.ColorB;
+                capEntry.Item.ColorA = ev.ColorA;
+                capEntry.Item.FloatX = ev.ColorR;
+                capEntry.Item.FloatY = ev.ColorG;
+                capEntry.Item.FloatZ = ev.ColorB;
+                capEntry.Item.FloatW = ev.ColorA;
+                capEntry.Item.StringValue = ev.NewText;
+                capEntry.Item.IsMixedValue = false;
+                self.RaisePropertyCommitted(ev);
+            };
+            entry.ColorEd = cp;
+            entry.EditorRoot = cp;
+        } else if (tk == "enum") {
+            var combo = new ComboBox();
+            combo.Height = 26.0f;
+            combo.SelectionChanged += (object s, SelectionChangedEventArgs ev) => {
+                if (capEntry.Syncing || capEntry.Item.IsReadOnly) { return; }
+                int idx = combo.SelectedIndex;
+                if (idx < 0 || idx >= capEntry.EnumNames.Length) { return; }
+                string optName = capEntry.EnumNames[idx];
+                int optVal = capEntry.EnumValues[idx];
+                float oldV = capEntry.Item.FloatX;
+                string oldTxt = capEntry.Item.StringValue;
+                capEntry.Item.IntValue = optVal;
+                capEntry.Item.FloatX = (float)optVal;
+                capEntry.Item.StringValue = optName;
+                capEntry.Item.IsMixedValue = false;
+                var outEv = new ValueEditLifecycleEventArgs(capEntry.Item.PropertyPath, oldV, (float)optVal, EditLifecyclePhase.Commit, self);
+                outEv.IntValue = optVal;
+                outEv.OldText = oldTxt;
+                outEv.NewText = optName;
+                self.RaisePropertyEdited(outEv);
+                self.RaisePropertyCommitted(outEv);
+            };
+            entry.Combo = combo;
+            entry.EditorRoot = combo;
+        } else if (tk == "asset") {
+            var assetGrid = new Grid();
+            assetGrid.SetColumnDefinitions("*,Auto,Auto");
+            assetGrid.ColumnSpacing = 4.0f;
+
+            var tb = new TextBox();
+            tb.Height = 26.0f;
+            tb.FontSize = 11.0f;
+            UIElement.SetGridColumn(tb, 0);
+            assetGrid.AddChild(tb);
+
+            var pickBtn = new Button();
+            var pickTxt = new TextBlock();
+            pickTxt.Text = "Pick";
+            pickTxt.FontSize = 11.0f;
+            pickBtn.Content = pickTxt;
+            pickBtn.Width = 40.0f;
+            pickBtn.Height = 24.0f;
+            pickBtn.Padding = new Thickness(2.0f, 0.0f, 2.0f, 0.0f);
+            UIElement.SetGridColumn(pickBtn, 1);
+            assetGrid.AddChild(pickBtn);
+
+            var clrBtn = new Button();
+            var clrTxt = new TextBlock();
+            clrTxt.Text = "×";
+            clrTxt.FontSize = 11.0f;
+            clrBtn.Content = clrTxt;
+            clrBtn.Width = 24.0f;
+            clrBtn.Height = 24.0f;
+            clrBtn.Padding = new Thickness(0.0f);
+            UIElement.SetGridColumn(clrBtn, 2);
+            assetGrid.AddChild(clrBtn);
+
+            tb.KeyDown += (object s, KeyEventArgs ke) => {
+                if (ke.Key == KeyCode.Enter && !capEntry.Syncing && !capEntry.Item.IsReadOnly) {
+                    string oldTxt = capEntry.Item.StringValue;
+                    capEntry.Item.StringValue = tb.Text == null ? "" : tb.Text;
+                    capEntry.Item.IsMixedValue = false;
+                    var outEv = new ValueEditLifecycleEventArgs(capEntry.Item.PropertyPath, 0.0f, 0.0f, EditLifecyclePhase.Commit, self);
+                    outEv.OldText = oldTxt;
+                    outEv.NewText = capEntry.Item.StringValue;
+                    self.RaisePropertyEdited(outEv);
+                    self.RaisePropertyCommitted(outEv);
+                    ke.Handled = true;
+                }
+            };
+            tb.LostFocus += (object s, RoutedEventArgs re) => {
+                if (capEntry.Syncing || capEntry.Item.IsReadOnly) { return; }
+                string nxt = tb.Text == null ? "" : tb.Text;
+                if (nxt != capEntry.Item.StringValue && !(capEntry.Item.IsMixedValue && nxt.Length == 0)) {
+                    string oldTxt = capEntry.Item.StringValue;
+                    capEntry.Item.StringValue = nxt;
+                    capEntry.Item.IsMixedValue = false;
+                    var outEv = new ValueEditLifecycleEventArgs(capEntry.Item.PropertyPath, 0.0f, 0.0f, EditLifecyclePhase.Commit, self);
+                    outEv.OldText = oldTxt;
+                    outEv.NewText = nxt;
+                    self.RaisePropertyEdited(outEv);
+                    self.RaisePropertyCommitted(outEv);
+                }
+            };
+            pickBtn.Click += (object s, RoutedEventArgs ev) => {
+                if (capEntry.Item.IsReadOnly) { return; }
+                self.RaiseAssetAction(new PropertyAssetActionEventArgs(
+                    capEntry.Item.PropertyPath, "Pick", capEntry.Item.AssetFilter, capEntry.Item.StringValue, self));
+            };
+            clrBtn.Click += (object s, RoutedEventArgs ev) => {
+                if (capEntry.Item.IsReadOnly) { return; }
+                string oldTxt = capEntry.Item.StringValue;
+                capEntry.Syncing = true;
+                tb.Text = "";
+                capEntry.Syncing = false;
+                capEntry.Item.StringValue = "";
+                capEntry.Item.IsMixedValue = false;
+                self.RaiseAssetAction(new PropertyAssetActionEventArgs(
+                    capEntry.Item.PropertyPath, "Clear", capEntry.Item.AssetFilter, "", self));
+                var outEv = new ValueEditLifecycleEventArgs(capEntry.Item.PropertyPath, 0.0f, 0.0f, EditLifecyclePhase.Commit, self);
+                outEv.OldText = oldTxt;
+                outEv.NewText = "";
+                self.RaisePropertyEdited(outEv);
+                self.RaisePropertyCommitted(outEv);
+            };
+
+            entry.AssetText = tb;
+            entry.EditorRoot = assetGrid;
+        } else if (tk == "layermask") {
+            var wrap = new WrapPanel();
+            wrap.Orientation = Orientation.Horizontal;
+            entry.LayerWrap = wrap;
+            entry.EditorRoot = wrap;
+        } else if (tk == "custom_host") {
+            var hostBorder = new Border();
+            hostBorder.MinHeight = 26.0f;
+            hostBorder.Background = new SolidColorBrush("#FF0B1120");
+            hostBorder.BorderBrush = new SolidColorBrush("#FF1E293B");
+            hostBorder.BorderThickness = new Thickness(1.0f);
+            hostBorder.CornerRadius = new CornerRadius(3.0f);
+            hostBorder.Padding = new Thickness(4.0f, 2.0f, 4.0f, 2.0f);
+            entry.CustomHostBox = hostBorder;
+            entry.EditorRoot = hostBorder;
+        } else if (tk == "bool") {
+            var cb = new CheckBox();
+            cb.Click += (object s, RoutedEventArgs ev) => {
+                if (capEntry.Syncing || capEntry.Item.IsReadOnly) { return; }
+                capEntry.Item.BoolValue = cb.IsChecked;
+                capEntry.Item.IsMixedValue = false;
+                var outEv = new ValueEditLifecycleEventArgs(
+                    capEntry.Item.PropertyPath,
+                    capEntry.Item.BoolValue ? 0.0f : 1.0f,
+                    capEntry.Item.BoolValue ? 1.0f : 0.0f,
+                    EditLifecyclePhase.Commit,
+                    self);
+                self.RaisePropertyEdited(outEv);
+                self.RaisePropertyCommitted(outEv);
+            };
+            entry.Check = cb;
+            entry.EditorRoot = cb;
+        } else {
+            var tb = new TextBox();
+            tb.Height = 26.0f;
+            tb.FontSize = 12.0f;
+            tb.TextChanged += (object s, TextChangedEventArgs ev) => {
+                if (capEntry.Syncing) { return; }
+                string oldTxt = capEntry.Item.StringValue;
+                capEntry.Item.StringValue = tb.Text;
+                capEntry.Item.IsMixedValue = false;
+                var outEv = new ValueEditLifecycleEventArgs(capEntry.Item.PropertyPath, 0.0f, 0.0f, EditLifecyclePhase.Commit, self);
+                outEv.OldText = oldTxt;
+                outEv.NewText = capEntry.Item.StringValue;
+                self.RaisePropertyEdited(outEv);
+                self.RaisePropertyCommitted(outEv);
+            };
+            entry.TextEd = tb;
+            entry.EditorRoot = tb;
+        }
+
+        if (entry.EditorRoot != null) {
+            UIElement.SetGridColumn(entry.EditorRoot, 1);
+            entry.RowGrid.AddChild(entry.EditorRoot);
+        }
+
+        entry.RevertButton = new Button();
+        var revTxt = new TextBlock();
+        revTxt.Text = "R";
+        revTxt.FontSize = 10.0f;
+        entry.RevertButton.Content = revTxt;
+        entry.RevertButton.Width = 22.0f;
+        entry.RevertButton.Height = 22.0f;
+        entry.RevertButton.Padding = new Thickness(0.0f);
+        entry.RevertButton.Click += (object s, RoutedEventArgs ev) => {
+            self.RaisePropertyRevert(new ValueEditLifecycleEventArgs(capEntry.Item.PropertyPath, 0.0f, 0.0f, EditLifecyclePhase.Cancel, self));
+        };
+        UIElement.SetGridColumn(entry.RevertButton, 2);
+        entry.RowGrid.AddChild(entry.RevertButton);
+
+        return entry;
+    }
+
+    private void RebuildLayerMaskChildren(PropertyGridRowEntry entry, InspectorPropertyItem item) {
+        if (entry.LayerWrap == null) { return; }
+        int count = 8;
+        if (item.EnumOptions != null && item.EnumOptions.Length > 0) {
+            count = EditorMath.Clampi(item.EnumOptions.Length, 1, 16);
+        }
+        string sig = EditorMath.IntToStr(count) + ":";
+        for (int i = 0; i < count; i += 1) {
+            string lbl = (item.EnumOptions != null && i < item.EnumOptions.Length && item.EnumOptions[i] != null && item.EnumOptions[i].Length > 0)
+                ? item.EnumOptions[i]
+                : EditorMath.IntToStr(i);
+            sig = sig + lbl + "\n";
+        }
+        if (entry.CachedLayerSig == sig && entry.LayerButtons.Length == count) { return; }
+        entry.CachedLayerSig = sig;
+        entry.LayerWrap.ClearChildren();
+        entry.LayerButtons = new Button[count];
+
+        PropertyGrid self = this;
+        PropertyGridRowEntry capEntry = entry;
+        for (int i = 0; i < count; i += 1) {
+            int bitIdx = i;
+            string lbl = (item.EnumOptions != null && i < item.EnumOptions.Length && item.EnumOptions[i] != null && item.EnumOptions[i].Length > 0)
+                ? item.EnumOptions[i]
+                : EditorMath.IntToStr(i);
+            var b = new Button();
+            var bt = new TextBlock();
+            bt.Text = lbl;
+            bt.FontSize = 10.0f;
+            bt.Foreground = new SolidColorBrush("#FFF8FAFC");
+            b.Content = bt;
+            b.MinWidth = 22.0f;
+            b.Height = 20.0f;
+            b.Padding = new Thickness(4.0f, 0.0f, 4.0f, 0.0f);
+            b.Margin = new Thickness(0.0f, 0.0f, 2.0f, 2.0f);
+            b.Click += (object s, RoutedEventArgs ev) => {
+                if (capEntry.Syncing || capEntry.Item.IsReadOnly) { return; }
+                int curMask = capEntry.Item.IntValue != 0 ? capEntry.Item.IntValue : EditorMath.RoundToInt(capEntry.Item.FloatX);
+                int nextMask = PropertyGrid.ToggleMaskBit(curMask, bitIdx);
+                capEntry.Item.IntValue = nextMask;
+                capEntry.Item.FloatX = (float)nextMask;
+                capEntry.Item.IsMixedValue = false;
+                self.RefreshLayerMaskButtons(capEntry, nextMask, false);
+                var outEv = new ValueEditLifecycleEventArgs(capEntry.Item.PropertyPath, (float)curMask, (float)nextMask, EditLifecyclePhase.Commit, self);
+                outEv.IntValue = nextMask;
+                outEv.NewText = EditorMath.IntToStr(nextMask);
+                self.RaisePropertyEdited(outEv);
+                self.RaisePropertyCommitted(outEv);
+            };
+            entry.LayerButtons[i] = b;
+            entry.LayerWrap.AddChild(b);
+        }
+        entry.LayerSummary = new TextBlock();
+        entry.LayerSummary.FontSize = 11.0f;
+        entry.LayerSummary.Foreground = new SolidColorBrush("#FF94A3B8");
+        entry.LayerSummary.VerticalAlignment = VerticalAlignment.Center;
+        entry.LayerSummary.Margin = new Thickness(4.0f, 0.0f, 0.0f, 0.0f);
+        entry.LayerWrap.AddChild(entry.LayerSummary);
+    }
+
+    private void UpdateRowFromItem(PropertyGridRowEntry entry, InspectorPropertyItem next) {
+        if (entry == null || next == null) { return; }
+        entry.Item = next;
+
+        if (entry.HeaderBorder != null && entry.HeaderLabel != null) {
+            if (next.HeaderText != null && next.HeaderText.Length > 0) {
+                entry.HeaderLabel.Text = next.HeaderText;
+                entry.HeaderBorder.Visibility = Visibility.Visible;
+            } else {
+                entry.HeaderBorder.Visibility = Visibility.Collapsed;
+            }
+        }
+
+        if (entry.RowRoot != null) {
+            entry.RowRoot.BorderBrush = new SolidColorBrush(next.IsOverridden ? "#FF38BDF8" : "#00000000");
+        }
+        if (entry.NameLabel != null) {
+            entry.NameLabel.Text = next.IsMixedValue ? (next.DisplayName + " (—)") : next.DisplayName;
+            entry.NameLabel.FontWeight = next.IsOverridden ? "Bold" : "Normal";
+            entry.NameLabel.Foreground = new SolidColorBrush(next.IsOverridden ? "#FFF8FAFC" : "#FFCBD5E1");
+        }
+        if (entry.RevertButton != null) {
+            entry.RevertButton.Visibility = next.IsOverridden ? Visibility.Visible : Visibility.Collapsed;
+        }
+
+        // Focus protection: never overwrite text/value/selection of an actively focused editor!
+        if (entry.HasActiveFocus()) {
+            return;
+        }
+
+        entry.Syncing = true;
+        string tk = entry.TypeKind;
+        if (tk == "float" || tk == "int") {
+            NumericScrubber sc = entry.Scrubber;
+            if (sc != null) {
+                sc.Minimum = next.MinValue;
+                sc.Maximum = next.MaxValue;
+                sc.Step = tk == "int" ? 1.0f : next.Step;
+                sc.IsReadOnly = next.IsReadOnly;
+                sc.PropertyPath = next.PropertyPath;
+                float val = (tk == "int" && next.IntValue != 0 && next.FloatX == 0.0f) ? (float)next.IntValue : next.FloatX;
+                sc.Value = val;
+                sc.IsMixed = next.IsMixedValue;
+            }
+        } else if (tk == "float_range" || tk == "int_range") {
+            float mn = next.MinValue;
+            float mx = next.MaxValue;
+            if (mn <= -999999.0f && mx >= 999999.0f) {
+                mn = 0.0f;
+                mx = tk == "int_range" ? 100.0f : 1.0f;
+            }
+            float val = (tk == "int_range" && next.IntValue != 0 && next.FloatX == 0.0f) ? (float)next.IntValue : next.FloatX;
+            if (entry.RangeSlider != null) {
+                entry.RangeSlider.Minimum = mn;
+                entry.RangeSlider.Maximum = mx;
+                entry.RangeSlider.SmallChange = tk == "int_range" ? 1.0f : next.Step;
+                entry.RangeSlider.TickFrequency = tk == "int_range" ? 1.0f : next.Step;
+                entry.RangeSlider.IsEnabled = !next.IsReadOnly;
+                entry.RangeSlider.Value = Math.Clampf(val, mn, mx);
+            }
+            if (entry.RangeScrubber != null) {
+                entry.RangeScrubber.Minimum = mn;
+                entry.RangeScrubber.Maximum = mx;
+                entry.RangeScrubber.Step = tk == "int_range" ? 1.0f : next.Step;
+                entry.RangeScrubber.IsReadOnly = next.IsReadOnly;
+                entry.RangeScrubber.PropertyPath = next.PropertyPath;
+                entry.RangeScrubber.Value = val;
+                entry.RangeScrubber.IsMixed = next.IsMixedValue;
+            }
+        } else if (tk == "vec2") {
+            if (entry.Vec2 != null) {
+                entry.Vec2.Step = next.Step;
+                entry.Vec2.IsReadOnly = next.IsReadOnly;
+                entry.Vec2.X = next.FloatX;
+                entry.Vec2.Y = next.FloatY;
+                entry.Vec2.IsMixed = next.IsMixedValue;
+            }
+        } else if (tk == "vec3") {
+            if (entry.Vec3 != null) {
+                entry.Vec3.Step = next.Step;
+                entry.Vec3.IsReadOnly = next.IsReadOnly;
+                entry.Vec3.X = next.FloatX;
+                entry.Vec3.Y = next.FloatY;
+                entry.Vec3.Z = next.FloatZ;
+                entry.Vec3.IsMixed = next.IsMixedValue;
+            }
+        } else if (tk == "color") {
+            SyncColorPickerFromItem(entry.ColorEd, next);
+        } else if (tk == "enum") {
+            ComboBox cb = entry.Combo;
+            if (cb != null) {
+                string nextSig = "";
+                if (next.EnumOptions != null) {
+                    for (int i = 0; i < next.EnumOptions.Length; i += 1) {
+                        nextSig = nextSig + (next.EnumOptions[i] == null ? "" : next.EnumOptions[i]) + "\n";
+                    }
+                }
+                if (entry.CachedEnumSig != nextSig) {
+                    ParseEnumOptionsIntoEntry(entry, next.EnumOptions);
+                    cb.ClearItems();
+                    for (int i = 0; i < entry.EnumNames.Length; i += 1) {
+                        cb.AddItem(entry.EnumNames[i]);
+                    }
+                }
+                cb.IsEnabled = !next.IsReadOnly;
+                if (next.IsMixedValue) {
+                    cb.Placeholder = "—";
+                    cb.SelectedIndex = -1;
+                } else {
+                    cb.Placeholder = "";
+                    int targetVal = next.IntValue != 0 ? next.IntValue : EditorMath.RoundToInt(next.FloatX);
+                    int matchIdx = -1;
+                    for (int i = 0; i < entry.EnumValues.Length; i += 1) {
+                        if (next.StringValue != null && next.StringValue.Length > 0 && entry.EnumNames[i] == next.StringValue) {
+                            matchIdx = i;
+                            break;
+                        }
+                        if (entry.EnumValues[i] == targetVal) {
+                            matchIdx = i;
+                            break;
+                        }
+                    }
+                    cb.SelectedIndex = matchIdx;
+                }
+            }
+        } else if (tk == "asset") {
+            if (entry.AssetText != null) {
+                entry.AssetText.IsReadOnly = next.IsReadOnly;
+                entry.AssetText.PlaceholderText = next.IsMixedValue
+                    ? "—"
+                    : (next.AssetFilter != null && next.AssetFilter.Length > 0 ? ("Asset (" + next.AssetFilter + ")") : "None (Asset)");
+                string txt = next.IsMixedValue ? "" : (next.StringValue == null ? "" : next.StringValue);
+                if (entry.AssetText.Text != txt) {
+                    entry.AssetText.Text = txt;
+                }
+            }
+        } else if (tk == "layermask") {
+            RebuildLayerMaskChildren(entry, next);
+            int maskVal = next.IntValue != 0 ? next.IntValue : EditorMath.RoundToInt(next.FloatX);
+            RefreshLayerMaskButtons(entry, maskVal, next.IsMixedValue);
+        } else if (tk == "custom_host") {
+            if (entry.CustomHostBox != null) {
+                string cid = next.CustomHostId == null ? "" : next.CustomHostId;
+                entry.CustomHostBox.Name = "PART_CustomHost_" + cid;
+                if (cid.Length > 0) {
+                    _customHostsById[cid] = entry.CustomHostBox;
+                    if (_customHostContentById.ContainsKey(cid)) {
+                        UIElement customEl = _customHostContentById[cid];
+                        if (entry.CustomHostBox.Child != customEl) {
+                            entry.CustomHostBox.Child = customEl;
+                        }
+                    } else if (entry.CustomHostBox.Child == null) {
+                        var ph = new TextBlock();
+                        ph.Text = cid;
+                        ph.FontSize = 11.0f;
+                        ph.Foreground = new SolidColorBrush("#FF64748B");
+                        entry.CustomHostBox.Child = ph;
+                    }
+                }
+            }
+        } else if (tk == "bool") {
+            if (entry.Check != null) {
+                entry.Check.IsEnabled = !next.IsReadOnly;
+                entry.Check.IsIndeterminate = next.IsMixedValue;
+                if (!next.IsMixedValue) {
+                    entry.Check.IsChecked = next.BoolValue;
+                }
+            }
+        } else {
+            if (entry.TextEd != null) {
+                entry.TextEd.IsReadOnly = next.IsReadOnly;
+                entry.TextEd.PlaceholderText = next.IsMixedValue ? "—" : "";
+                string txt = next.IsMixedValue ? "" : (next.StringValue == null ? "" : next.StringValue);
+                if (entry.TextEd.Text != txt) {
+                    entry.TextEd.Text = txt;
+                }
+            }
+        }
+        entry.Syncing = false;
+    }
+
+    private static bool SameElement(UIElement a, UIElement b) {
+        if (a == null && b == null) { return true; }
+        if (a == null || b == null) { return false; }
+        return a.__nativeHandle == b.__nativeHandle;
+    }
+
+    private static bool ArrayContainsElement(UIElement[] arr, UIElement target) {
+        for (int i = 0; i < arr.Length; i += 1) {
+            if (SameElement(arr[i], target)) { return true; }
+        }
+        return false;
+    }
+
+    private static int FindChildIndexInPanel(StackPanel panel, UIElement target) {
+        UIElement[] ch = panel.Children();
+        for (int i = 0; i < ch.Length; i += 1) {
+            if (SameElement(ch[i], target)) { return i; }
+        }
+        return -1;
+    }
+
+    private static void ReconcilePanelChildren(StackPanel panel, UIElement[] desired) {
+        if (panel == null) { return; }
+        // 1. Remove obsolete children not in desired
+        UIElement[] existing = panel.Children();
+        for (int i = 0; i < existing.Length; i += 1) {
+            if (!ArrayContainsElement(desired, existing[i])) {
+                panel.RemoveChild(existing[i]);
+            }
+        }
+        // 2. Reconcile order without detaching focused elements
+        for (int idx = 0; idx < desired.Length; idx += 1) {
+            UIElement want = desired[idx];
+            if (idx < panel.ChildCount() && SameElement(panel.ChildAt(idx), want)) {
+                continue;
+            }
+            int curPos = FindChildIndexInPanel(panel, want);
+            if (curPos < 0) {
+                panel.InsertChild(idx, want);
+            } else if (!want.IsKeyboardFocusWithin) {
+                panel.RemoveChild(want);
+                panel.InsertChild(idx, want);
+            } else {
+                // Keep focused subtree mounted in place; shift preceding non-focused sibling past it
+                while (idx < panel.ChildCount() && !SameElement(panel.ChildAt(idx), want)) {
+                    UIElement displace = panel.ChildAt(idx);
+                    if (displace.IsKeyboardFocusWithin) { break; }
+                    panel.RemoveChild(displace);
+                    int wantPos = FindChildIndexInPanel(panel, want);
+                    panel.InsertChild(wantPos + 1, displace);
+                }
+            }
+        }
+    }
+
+    private void RecountVisibleRows() {
+        int cnt = 0;
+        for (int i = 0; i < _orderedRowKeys.Length; i += 1) {
+            string rk = _orderedRowKeys[i];
+            if (_rowsByKey.ContainsKey(rk)) {
+                PropertyGridRowEntry re = _rowsByKey[rk];
+                if (_cardsByKey.ContainsKey(re.CardKey) && _cardsByKey[re.CardKey].IsExpanded) {
+                    cnt += 1;
+                }
+            }
+        }
+        _visibleRowCount = cnt;
+    }
+
+    private void ReconcileRows() {
+        if (_rowsPanel == null) { return; }
+
+        var nextCardOrder = new string[0];
+        var cardCategoryByKey = new Dictionary<string, string>();
+        var cardCanRemoveByKey = new Dictionary<string, bool>();
+        var cardRowLists = new Dictionary<string, PropertyGridElementList>();
+        var nextRowsByKey = new Dictionary<string, PropertyGridRowEntry>();
+        var nextRowOrder = new string[0];
+        var dupCount = new Dictionary<string, int>();
 
         for (int i = 0; i < _items.Length; i += 1) {
             InspectorPropertyItem item = _items[i];
             if (!MatchesFilter(item)) { continue; }
 
-            if (item.Category != lastCategory) {
-                lastCategory = item.Category;
-                var catHeader = new Border();
-                catHeader.Background = new SolidColorBrush("#FF1E293B");
-                catHeader.CornerRadius = new CornerRadius(3.0f);
-                catHeader.Padding = new Thickness(8.0f, 4.0f, 8.0f, 4.0f);
-                catHeader.Margin = new Thickness(0.0f, 4.0f, 0.0f, 2.0f);
-                var catLbl = new TextBlock();
-                catLbl.Text = lastCategory;
-                catLbl.FontSize = 11.0f;
-                catLbl.FontWeight = "Bold";
-                catLbl.Foreground = new SolidColorBrush("#FF94A3B8");
-                catHeader.Child = catLbl;
-                _rowsPanel.AddChild(catHeader);
+            string cardKey = ResolveCardKey(item);
+            string cardCat = (item.Category != null && item.Category.Length > 0) ? item.Category : cardKey;
+            if (!cardCategoryByKey.ContainsKey(cardKey)) {
+                cardCategoryByKey[cardKey] = cardCat;
+                cardCanRemoveByKey[cardKey] = item.CanRemoveCard;
+                cardRowLists[cardKey] = new PropertyGridElementList();
+                nextCardOrder.Push(cardKey);
+            } else if (item.CanRemoveCard) {
+                cardCanRemoveByKey[cardKey] = true;
             }
 
-            var rowBorder = new Border();
-            rowBorder.Padding = new Thickness(6.0f, 3.0f, 4.0f, 3.0f);
-            rowBorder.Background = new SolidColorBrush("#FF111827");
-            rowBorder.BorderBrush = new SolidColorBrush(item.IsOverridden ? "#FF38BDF8" : "#00000000");
-            rowBorder.BorderThickness = new Thickness(3.0f, 0.0f, 0.0f, 0.0f);
+            string baseKey = MakeBaseRowKey(item);
+            int seen = dupCount.ContainsKey(baseKey) ? dupCount[baseKey] : 0;
+            dupCount[baseKey] = seen + 1;
+            string rowKey = seen == 0 ? baseKey : (baseKey + "#dup" + EditorMath.IntToStr(seen));
 
-            var rowGrid = new Grid();
-            rowGrid.SetColumnDefinitions("120,*,Auto");
-            rowGrid.ColumnSpacing = 6.0f;
-            rowBorder.Child = rowGrid;
-
-            var nameLbl = new TextBlock();
-            nameLbl.Text = item.IsMixedValue ? (item.DisplayName + " (—)") : item.DisplayName;
-            nameLbl.FontSize = 12.0f;
-            nameLbl.FontWeight = item.IsOverridden ? "Bold" : "Normal";
-            nameLbl.Foreground = new SolidColorBrush(item.IsOverridden ? "#FFF8FAFC" : "#FFCBD5E1");
-            nameLbl.VerticalAlignment = VerticalAlignment.Center;
-            UIElement.SetGridColumn(nameLbl, 0);
-            rowGrid.AddChild(nameLbl);
-
-            InspectorPropertyItem captured = item;
-            if (item.TypeKind == "float" || item.TypeKind == "int") {
-                var scrub = new NumericScrubber();
-                scrub.Label = item.TypeKind == "int" ? "#" : "V";
-                scrub.Decimals = item.TypeKind == "int" ? 0 : 2;
-                scrub.Minimum = item.MinValue;
-                scrub.Maximum = item.MaxValue;
-                scrub.Step = item.TypeKind == "int" ? 1.0f : item.Step;
-                scrub.Value = item.FloatX;
-                scrub.IsReadOnly = item.IsReadOnly;
-                scrub.PropertyPath = item.PropertyPath;
-                scrub.ValueChanged += (object s, ValueEditLifecycleEventArgs ev) => {
-                    captured.FloatX = ev.NewValue;
-                    self.RaisePropertyEdited(ev);
-                };
-                scrub.EditCommitted += (object s, ValueEditLifecycleEventArgs ev) => {
-                    captured.FloatX = ev.NewValue;
-                    self.RaisePropertyCommitted(ev);
-                };
-                UIElement.SetGridColumn(scrub, 1);
-                rowGrid.AddChild(scrub);
-            } else if (item.TypeKind == "vec3") {
-                var v3 = new Vector3Field();
-                v3.Step = item.Step;
-                v3.X = item.FloatX;
-                v3.Y = item.FloatY;
-                v3.Z = item.FloatZ;
-                v3.VectorChanged += (object s, EventArgs ev) => {
-                    captured.FloatX = v3.X;
-                    captured.FloatY = v3.Y;
-                    captured.FloatZ = v3.Z;
-                    self.RaisePropertyEdited(new ValueEditLifecycleEventArgs(captured.PropertyPath, 0.0f, v3.X, EditLifecyclePhase.Change, self));
-                };
-                v3.EditCommitted += (object s, EventArgs ev) => {
-                    captured.FloatX = v3.X;
-                    captured.FloatY = v3.Y;
-                    captured.FloatZ = v3.Z;
-                    self.RaisePropertyCommitted(new ValueEditLifecycleEventArgs(captured.PropertyPath, 0.0f, v3.X, EditLifecyclePhase.Commit, self));
-                };
-                UIElement.SetGridColumn(v3, 1);
-                rowGrid.AddChild(v3);
-            } else if (item.TypeKind == "bool") {
-                var cb = new CheckBox();
-                cb.IsChecked = item.BoolValue;
-                cb.Click += (object s, RoutedEventArgs ev) => {
-                    captured.BoolValue = cb.IsChecked;
-                    var outEv = new ValueEditLifecycleEventArgs(captured.PropertyPath, captured.BoolValue ? 0.0f : 1.0f, captured.BoolValue ? 1.0f : 0.0f, EditLifecyclePhase.Commit, self);
-                    self.RaisePropertyEdited(outEv);
-                    self.RaisePropertyCommitted(outEv);
-                };
-                UIElement.SetGridColumn(cb, 1);
-                rowGrid.AddChild(cb);
+            PropertyGridRowEntry entry = null;
+            if (_rowsByKey.ContainsKey(rowKey)) {
+                entry = _rowsByKey[rowKey];
+                entry.CardKey = cardKey;
             } else {
-                var tb = new TextBox();
-                tb.Text = item.StringValue;
-                tb.IsReadOnly = item.IsReadOnly;
-                tb.Height = 26.0f;
-                tb.FontSize = 12.0f;
-                tb.TextChanged += (object s, TextChangedEventArgs ev) => {
-                    string oldTxt = captured.StringValue;
-                    captured.StringValue = tb.Text;
-                    var outEv = new ValueEditLifecycleEventArgs(captured.PropertyPath, 0.0f, 0.0f, EditLifecyclePhase.Commit, self);
-                    outEv.OldText = oldTxt;
-                    outEv.NewText = captured.StringValue;
-                    self.RaisePropertyEdited(outEv);
-                    self.RaisePropertyCommitted(outEv);
-                };
-                UIElement.SetGridColumn(tb, 1);
-                rowGrid.AddChild(tb);
+                entry = CreateRowEntry(rowKey, cardKey, item);
             }
+            UpdateRowFromItem(entry, item);
 
-            if (item.IsOverridden) {
-                var revBtn = new Button();
-                var revTxt = new TextBlock();
-                revTxt.Text = "R";
-                revTxt.FontSize = 10.0f;
-                revBtn.Content = revTxt;
-                revBtn.Width = 22.0f;
-                revBtn.Height = 22.0f;
-                revBtn.Padding = new Thickness(0.0f);
-                revBtn.Click += (object s, RoutedEventArgs ev) => {
-                    self.RaisePropertyRevert(new ValueEditLifecycleEventArgs(captured.PropertyPath, 0.0f, 0.0f, EditLifecyclePhase.Cancel, self));
-                };
-                UIElement.SetGridColumn(revBtn, 2);
-                rowGrid.AddChild(revBtn);
-            }
-
-            _rowsPanel.AddChild(rowBorder);
+            nextRowsByKey[rowKey] = entry;
+            nextRowOrder.Push(rowKey);
+            cardRowLists[cardKey].Items.Push(entry.WrapperPanel);
         }
+
+        // Remove cards no longer visible
+        var nextCardsByKey = new Dictionary<string, PropertyGridCardEntry>();
+        var desiredCardRoots = new UIElement[0];
+        for (int ci = 0; ci < nextCardOrder.Length; ci += 1) {
+            string ck = nextCardOrder[ci];
+            PropertyGridCardEntry card = GetOrCreateCard(ck, cardCategoryByKey[ck]);
+            card.CanRemove = cardCanRemoveByKey[ck];
+            if (card.RemoveBtn != null) {
+                card.RemoveBtn.Visibility = card.CanRemove ? Visibility.Visible : Visibility.Collapsed;
+            }
+            ReconcilePanelChildren(card.BodyPanel, cardRowLists[ck].Items);
+            nextCardsByKey[ck] = card;
+            desiredCardRoots.Push(card.CardRoot);
+        }
+
+        ReconcilePanelChildren(_rowsPanel, desiredCardRoots);
+
+        _rowsByKey = nextRowsByKey;
+        _cardsByKey = nextCardsByKey;
+        _orderedRowKeys = nextRowOrder;
+        RecountVisibleRows();
     }
 }
 

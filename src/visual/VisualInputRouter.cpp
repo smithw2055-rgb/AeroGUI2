@@ -277,6 +277,19 @@ namespace {
     }
 
     if (inside && node->layout.isHitTestVisible) {
+        if (node->kind == VisualKind::Box && node->layout.hitTestBorderOnly) {
+            const Thickness& bt = node->box.borderThickness;
+            const float w = node->layout.layoutRect.width;
+            const float h = node->layout.layoutRect.height;
+            const bool onBorderBand =
+                (bt.left > 0.0f && localPt.x < bt.left) ||
+                (bt.right > 0.0f && localPt.x > w - bt.right) ||
+                (bt.top > 0.0f && localPt.y < bt.top) ||
+                (bt.bottom > 0.0f && localPt.y > h - bt.bottom);
+            if (!onBorderBand) {
+                return VisualNodeId{};
+            }
+        }
         if (node->kind == VisualKind::Image) {
             const VisualImageData& img = node->Image();
             const bool isRiveUri = img.uri.size() >= 7u && img.uri.substr(0u, 7u) == "rive://";

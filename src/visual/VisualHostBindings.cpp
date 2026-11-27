@@ -1319,6 +1319,10 @@ bool RegisterVisualHostBindings(
         (void)world.SetInteractiveFlags(ArgNode(args, 0, world), ArgBool(args, 1, true), ArgBool(args, 2, true), ArgBool(args, 3, false));
         return rs_rt::Value{std::int64_t{0}};
     });
+    ok &= bindFn("Visual_SetHitTestBorderOnly", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
+        (void)world.SetHitTestBorderOnly(ArgNode(args, 0, world), ArgBool(args, 1, false));
+        return rs_rt::Value{std::int64_t{0}};
+    });
     ok &= bindFn("Visual_SetLayoutMode", [&world](const rs_bc::FunctionReference&, rs_rt::ValueSpan args, rs_rt::RuntimeError&) -> std::optional<rs_rt::Value> {
         (void)world.SetLayoutMode(
             ArgNode(args, 0, world),

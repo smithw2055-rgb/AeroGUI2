@@ -664,6 +664,15 @@ bool VisualWorld::SetInteractiveFlags(
     return true;
 }
 
+bool VisualWorld::SetHitTestBorderOnly(
+    VisualNodeId id,
+    bool borderOnly) noexcept {
+    VisualNode* node = GetNode(id);
+    if (!node) return false;
+    node->layout.hitTestBorderOnly = borderOnly;
+    return true;
+}
+
 bool VisualWorld::SetLayoutMode(
     VisualNodeId id,
     LayoutMode mode,

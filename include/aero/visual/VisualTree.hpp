@@ -339,7 +339,8 @@ struct VisualLayoutData {
         , lastMeasureInnerInfH(false)
         , suppressNativePadding(false)
         , suppressNativeBoxVisual(false)
-        , includeBorderInPadding(false) {}
+        , includeBorderInPadding(false)
+        , hitTestBorderOnly(false) {}
 
     float width = std::numeric_limits<float>::quiet_NaN();
     float height = std::numeric_limits<float>::quiet_NaN();
@@ -415,6 +416,7 @@ struct VisualLayoutData {
     bool suppressNativePadding : 1;
     bool suppressNativeBoxVisual : 1;
     bool includeBorderInPadding : 1;
+    bool hitTestBorderOnly : 1;
 };
 
 struct VisualSpatial3DData {
@@ -668,6 +670,7 @@ public:
     bool SetZIndex(VisualNodeId id, std::int32_t zIndex) noexcept;
     bool SetClipToBounds(VisualNodeId id, bool clip) noexcept;
     bool SetInteractiveFlags(VisualNodeId id, bool enabled, bool hitTestVisible, bool focusable) noexcept;
+    bool SetHitTestBorderOnly(VisualNodeId id, bool borderOnly) noexcept;
     bool SetLayoutMode(VisualNodeId id, LayoutMode mode, float p0, float p1, std::int32_t i0, std::int32_t i1) noexcept;
     bool GridClearDefs(VisualNodeId id) noexcept;
     bool GridAddRowDef(VisualNodeId id, GridUnitType unit, float value);
