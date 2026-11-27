@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -27,6 +28,21 @@ struct XmlAttribute final {
     std::string value;
     int line = 1;
     int column = 1;
+    int nameEndLine = 1;
+    int nameEndColumn = 1;
+    int valueStartLine = 1;
+    int valueStartColumn = 1;
+    int valueEndLine = 1;
+    int valueEndColumn = 1;
+    int endLine = 1;
+    int endColumn = 1;
+    std::size_t leadingTriviaOffset = 0u;
+    std::size_t startOffset = 0u;
+    std::size_t nameEndOffset = 0u;
+    std::size_t valueInnerStartOffset = 0u;
+    std::size_t valueInnerEndOffset = 0u;
+    std::size_t endOffset = 0u;
+    char quoteChar = '"';
     bool isXmlns = false;
 };
 
@@ -41,6 +57,11 @@ struct XmlToken final {
     bool isEmptyElement = false;
     int line = 1;
     int column = 1;
+    int endLine = 1;
+    int endColumn = 1;
+    std::size_t startOffset = 0u;
+    std::size_t endOffset = 0u;
+    std::size_t openTagAttrInsertOffset = 0u;
 };
 
 /// Decodes XML predefined entities (`&amp;`, `&lt;`, `&gt;`, `&quot;`, `&apos;`)
@@ -49,8 +70,8 @@ struct XmlToken final {
     std::string_view raw,
     std::string* outError = nullptr);
 
-/// Streaming pull lexer for XML / XAML documents with namespace scope resolution
-/// and 1-based line/column diagnostics.
+/// Streaming pull lexer for XML / XAML documents with namespace scope resolution,
+/// exact UTF-8 byte-offset spans, and 1-based line/column diagnostics.
 class XmlPullLexer final {
 public:
     explicit XmlPullLexer(std::string_view input, bool emitCommentsAndPI = false);
@@ -60,6 +81,7 @@ public:
 
     [[nodiscard]] int CurrentLine() const noexcept { return line_; }
     [[nodiscard]] int CurrentColumn() const noexcept { return column_; }
+    [[nodiscard]] std::size_t CurrentOffset() const noexcept { return pos_; }
     [[nodiscard]] std::string ResolveNamespace(std::string_view prefix) const;
 
 private:
@@ -74,16 +96,16 @@ private:
     char Advance() noexcept;
     void SkipWhitespace() noexcept;
     [[nodiscard]] std::string ReadName();
-    [[nodiscard]] XmlToken MakeError(int line, int col, std::string message);
+    [[nodiscard]] XmlToken MakeError(std::size_t startOffset, int line, int col, std::string message);
 
     XmlToken LexLessThan();
-    XmlToken LexComment(int startLine, int startCol);
-    XmlToken LexCData(int startLine, int startCol);
-    XmlToken LexProcessingInstruction(int startLine, int startCol);
-    XmlToken LexDoctype(int startLine, int startCol);
-    XmlToken LexEndElement(int startLine, int startCol);
-    XmlToken LexStartElement(int startLine, int startCol);
-    XmlToken LexText(int startLine, int startCol);
+    XmlToken LexComment(std::size_t startOffset, int startLine, int startCol);
+    XmlToken LexCData(std::size_t startOffset, int startLine, int startCol);
+    XmlToken LexProcessingInstruction(std::size_t startOffset, int startLine, int startCol);
+    XmlToken LexDoctype(std::size_t startOffset, int startLine, int startCol);
+    XmlToken LexEndElement(std::size_t startOffset, int startLine, int startCol);
+    XmlToken LexStartElement(std::size_t startOffset, int startLine, int startCol);
+    XmlToken LexText(std::size_t startOffset, int startLine, int startCol);
 
     std::string_view input_;
     std::size_t pos_ = 0;

@@ -78,6 +78,7 @@ internal class XamlParsedBinding {
     public string Path = "";
     public string ElementName = "";
     public int Mode = 0;
+    public bool HasExplicitMode = false;
     public string RelativeSourceMode = "";
     public string AncestorType = "";
     public IValueConverter Converter;
@@ -526,6 +527,9 @@ internal static class XamlStr {
             }
             return sec;
         }
+        if (EndsWith(t, "ms") || EndsWith(t, "MS")) {
+            return ParseUtil.ParseFloat(t.Substring(0, t.Length - 2), 0.0f) * 0.001f;
+        }
         if (EndsWith(t, "s") || EndsWith(t, "S")) {
             return ParseUtil.ParseFloat(t.Substring(0, t.Length - 1), 0.0f);
         }
@@ -587,239 +591,40 @@ internal static class XamlStr {
 }
 
 internal static class XamlDomParser {
-    private static int FindTagCloseOutsideQuotes(string chunk) {
-        string quote = "";
-        for (int i = 0; i < chunk.Length; i += 1) {
-            string ch = chunk.Substring(i, 1);
-            if (quote.Length > 0) {
-                if (ch == quote) { quote = ""; }
-            } else {
-                if (ch == "\"" || ch == "'") {
-                    quote = ch;
-                } else if (ch == ">") {
-                    return i;
-                }
-            }
-        }
-        return -1;
-    }
-
-    private static void ParseAttributes(string attrText, XamlXmlNode node) {
-        int i = 0;
-        int len = attrText.Length;
-        while (i < len) {
-            while (i < len && XamlStr.IsSpace(attrText.Substring(i, 1))) { i += 1; }
-            if (i >= len) { break; }
-            int nameStart = i;
-            while (i < len) {
-                string ch = attrText.Substring(i, 1);
-                if (ch == "=" || XamlStr.IsSpace(ch)) { break; }
-                i += 1;
-            }
-            string rawAttr = attrText.Substring(nameStart, i - nameStart).Trim();
-            while (i < len && XamlStr.IsSpace(attrText.Substring(i, 1))) { i += 1; }
-            if (i >= len || attrText.Substring(i, 1) != "=") {
-                if (rawAttr.Length > 0) {
-                    node.Attrs.Push(new XamlXmlAttr(rawAttr, XamlStr.StripPrefix(rawAttr), ""));
-                }
-                continue;
-            }
-            i += 1;
-            while (i < len && XamlStr.IsSpace(attrText.Substring(i, 1))) { i += 1; }
-            if (i >= len) { break; }
-            string q = attrText.Substring(i, 1);
-            string val = "";
-            if (q == "\"" || q == "'") {
-                i += 1;
-                int valStart = i;
-                while (i < len && attrText.Substring(i, 1) != q) { i += 1; }
-                val = XamlStr.DecodeXmlText(attrText.Substring(valStart, i - valStart));
-                if (i < len) { i += 1; }
-            } else {
-                int valStart = i;
-                while (i < len && !XamlStr.IsSpace(attrText.Substring(i, 1))) { i += 1; }
-                val = XamlStr.DecodeXmlText(attrText.Substring(valStart, i - valStart));
-            }
-            if (rawAttr.Length > 0) {
-                node.Attrs.Push(new XamlXmlAttr(rawAttr, XamlStr.StripPrefix(rawAttr), val));
-            }
-        }
-    }
-
-    private static void AppendParentTextSegment(XamlXmlNode parent, string rawSeg) {
-        if (parent == null || rawSeg == null || rawSeg.Length == 0) { return; }
-        string decoded = XamlStr.DecodeXmlText(rawSeg);
-        string tr = decoded.Trim();
-        bool isInlineContainer = (parent.LocalName == "TextBlock" || parent.LocalName == "Span" ||
-            parent.LocalName == "Bold" || parent.LocalName == "Italic" ||
-            parent.LocalName == "Underline" || parent.LocalName == "Hyperlink");
-        if (isInlineContainer) {
-            if (tr.Length == 0) {
-                parent.Children.Push(new XamlXmlNode("#ws", "#ws"));
-            } else {
-                bool hasLead = decoded.Substring(0, 1).Trim().Length == 0;
-                bool hasTrail = decoded.Substring(decoded.Length - 1, 1).Trim().Length == 0;
-                bool prevIsLineBreak = parent.Children.Length > 0 && parent.Children[parent.Children.Length - 1].LocalName == "LineBreak";
-                if (hasLead && parent.Children.Length > 0 && !prevIsLineBreak) {
-                    parent.Children.Push(new XamlXmlNode("#ws", "#ws"));
-                }
-                var txtNode = new XamlXmlNode("#text", "#text");
-                txtNode.Text = tr;
-                parent.Children.Push(txtNode);
-                parent.Text = parent.Text + decoded;
-                if (hasTrail) {
-                    parent.Children.Push(new XamlXmlNode("#ws", "#ws"));
-                }
-            }
-            return;
-        }
-        if (tr.Length > 0) {
-            if (parent.LocalName == "ItemsControl" || parent.LocalName == "ListBox" ||
-                parent.LocalName == "ListView" || parent.LocalName == "ComboBox") {
-                var itemTxt = new XamlXmlNode("#text", "#text");
-                itemTxt.Text = tr;
-                parent.Children.Push(itemTxt);
-            }
-            parent.Text = parent.Text + decoded;
-        }
-    }
-
     public static XamlXmlNode ParseDocument(string xmlText) {
         if (xmlText == null) { return null; }
         int nativeCount = Xml_ParseDocument(xmlText);
-        if (nativeCount >= 0) {
+        if (nativeCount <= 0) {
             if (nativeCount == 0) {
                 Xml_ClearDocument();
-                return null;
             }
-            var nodes = new XamlXmlNode[nativeCount];
-            for (int id = 0; id < nativeCount; id += 1) {
-                int meta = Xml_NodeMeta(id);
-                int parentId = (meta % 262144) - 1;
-                int attrCount = (meta / 262144) % 1024;
-                bool hasText = ((meta / 268435456) % 2) != 0;
-                bool hasPrefix = ((meta / 536870912) % 2) != 0;
-                string raw = Xml_NodeRawName(id);
-                string local = hasPrefix ? Xml_NodeLocalName(id) : raw;
-                var n = new XamlXmlNode(raw, local);
-                if (hasText) {
-                    n.Text = Xml_NodeText(id);
-                }
-                for (int a = 0; a < attrCount; a += 1) {
-                    string aName = Xml_AttrName(id, a);
-                    string aLocal = aName.Contains(":") ? XamlStr.StripPrefix(aName) : aName;
-                    n.Attrs.Push(new XamlXmlAttr(aName, aLocal, Xml_AttrValue(id, a)));
-                }
-                nodes[id] = n;
-                if (parentId >= 0 && parentId < id) {
-                    nodes[parentId].Children.Push(n);
-                }
-            }
-            Xml_ClearDocument();
-            return nodes[0];
+            return null;
         }
-        string src = xmlText.Trim();
-        if (src.Length == 0) { return null; }
-        int firstLt = XamlStr.FindFrom(src, "<", 0);
-        if (firstLt < 0) { return null; }
-        if (firstLt > 0) { src = src.Substring(firstLt); }
-
-        string[] chunks = src.Split("<");
-        var stack = new XamlXmlNode[0];
-        XamlXmlNode root = null;
-
-        int cIdx = 0;
-        while (cIdx < chunks.Length) {
-            string chunk = chunks[cIdx];
-            cIdx += 1;
-            if (chunk == null || chunk.Length == 0) { continue; }
-
-            if (XamlStr.StartsWith(chunk, "!--")) {
-                string cur = chunk;
-                while (!cur.Contains("-->") && cIdx < chunks.Length) {
-                    cur = cur + "<" + chunks[cIdx];
-                    cIdx += 1;
-                }
-                int endCom = XamlStr.FindFrom(cur, "-->", 3);
-                if (endCom >= 0 && endCom + 3 < cur.Length && stack.Length > 0) {
-                    AppendParentTextSegment(stack[stack.Length - 1], cur.Substring(endCom + 3));
-                }
-                continue;
+        var nodes = new XamlXmlNode[nativeCount];
+        for (int id = 0; id < nativeCount; id += 1) {
+            int meta = Xml_NodeMeta(id);
+            int parentId = (meta % 262144) - 1;
+            int attrCount = (meta / 262144) % 1024;
+            bool hasText = ((meta / 268435456) % 2) != 0;
+            bool hasPrefix = ((meta / 536870912) % 2) != 0;
+            string raw = Xml_NodeRawName(id);
+            string local = hasPrefix ? Xml_NodeLocalName(id) : raw;
+            var n = new XamlXmlNode(raw, local);
+            if (hasText) {
+                n.Text = Xml_NodeText(id);
             }
-
-            if (XamlStr.StartsWith(chunk, "![CDATA[")) {
-                string cur = chunk;
-                while (!cur.Contains("]]>") && cIdx < chunks.Length) {
-                    cur = cur + "<" + chunks[cIdx];
-                    cIdx += 1;
-                }
-                int endCd = XamlStr.FindFrom(cur, "]]>", 8);
-                if (endCd >= 0 && stack.Length > 0) {
-                    XamlXmlNode parent = stack[stack.Length - 1];
-                    parent.Text = parent.Text + cur.Substring(8, endCd - 8);
-                    if (endCd + 3 < cur.Length) {
-                        AppendParentTextSegment(parent, cur.Substring(endCd + 3));
-                    }
-                }
-                continue;
+            for (int a = 0; a < attrCount; a += 1) {
+                string aName = Xml_AttrName(id, a);
+                string aLocal = aName.Contains(":") ? XamlStr.StripPrefix(aName) : aName;
+                n.Attrs.Push(new XamlXmlAttr(aName, aLocal, Xml_AttrValue(id, a)));
             }
-
-            if (XamlStr.StartsWith(chunk, "?") || XamlStr.StartsWith(chunk, "!")) {
-                continue;
-            }
-
-            int gt = FindTagCloseOutsideQuotes(chunk);
-            if (gt < 0) { continue; }
-            string tagHeader = chunk.Substring(0, gt).Trim();
-            string after = gt + 1 < chunk.Length ? chunk.Substring(gt + 1) : "";
-
-            if (XamlStr.StartsWith(tagHeader, "/")) {
-                string closeName = tagHeader.Substring(1).Trim();
-                while (stack.Length > 0) {
-                    XamlXmlNode popped = stack[stack.Length - 1];
-                    stack.RemoveAt(stack.Length - 1);
-                    if (popped.RawName == closeName || popped.LocalName == XamlStr.StripPrefix(closeName)) {
-                        break;
-                    }
-                }
-                if (stack.Length > 0 && after.Length > 0) {
-                    AppendParentTextSegment(stack[stack.Length - 1], after);
-                }
-                continue;
-            }
-
-            bool selfClosing = XamlStr.EndsWith(tagHeader, "/");
-            if (selfClosing) {
-                tagHeader = tagHeader.Substring(0, tagHeader.Length - 1).Trim();
-            }
-
-            int nameEnd = 0;
-            while (nameEnd < tagHeader.Length && !XamlStr.IsSpace(tagHeader.Substring(nameEnd, 1))) {
-                nameEnd += 1;
-            }
-            string rawName = tagHeader.Substring(0, nameEnd);
-            string attrRest = nameEnd < tagHeader.Length ? tagHeader.Substring(nameEnd) : "";
-
-            var node = new XamlXmlNode(rawName, XamlStr.StripPrefix(rawName));
-            if (attrRest.Length > 0) {
-                ParseAttributes(attrRest, node);
-            }
-
-            if (root == null) { root = node; }
-            if (stack.Length > 0) {
-                stack[stack.Length - 1].Children.Push(node);
-            }
-
-            if (!selfClosing) {
-                if (after.Length > 0) {
-                    AppendParentTextSegment(node, after);
-                }
-                stack.Push(node);
-            } else if (stack.Length > 0 && after.Length > 0) {
-                AppendParentTextSegment(stack[stack.Length - 1], after);
+            nodes[id] = n;
+            if (parentId >= 0 && parentId < id) {
+                nodes[parentId].Children.Push(n);
             }
         }
-        return root;
+        Xml_ClearDocument();
+        return nodes[0];
     }
 }
 
@@ -1139,6 +944,7 @@ public static class XamlReader {
             } else if (k == "ElementName") {
                 b.ElementName = v;
             } else if (k == "Mode") {
+                b.HasExplicitMode = true;
                 if (v == "TwoWay") { b.Mode = 1; }
                 else if (v == "OneTime") { b.Mode = 2; }
                 else if (v == "OneWayToSource") { b.Mode = 3; }
@@ -1250,6 +1056,18 @@ public static class XamlReader {
         return b;
     }
 
+    private static int InferDefaultBindingMode(UIElement target, string targetProp) {
+        if (target == null || targetProp == null) { return 0; }
+        if (target is TextBox && targetProp == "Text") { return 1; }
+        if (target is Slider && targetProp == "Value") { return 1; }
+        if (target is ToggleButton && targetProp == "IsChecked") { return 1; }
+        if (target is Selector &&
+            (targetProp == "SelectedItem" || targetProp == "SelectedIndex" || targetProp == "SelectedValue")) {
+            return 1;
+        }
+        return 0;
+    }
+
     private static void BindElementFromSpec(UIElement target, string targetProp, XamlParsedBinding pb, XamlBuildContext ctx) {
         if (target == null || targetProp.Length == 0 || pb == null) { return; }
         if (!pb.CachedPrepReady) {
@@ -1266,26 +1084,30 @@ public static class XamlReader {
             pb.CachedTargetProp = targetProp;
             pb.CachedTargetPropId = tPropId;
         }
+        int effMode = pb.Mode;
+        if (!pb.HasExplicitMode && pb.RelativeSourceMode != "TemplatedParent") {
+            effMode = InferDefaultBindingMode(target, targetProp);
+        }
         if (pb.RelativeSourceMode == "TemplatedParent") {
             UIElement tp = ctx != null ? ctx.TemplatedParent : target.TemplatedParent;
             BindingEngine.BindTemplateParentPrepared(
                 target, tPropId, targetProp, tp as Control,
                 pb.CachedSrcPropId, pb.Path, pb.CachedSegs, pb.CachedSingleHop,
                 pb.Converter, pb.ConverterKey, pb.ConverterParameter, pb.StringFormat,
-                pb.HasFallback, pb.FallbackBox, pb.HasTargetNull, pb.TargetNullBox, pb.Mode);
+                pb.HasFallback, pb.FallbackBox, pb.HasTargetNull, pb.TargetNullBox, effMode);
             return;
         }
         if (pb.ElementName.Length > 0) {
             BindingEngine.BindElementPrepared(
                 target, tPropId, targetProp, pb.ElementName,
-                pb.CachedSrcPropId, pb.Path, pb.CachedSegs, pb.CachedSingleHop, pb.Mode,
+                pb.CachedSrcPropId, pb.Path, pb.CachedSegs, pb.CachedSingleHop, effMode,
                 pb.Converter, pb.ConverterKey, pb.ConverterParameter, pb.StringFormat,
                 pb.HasFallback, pb.FallbackBox, pb.HasTargetNull, pb.TargetNullBox);
             return;
         }
         BindingEngine.BindPathPrepared(
             target, tPropId, targetProp, pb.ExplicitSourceBox,
-            pb.CachedSrcPropId, pb.Path, pb.CachedSegs, pb.CachedSingleHop, pb.Mode,
+            pb.CachedSrcPropId, pb.Path, pb.CachedSegs, pb.CachedSingleHop, effMode,
             pb.Converter, pb.ConverterKey, pb.ConverterParameter, pb.StringFormat,
             pb.HasFallback, pb.FallbackBox, pb.HasTargetNull, pb.TargetNullBox,
             pb.RelativeSourceMode, pb.AncestorType);
@@ -2724,6 +2546,7 @@ public static class XamlReader {
         string elName = bNode.GetAttr("ElementName");
         if (elName != null) { pb.ElementName = elName; }
         string modeAttr = bNode.GetAttr("Mode");
+        if (modeAttr != null && modeAttr.Length > 0) { pb.HasExplicitMode = true; }
         if (modeAttr == "TwoWay") { pb.Mode = 1; }
         else if (modeAttr == "OneTime") { pb.Mode = 2; }
         else if (modeAttr == "OneWayToSource") { pb.Mode = 3; }

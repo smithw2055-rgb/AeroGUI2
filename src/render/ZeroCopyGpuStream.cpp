@@ -821,8 +821,8 @@ fn fs_main(in : VertexOut) -> @location(0) vec4<f32> {
 )";
 
 [[nodiscard]] bool SameBatchScissor(const GpuClipDrawBatch& batch, const CommandPageHeader& hdr) noexcept {
-    if (batch.textureId != hdr.reserved[0] ||
-        static_cast<std::uint32_t>(batch.blendMode) != hdr.reserved[1]) {
+    if (batch.textureId != hdr.textureId ||
+        static_cast<std::uint32_t>(batch.blendMode) != hdr.blendMode) {
         return false;
     }
     const bool hdrScissor = (hdr.flags & CommandPageFlag_ScissorClipActive) != 0u;
@@ -1087,9 +1087,9 @@ ZeroCopySubmissionStats ZeroCopyGpuStream::SubmitDirtyPages(PagedRenderTree& tre
                     batch.firstPageIndex = static_cast<std::uint32_t>(p);
                     batch.pageCount = 1u;
                     batch.vertexCount = clampedVerts;
-                    batch.textureId = hdr.reserved[0];
-                    batch.blendMode = (hdr.reserved[1] <= 3u)
-                        ? static_cast<BlendingMode>(hdr.reserved[1])
+                    batch.textureId = hdr.textureId;
+                    batch.blendMode = (hdr.blendMode <= 3u)
+                        ? static_cast<BlendingMode>(hdr.blendMode)
                         : BlendingMode::Normal;
                     batch.scissorActive = (hdr.flags & CommandPageFlag_ScissorClipActive) != 0u;
                     batch.scissorRect = Rect{hdr.clipX, hdr.clipY, hdr.clipW, hdr.clipH};

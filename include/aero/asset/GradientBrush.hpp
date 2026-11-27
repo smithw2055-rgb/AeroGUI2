@@ -11,7 +11,7 @@
 #include <vector>
 
 #include "aero/drawing/Geometry.hpp"
-#include "aero/foundation/ChunkedArena.hpp"
+#include "aero/core/ChunkedArena.hpp"
 
 namespace aero {
 

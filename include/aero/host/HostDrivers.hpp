@@ -9,7 +9,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "aero/core/UIResourceStore.hpp"
+#include "aero/render/UIResourceStore.hpp"
 #include "aero/render/FontAtlas.hpp"
 #include "aero/render/PagedRenderTree.hpp"
 #include "aero/render/ZeroCopyGpuStream.hpp"

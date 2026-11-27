@@ -9,8 +9,8 @@
 #include <string_view>
 #include <vector>
 
+#include "aero/asset/MtsdfPathBaker.hpp"
 #include "aero/core/StringUtils.hpp"
-#include "aero/core/UIResourceStore.hpp"
 
 namespace aero {
 
@@ -368,10 +368,6 @@ bool TryDeserializeGradientBrushSpec(std::string_view raw, GradientBrushDesc& ou
     BakeGradientBrushRamp(parsed);
     outBrush = std::move(parsed);
     return true;
-}
-
-GradientBrushRegistry& GradientBrushRegistry::Instance() noexcept {
-    return UIResourceStore::Default().GradientBrushes();
 }
 
 std::uint32_t GradientBrushRegistry::RegisterBrush(GradientBrushDesc desc) {

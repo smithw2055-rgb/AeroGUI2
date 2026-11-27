@@ -6,7 +6,7 @@
 #include <limits>
 #include <vector>
 
-#include "aero/core/UIResourceStore.hpp"
+#include "aero/render/UIResourceStore.hpp"
 #include "aero/render/ImageAtlas.hpp"
 
 namespace aero {

@@ -29,8 +29,13 @@ class ObservableListHelper final {
 public:
     static constexpr std::size_t kDeltaRingCapacity = 256u;
 
-    static void RegisterWrapperType(realscript::semantic::SymbolId wrapperTypeId);
+    static void RegisterWrapperType(
+        realscript::semantic::SymbolId wrapperTypeId,
+        std::size_t backingFieldIndex = 0u);
     [[nodiscard]] static bool IsWrapperType(realscript::semantic::SymbolId typeId) noexcept;
+    [[nodiscard]] static bool TryGetWrapperBackingFieldIndex(
+        realscript::semantic::SymbolId typeId,
+        std::size_t& outFieldIndex) noexcept;
 
     [[nodiscard]] static realscript::runtime::ObjectRef ResolveBackingArray(
         const realscript::runtime::ManagedHeap& heap,

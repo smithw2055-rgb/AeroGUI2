@@ -1,9 +1,11 @@
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <string_view>
 
 namespace aero::str {
@@ -160,6 +162,86 @@ namespace detail {
         }
     }
     return count;
+}
+
+inline void AppendUtf8CodePoint(std::string& dst, std::uint32_t cp) {
+    if (cp == 0u || cp > 0x10FFFFu || (cp >= 0xD800u && cp <= 0xDFFFu)) {
+        return;
+    }
+    if (cp <= 0x7Fu) {
+        dst.push_back(static_cast<char>(cp));
+    } else if (cp <= 0x7FFu) {
+        dst.push_back(static_cast<char>(0xC0u | ((cp >> 6u) & 0x1Fu)));
+        dst.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+    } else if (cp <= 0xFFFFu) {
+        dst.push_back(static_cast<char>(0xE0u | ((cp >> 12u) & 0x0Fu)));
+        dst.push_back(static_cast<char>(0x80u | ((cp >> 6u) & 0x3Fu)));
+        dst.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+    } else {
+        dst.push_back(static_cast<char>(0xF0u | ((cp >> 18u) & 0x07u)));
+        dst.push_back(static_cast<char>(0x80u | ((cp >> 12u) & 0x3Fu)));
+        dst.push_back(static_cast<char>(0x80u | ((cp >> 6u) & 0x3Fu)));
+        dst.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+    }
+}
+
+[[nodiscard]] inline std::string Utf8FromCodePoint(std::int64_t cpRaw) {
+    if (cpRaw <= 0 || cpRaw > 0x10FFFF || (cpRaw >= 0xD800 && cpRaw <= 0xDFFF)) {
+        return {};
+    }
+    std::string out;
+    AppendUtf8CodePoint(out, static_cast<std::uint32_t>(cpRaw));
+    return out;
+}
+
+[[nodiscard]] inline std::int64_t CountUtf8CodePoints(std::string_view s) noexcept {
+    std::int64_t count = 0;
+    for (std::size_t i = 0u; i < s.size();) {
+        const auto c = static_cast<unsigned char>(s[i]);
+        std::size_t adv = 1u;
+        if ((c & 0x80u) == 0u) adv = 1u;
+        else if ((c & 0xE0u) == 0xC0u) adv = 2u;
+        else if ((c & 0xF0u) == 0xE0u) adv = 3u;
+        else if ((c & 0xF8u) == 0xF0u) adv = 4u;
+        i += std::min(adv, s.size() - i);
+        ++count;
+    }
+    return count;
+}
+
+[[nodiscard]] inline std::string_view SliceUtf8CodePoints(
+    std::string_view s,
+    std::int32_t startCp,
+    std::int32_t countCp) noexcept {
+    if (countCp <= 0 || s.empty()) {
+        return {};
+    }
+    startCp = std::max<std::int32_t>(0, startCp);
+    const std::int64_t endCp = static_cast<std::int64_t>(startCp) + static_cast<std::int64_t>(countCp);
+    std::size_t byteStart = s.size();
+    std::size_t byteEnd = s.size();
+    std::int64_t cpIdx = 0;
+    for (std::size_t i = 0u; i < s.size();) {
+        if (cpIdx == startCp) {
+            byteStart = i;
+        }
+        if (cpIdx == endCp) {
+            byteEnd = i;
+            break;
+        }
+        const auto c = static_cast<unsigned char>(s[i]);
+        std::size_t adv = 1u;
+        if ((c & 0x80u) == 0u) adv = 1u;
+        else if ((c & 0xE0u) == 0xC0u) adv = 2u;
+        else if ((c & 0xF0u) == 0xE0u) adv = 3u;
+        else if ((c & 0xF8u) == 0xF0u) adv = 4u;
+        i += std::min(adv, s.size() - i);
+        ++cpIdx;
+    }
+    if (byteStart >= s.size() || byteEnd <= byteStart) {
+        return {};
+    }
+    return s.substr(byteStart, byteEnd - byteStart);
 }
 
 } // namespace aero::str

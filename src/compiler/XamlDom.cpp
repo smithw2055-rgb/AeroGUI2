@@ -12,77 +12,6 @@ namespace {
     return c == ' ' || c == '\t' || c == '\r' || c == '\n';
 }
 
-[[nodiscard]] bool IsNameStart(unsigned char c) noexcept {
-    return std::isalpha(c) != 0 || c == '_' || c == ':' || c >= 0x80u;
-}
-
-[[nodiscard]] bool IsNameChar(unsigned char c) noexcept {
-    return IsNameStart(c) || std::isdigit(c) != 0 || c == '-' || c == '.';
-}
-
-void SplitQName(std::string_view raw, std::string& outPrefix, std::string& outLocal) {
-    const std::size_t colon = raw.find(':');
-    if (colon == std::string_view::npos) {
-        outPrefix.clear();
-        outLocal.assign(raw);
-    } else {
-        outPrefix.assign(raw.substr(0u, colon));
-        outLocal.assign(raw.substr(colon + 1u));
-    }
-}
-
-struct SourceCursor final {
-    std::string_view text;
-    std::size_t pos = 0u;
-    int line = 1;
-    int col = 1;
-
-    explicit SourceCursor(std::string_view src) noexcept : text(src) {
-        if (text.size() >= 3u &&
-            static_cast<unsigned char>(text[0]) == 0xEFu &&
-            static_cast<unsigned char>(text[1]) == 0xBBu &&
-            static_cast<unsigned char>(text[2]) == 0xBFu) {
-            pos = 3u;
-        }
-    }
-
-    [[nodiscard]] bool AtEnd() const noexcept { return pos >= text.size(); }
-    [[nodiscard]] char Peek(std::size_t off = 0u) const noexcept {
-        return (pos + off < text.size()) ? text[pos + off] : '\0';
-    }
-    [[nodiscard]] bool StartsWith(std::string_view pfx) const noexcept {
-        return pos + pfx.size() <= text.size() && text.substr(pos, pfx.size()) == pfx;
-    }
-
-    char Advance() noexcept {
-        if (pos >= text.size()) {
-            return '\0';
-        }
-        const char c = text[pos++];
-        if (c == '\r') {
-            if (pos < text.size() && text[pos] == '\n') {
-                ++pos;
-            }
-            ++line;
-            col = 1;
-            return '\n';
-        }
-        if (c == '\n') {
-            ++line;
-            col = 1;
-        } else {
-            ++col;
-        }
-        return c;
-    }
-
-    void SkipSpaces() noexcept {
-        while (!AtEnd() && IsSpace(Peek())) {
-            (void)Advance();
-        }
-    }
-};
-
 [[nodiscard]] std::size_t MeasureLeadingIndentSpaces(std::string_view src, std::size_t tagOffset) noexcept {
     std::size_t lineStart = tagOffset;
     while (lineStart > 0u && src[lineStart - 1u] != '\n' && src[lineStart - 1u] != '\r') {
@@ -143,9 +72,6 @@ bool XamlDomDocument::Parse(
     outDoc.source_.assign(sourceText);
     const std::string_view src(outDoc.source_);
 
-    SourceCursor cur(src);
-    std::vector<std::int32_t> stack;
-
     auto setErr = [&](int ln, int cl, std::string msg) -> bool {
         if (outError != nullptr) {
             *outError = "Line " + std::to_string(ln) + ":" + std::to_string(cl) + ": " + std::move(msg);
@@ -153,14 +79,42 @@ bool XamlDomDocument::Parse(
         return false;
     };
 
-    while (!cur.AtEnd()) {
-        if (cur.Peek() != '<') {
-            const std::size_t textStart = cur.pos;
-            while (!cur.AtEnd() && cur.Peek() != '<') {
-                (void)cur.Advance();
+    XmlPullLexer lexer(src, /*emitCommentsAndPI=*/true);
+    std::vector<std::int32_t> stack;
+
+    for (;;) {
+        XmlToken tok = lexer.Next();
+        if (tok.kind == XmlTokenKind::EndOfFile) {
+            break;
+        }
+        if (tok.kind == XmlTokenKind::Error) {
+            return setErr(tok.line, tok.column, std::move(tok.text));
+        }
+        if (tok.kind == XmlTokenKind::ProcessingInstruction) {
+            continue;
+        }
+        if (tok.kind == XmlTokenKind::Comment) {
+            XamlDomComment cmt{};
+            cmt.span = XamlTextSpan{
+                tok.startOffset, tok.endOffset, tok.line, tok.column, tok.endLine, tok.endColumn};
+            if (tok.endOffset >= tok.startOffset + 7u) {
+                cmt.text.assign(src.substr(tok.startOffset + 4u, tok.endOffset - tok.startOffset - 7u));
+            } else {
+                cmt.text = std::move(tok.text);
             }
+            outDoc.comments_.push_back(std::move(cmt));
+            continue;
+        }
+        if (tok.kind == XmlTokenKind::CData) {
             if (!stack.empty()) {
-                const std::string_view rawTxt = src.substr(textStart, cur.pos - textStart);
+                outDoc.elements_[static_cast<std::size_t>(stack.back())].innerText.append(tok.text);
+            }
+            continue;
+        }
+        if (tok.kind == XmlTokenKind::Text) {
+            if (!stack.empty()) {
+                const std::string_view rawTxt = src.substr(
+                    tok.startOffset, tok.endOffset - tok.startOffset);
                 bool allWs = true;
                 for (char ch : rawTxt) {
                     if (!IsSpace(ch)) {
@@ -169,264 +123,80 @@ bool XamlDomDocument::Parse(
                     }
                 }
                 if (!allWs) {
-                    std::string entityErr;
-                    outDoc.elements_[static_cast<std::size_t>(stack.back())].innerText.append(
-                        DecodeXmlEntities(rawTxt, &entityErr));
+                    outDoc.elements_[static_cast<std::size_t>(stack.back())].innerText.append(tok.text);
                 }
             }
             continue;
         }
-
-        const std::size_t tagStartOff = cur.pos;
-        const int tagStartLine = cur.line;
-        const int tagStartCol = cur.col;
-
-        // Comment <!-- ... -->
-        if (cur.StartsWith("<!--")) {
-            cur.Advance(); cur.Advance(); cur.Advance(); cur.Advance();
-            const std::size_t bodyStart = cur.pos;
-            bool closed = false;
-            while (!cur.AtEnd()) {
-                if (cur.StartsWith("-->")) {
-                    const std::size_t bodyEnd = cur.pos;
-                    cur.Advance(); cur.Advance(); cur.Advance();
-                    XamlDomComment cmt{};
-                    cmt.span = XamlTextSpan{tagStartOff, cur.pos, tagStartLine, tagStartCol, cur.line, cur.col};
-                    cmt.text.assign(src.substr(bodyStart, bodyEnd - bodyStart));
-                    outDoc.comments_.push_back(std::move(cmt));
-                    closed = true;
-                    break;
-                }
-                (void)cur.Advance();
-            }
-            if (!closed) {
-                return setErr(tagStartLine, tagStartCol, "Unterminated XML comment");
-            }
-            continue;
-        }
-
-        // CDATA <![CDATA[ ... ]]>
-        if (cur.StartsWith("<![CDATA[")) {
-            for (int k = 0; k < 9; ++k) (void)cur.Advance();
-            const std::size_t bodyStart = cur.pos;
-            bool closed = false;
-            while (!cur.AtEnd()) {
-                if (cur.StartsWith("]]>")) {
-                    if (!stack.empty()) {
-                        outDoc.elements_[static_cast<std::size_t>(stack.back())].innerText.append(
-                            src.substr(bodyStart, cur.pos - bodyStart));
-                    }
-                    cur.Advance(); cur.Advance(); cur.Advance();
-                    closed = true;
-                    break;
-                }
-                (void)cur.Advance();
-            }
-            if (!closed) {
-                return setErr(tagStartLine, tagStartCol, "Unterminated CDATA section");
-            }
-            continue;
-        }
-
-        // Processing instruction <? ... ?> or <!DOCTYPE ...>
-        if (cur.Peek(1u) == '?' || cur.Peek(1u) == '!') {
-            const bool isPi = (cur.Peek(1u) == '?');
-            cur.Advance();
-            cur.Advance();
-            bool closed = false;
-            while (!cur.AtEnd()) {
-                if (isPi && cur.StartsWith("?>")) {
-                    cur.Advance();
-                    cur.Advance();
-                    closed = true;
-                    break;
-                }
-                if (!isPi && cur.Peek() == '>') {
-                    cur.Advance();
-                    closed = true;
-                    break;
-                }
-                (void)cur.Advance();
-            }
-            if (!closed) {
-                return setErr(tagStartLine, tagStartCol, "Unterminated XML declaration or directive");
-            }
-            continue;
-        }
-
-        // Closing tag </Name>
-        if (cur.Peek(1u) == '/') {
-            cur.Advance(); // '<'
-            cur.Advance(); // '/'
-            cur.SkipSpaces();
-            const std::size_t closeNameStart = cur.pos;
-            while (!cur.AtEnd() && IsNameChar(static_cast<unsigned char>(cur.Peek()))) {
-                (void)cur.Advance();
-            }
-            const std::string_view closeName = src.substr(closeNameStart, cur.pos - closeNameStart);
-            cur.SkipSpaces();
-            if (cur.Peek() != '>') {
-                return setErr(tagStartLine, tagStartCol, "Expected '>' in closing tag");
-            }
-            cur.Advance();
-
+        if (tok.kind == XmlTokenKind::EndElement) {
             if (stack.empty()) {
-                return setErr(tagStartLine, tagStartCol, "Unexpected closing tag '</" + std::string(closeName) + ">'");
+                return setErr(tok.line, tok.column, "Unexpected closing tag '</" + tok.rawName + ">'");
             }
             const std::int32_t openId = stack.back();
             XamlDomElement& elem = outDoc.elements_[static_cast<std::size_t>(openId)];
-            if (elem.rawName != closeName) {
-                return setErr(
-                    tagStartLine,
-                    tagStartCol,
-                    "Mismatched closing tag '</" + std::string(closeName) + ">' for '<" + elem.rawName + ">'");
-            }
-            elem.childrenInsertOffset = tagStartOff;
-            elem.closeTagSpan = XamlTextSpan{tagStartOff, cur.pos, tagStartLine, tagStartCol, cur.line, cur.col};
-            elem.fullSpan.endOffset = cur.pos;
-            elem.fullSpan.endLine = cur.line;
-            elem.fullSpan.endColumn = cur.col;
+            elem.childrenInsertOffset = tok.startOffset;
+            elem.closeTagSpan = XamlTextSpan{
+                tok.startOffset, tok.endOffset, tok.line, tok.column, tok.endLine, tok.endColumn};
+            elem.fullSpan.endOffset = tok.endOffset;
+            elem.fullSpan.endLine = tok.endLine;
+            elem.fullSpan.endColumn = tok.endColumn;
             stack.pop_back();
             continue;
         }
+        if (tok.kind == XmlTokenKind::StartElement) {
+            const auto elemId = static_cast<std::int32_t>(outDoc.elements_.size());
+            XamlDomElement elem{};
+            elem.id = elemId;
+            elem.parentId = stack.empty() ? -1 : stack.back();
+            elem.rawName = std::move(tok.rawName);
+            elem.prefix = std::move(tok.prefix);
+            elem.localName = std::move(tok.localName);
+            elem.isSelfClosing = tok.isEmptyElement;
+            elem.leadingLineIndentSpaces = MeasureLeadingIndentSpaces(src, tok.startOffset);
+            elem.openTagAttrInsertOffset = tok.openTagAttrInsertOffset;
+            elem.childrenInsertOffset = tok.endOffset;
+            elem.openTagSpan = XamlTextSpan{
+                tok.startOffset, tok.endOffset, tok.line, tok.column, tok.endLine, tok.endColumn};
+            elem.fullSpan = elem.openTagSpan;
 
-        // Opening tag <Name ...> or <Name ... />
-        cur.Advance(); // '<'
-        if (cur.AtEnd() || !IsNameStart(static_cast<unsigned char>(cur.Peek()))) {
-            return setErr(tagStartLine, tagStartCol, "Expected element tag name after '<'");
-        }
-        const std::size_t nameStart = cur.pos;
-        while (!cur.AtEnd() && IsNameChar(static_cast<unsigned char>(cur.Peek()))) {
-            (void)cur.Advance();
-        }
-        const std::string_view rawTagName = src.substr(nameStart, cur.pos - nameStart);
-
-        const auto elemId = static_cast<std::int32_t>(outDoc.elements_.size());
-        XamlDomElement elem{};
-        elem.id = elemId;
-        elem.parentId = stack.empty() ? -1 : stack.back();
-        elem.rawName.assign(rawTagName);
-        SplitQName(rawTagName, elem.prefix, elem.localName);
-        elem.leadingLineIndentSpaces = MeasureLeadingIndentSpaces(src, tagStartOff);
-        elem.fullSpan.startOffset = tagStartOff;
-        elem.fullSpan.startLine = tagStartLine;
-        elem.fullSpan.startColumn = tagStartCol;
-        elem.openTagSpan.startOffset = tagStartOff;
-        elem.openTagSpan.startLine = tagStartLine;
-        elem.openTagSpan.startColumn = tagStartCol;
-
-        // Parse attributes until '>' or '/>'
-        while (!cur.AtEnd()) {
-            const std::size_t triviaStart = cur.pos;
-            cur.SkipSpaces();
-            if (cur.AtEnd()) {
-                return setErr(tagStartLine, tagStartCol, "Unterminated opening tag '<" + elem.rawName + ">'");
-            }
-            if (cur.StartsWith("/>")) {
-                elem.isSelfClosing = true;
-                elem.openTagAttrInsertOffset = triviaStart;
-                cur.Advance();
-                cur.Advance();
-                break;
-            }
-            if (cur.Peek() == '>') {
-                elem.isSelfClosing = false;
-                elem.openTagAttrInsertOffset = cur.pos;
-                cur.Advance();
-                break;
+            elem.attributes.reserve(tok.attributes.size());
+            for (auto& a : tok.attributes) {
+                XamlDomAttribute attr{};
+                attr.rawName = std::move(a.rawName);
+                attr.prefix = std::move(a.prefix);
+                attr.localName = std::move(a.localName);
+                attr.value = std::move(a.value);
+                attr.rawValueLiteral.assign(src.substr(
+                    a.valueInnerStartOffset, a.valueInnerEndOffset - a.valueInnerStartOffset));
+                attr.quoteChar = a.quoteChar;
+                attr.leadingTriviaOffset = a.leadingTriviaOffset;
+                attr.fullSpan = XamlTextSpan{
+                    a.startOffset, a.endOffset, a.line, a.column, a.endLine, a.endColumn};
+                attr.nameSpan = XamlTextSpan{
+                    a.startOffset, a.nameEndOffset, a.line, a.column, a.nameEndLine, a.nameEndColumn};
+                attr.valueInnerSpan = XamlTextSpan{
+                    a.valueInnerStartOffset,
+                    a.valueInnerEndOffset,
+                    a.valueStartLine,
+                    a.valueStartColumn,
+                    a.valueEndLine,
+                    a.valueEndColumn};
+                elem.attributes.push_back(std::move(attr));
             }
 
-            if (!IsNameStart(static_cast<unsigned char>(cur.Peek()))) {
-                return setErr(cur.line, cur.col, "Invalid attribute name in '<" + elem.rawName + ">'");
+            if (elem.parentId >= 0) {
+                outDoc.elements_[static_cast<std::size_t>(elem.parentId)].children.push_back(elemId);
+            } else if (outDoc.rootId_ < 0) {
+                outDoc.rootId_ = elemId;
+            } else {
+                return setErr(tok.line, tok.column, "Multiple root elements in XAML document");
             }
 
-            XamlDomAttribute attr{};
-            attr.leadingTriviaOffset = triviaStart;
-            attr.fullSpan.startOffset = cur.pos;
-            attr.fullSpan.startLine = cur.line;
-            attr.fullSpan.startColumn = cur.col;
-            attr.nameSpan.startOffset = cur.pos;
-            attr.nameSpan.startLine = cur.line;
-            attr.nameSpan.startColumn = cur.col;
-
-            while (!cur.AtEnd() && IsNameChar(static_cast<unsigned char>(cur.Peek()))) {
-                (void)cur.Advance();
+            const bool selfClosing = elem.isSelfClosing;
+            outDoc.elements_.push_back(std::move(elem));
+            if (!selfClosing) {
+                stack.push_back(elemId);
             }
-            attr.nameSpan.endOffset = cur.pos;
-            attr.nameSpan.endLine = cur.line;
-            attr.nameSpan.endColumn = cur.col;
-
-            const std::string_view attrRawName = src.substr(
-                attr.nameSpan.startOffset,
-                attr.nameSpan.endOffset - attr.nameSpan.startOffset);
-            attr.rawName.assign(attrRawName);
-            SplitQName(attrRawName, attr.prefix, attr.localName);
-
-            cur.SkipSpaces();
-            if (cur.Peek() != '=') {
-                return setErr(cur.line, cur.col, "Expected '=' after attribute '" + attr.rawName + "'");
-            }
-            cur.Advance(); // '='
-            cur.SkipSpaces();
-
-            const char q = cur.Peek();
-            if (q != '"' && q != '\'') {
-                return setErr(cur.line, cur.col, "Expected quoted value for attribute '" + attr.rawName + "'");
-            }
-            attr.quoteChar = q;
-            cur.Advance(); // opening quote
-
-            attr.valueInnerSpan.startOffset = cur.pos;
-            attr.valueInnerSpan.startLine = cur.line;
-            attr.valueInnerSpan.startColumn = cur.col;
-
-            while (!cur.AtEnd() && cur.Peek() != q) {
-                (void)cur.Advance();
-            }
-            if (cur.AtEnd()) {
-                return setErr(
-                    attr.valueInnerSpan.startLine,
-                    attr.valueInnerSpan.startColumn,
-                    "Unterminated string literal for attribute '" + attr.rawName + "'");
-            }
-            attr.valueInnerSpan.endOffset = cur.pos;
-            attr.valueInnerSpan.endLine = cur.line;
-            attr.valueInnerSpan.endColumn = cur.col;
-
-            attr.rawValueLiteral.assign(src.substr(
-                attr.valueInnerSpan.startOffset,
-                attr.valueInnerSpan.endOffset - attr.valueInnerSpan.startOffset));
-            std::string entityErr;
-            attr.value = DecodeXmlEntities(attr.rawValueLiteral, &entityErr);
-
-            cur.Advance(); // closing quote
-            attr.fullSpan.endOffset = cur.pos;
-            attr.fullSpan.endLine = cur.line;
-            attr.fullSpan.endColumn = cur.col;
-
-            elem.attributes.push_back(std::move(attr));
-        }
-
-        elem.openTagSpan.endOffset = cur.pos;
-        elem.openTagSpan.endLine = cur.line;
-        elem.openTagSpan.endColumn = cur.col;
-        elem.fullSpan.endOffset = cur.pos;
-        elem.fullSpan.endLine = cur.line;
-        elem.fullSpan.endColumn = cur.col;
-        elem.childrenInsertOffset = cur.pos;
-
-        if (elem.parentId >= 0) {
-            outDoc.elements_[static_cast<std::size_t>(elem.parentId)].children.push_back(elemId);
-        } else if (outDoc.rootId_ < 0) {
-            outDoc.rootId_ = elemId;
-        } else {
-            return setErr(tagStartLine, tagStartCol, "Multiple root elements in XAML document");
-        }
-
-        const bool selfClosing = elem.isSelfClosing;
-        outDoc.elements_.push_back(std::move(elem));
-        if (!selfClosing) {
-            stack.push_back(elemId);
         }
     }
 

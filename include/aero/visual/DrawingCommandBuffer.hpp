@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "aero/drawing/Geometry.hpp"
+#include "aero/visual/SyntaxHighlighter.hpp"
 #include "aero/visual/VisualTree.hpp"
 
 namespace aero {
@@ -31,19 +32,6 @@ enum class DrawCommandKind : std::uint8_t {
     PushOpacity = 16,
     PopOpacity = 17,
     DrawTextRuns = 18,
-};
-
-enum class SyntaxHighlightLang : std::uint8_t {
-    Plain = 0,
-    RealScript = 1,
-    Xaml = 2,
-    AeroScene = 3,
-};
-
-struct StyledTextSpan {
-    std::uint32_t byteOffset = 0u;
-    std::uint32_t byteLength = 0u;
-    std::uint32_t colorRgba = 0xFFFFFFFFu;
 };
 
 struct DrawCommand {

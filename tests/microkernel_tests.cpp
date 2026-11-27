@@ -16,7 +16,7 @@
 #include <realscript/semantic/Semantic.h>
 
 #include "aero/asset/GradientBrush.hpp"
-#include "aero/core/UIResourceStore.hpp"
+#include "aero/render/UIResourceStore.hpp"
 #include "aero/render/FontAtlas.hpp"
 #include "aero/render/ImageAtlas.hpp"
 #include "aero/render/PagedRenderTree.hpp"
@@ -28,34 +28,20 @@
 #include "aero/visual/VisualInputRouter.hpp"
 #include "aero/visual/VisualRenderAdapter.hpp"
 #include "aero/visual/VisualTree.hpp"
+#include "common/AeroTestHarness.hpp"
 
 namespace {
 
 int gFailureCount = 0;
 
-void CheckImpl(bool cond, const char* expr, int line) {
-    if (!cond) {
-        std::fprintf(stderr, "[FAIL] Line %d: %s\n", line, expr);
-        ++gFailureCount;
-    }
-}
-
-void CheckNearImpl(float actual, float expected, float eps, const char* expr, int line) {
-    if (!std::isfinite(actual) || std::fabs(actual - expected) > eps) {
-        std::fprintf(
-            stderr,
-            "[FAIL] Line %d: %s (actual=%.5f expected=%.5f eps=%.5f)\n",
-            line,
-            expr,
-            static_cast<double>(actual),
-            static_cast<double>(expected),
-            static_cast<double>(eps));
-        ++gFailureCount;
-    }
-}
-
-#define CHECK(expr) CheckImpl((expr), #expr, __LINE__)
-#define CHECK_NEAR(actual, expected, eps) CheckNearImpl((actual), (expected), (eps), #actual, __LINE__)
+#define CHECK(expr)                                                           \
+    do {                                                                      \
+        if (!(expr)) {                                                        \
+            aero::test::ReportFailure(gFailureCount, #expr, __FILE__, __LINE__); \
+        }                                                                     \
+    } while (false)
+#define CHECK_NEAR(actual, expected, eps) \
+    aero::test::CheckNear(gFailureCount, (actual), (expected), (eps), #actual, __FILE__, __LINE__)
 
 [[nodiscard]] aero::rs_rt::Value MakeStrVal(std::string_view sv) {
     return aero::rs_rt::Value{aero::rs_rt::StringValue{sv}};
@@ -1010,18 +996,21 @@ void TestHostBindingsAndReflection() {
         return bindings->invoke(ref, aero::rs_rt::ValueSpan(args), err);
     };
 
-    // Check canonical, bare, and __rs_native_ aliases exist
+    // Check canonical, bare, and void-only __rs_native_ aliases
     {
         aero::rs_bc::FunctionReference canonRef{};
         canonRef.name = "Aero.Native::Visual_Create";
         aero::rs_bc::FunctionReference bareRef{};
         bareRef.name = "Visual_Create";
+        aero::rs_bc::FunctionReference nonVoidNativeRef{};
+        nonVoidNativeRef.name = "Aero.Native::__rs_native_Visual_Create";
         aero::rs_bc::FunctionReference nativeCanonRef{};
-        nativeCanonRef.name = "Aero.Native::__rs_native_Visual_Create";
+        nativeCanonRef.name = "Aero.Native::__rs_native_Visual_SetOpacity";
         aero::rs_bc::FunctionReference nativeBareRef{};
-        nativeBareRef.name = "__rs_native_Visual_Create";
+        nativeBareRef.name = "__rs_native_Visual_SetOpacity";
         CHECK(bindings->resolve(canonRef).has_value());
         CHECK(bindings->resolve(bareRef).has_value());
+        CHECK(!bindings->resolve(nonVoidNativeRef).has_value());
         CHECK(bindings->resolve(nativeCanonRef).has_value());
         CHECK(bindings->resolve(nativeBareRef).has_value());
     }

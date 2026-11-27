@@ -8,7 +8,7 @@
 #include <vector>
 
 #include "aero/asset/MtsdfPathBaker.hpp"
-#include "aero/core/UIResourceStore.hpp"
+#include "aero/render/UIResourceStore.hpp"
 #include "aero/render/ImageAtlas.hpp"
 #include "aero/render/RiveRenderer.hpp"
 

@@ -1268,10 +1268,13 @@ public class DockTabGroup : Control {
         _rootGrid.AddChild(headerBar);
 
         _contentHost = new Border();
-        _contentHost.Background = new SolidColorBrush("#FF0F172A");
+        _contentHost.Background = ThemePalette.Slate900();
         UIElement.SetGridRow(_contentHost, 1);
         _rootGrid.AddChild(_contentHost);
     }
+
+    private Border[] _tabBorders = new Border[0];
+    private TextBlock[] _tabLabels = new TextBlock[0];
 
     public override string GetTypeName() { return "DockTabGroup"; }
 
@@ -1304,19 +1307,19 @@ public class DockTabGroup : Control {
                 }
             }
         }
-        RebuildTabsAndContent();
+        RebuildTabStrip();
         return true;
     }
 
     internal void ClearAllPanesSilent() {
         _panes.Clear();
         _selectedIndex = -1;
-        RebuildTabsAndContent();
+        RebuildTabStrip();
     }
 
     internal void SetMaximizedDetached(bool detached) {
         _maximizedDetached = detached;
-        RebuildTabsAndContent();
+        SyncTabSelectionAndContent();
     }
 
     public int SelectedIndex {
@@ -1325,7 +1328,7 @@ public class DockTabGroup : Control {
             int next = _panes.Length == 0 ? -1 : EditorMath.Clampi(value, 0, _panes.Length - 1);
             if (_selectedIndex == next) { return; }
             _selectedIndex = next;
-            RebuildTabsAndContent();
+            SyncTabSelectionAndContent();
             ActivePaneChanged(this, EventArgs.Empty());
         }
     }
@@ -1350,7 +1353,7 @@ public class DockTabGroup : Control {
             _selectedIndex = _panes.Length - 1;
             selChanged = true;
         }
-        RebuildTabsAndContent();
+        RebuildTabStrip();
         if (selChanged) {
             ActivePaneChanged(this, EventArgs.Empty());
         }
@@ -1366,7 +1369,7 @@ public class DockTabGroup : Control {
                 } else if (_selectedIndex >= _panes.Length) {
                     _selectedIndex = _panes.Length - 1;
                 }
-                RebuildTabsAndContent();
+                RebuildTabStrip();
                 return true;
             }
         }
@@ -1387,25 +1390,25 @@ public class DockTabGroup : Control {
         return false;
     }
 
-    private void RebuildTabsAndContent() {
+    private void RebuildTabStrip() {
         if (_tabStrip == null || _contentHost == null) { return; }
         _tabStrip.ClearChildren();
+        _tabBorders.Clear();
+        _tabLabels.Clear();
         DockTabGroup self = this;
+        var pad = new Thickness(10.0f, 4.0f, 10.0f, 4.0f);
+        var topBorder = new Thickness(0.0f, 2.0f, 0.0f, 0.0f);
         for (int i = 0; i < _panes.Length; i += 1) {
             int capturedIdx = i;
             DockPane p = _panes[i];
-            bool active = (i == _selectedIndex);
 
             var tabBtn = new Border();
-            tabBtn.Padding = new Thickness(10.0f, 4.0f, 10.0f, 4.0f);
-            tabBtn.Background = new SolidColorBrush(active ? "#FF1E293B" : "#00000000");
-            tabBtn.BorderBrush = new SolidColorBrush(active ? "#FF38BDF8" : "#00000000");
-            tabBtn.BorderThickness = new Thickness(0.0f, 2.0f, 0.0f, 0.0f);
+            tabBtn.Padding = pad;
+            tabBtn.BorderThickness = topBorder;
 
             var lbl = new TextBlock();
             lbl.Text = p.Title;
             lbl.FontSize = 12.0f;
-            lbl.Foreground = new SolidColorBrush(active ? "#FFF8FAFC" : "#FF94A3B8");
             lbl.VerticalAlignment = VerticalAlignment.Center;
             tabBtn.Child = lbl;
 
@@ -1419,7 +1422,25 @@ public class DockTabGroup : Control {
                 }
                 e.Handled = true;
             };
+            _tabBorders.Push(tabBtn);
+            _tabLabels.Push(lbl);
             _tabStrip.AddChild(tabBtn);
+        }
+        SyncTabSelectionAndContent();
+    }
+
+    private void SyncTabSelectionAndContent() {
+        if (_tabStrip == null || _contentHost == null) { return; }
+        if (_tabBorders.Length != _panes.Length) {
+            RebuildTabStrip();
+            return;
+        }
+        for (int i = 0; i < _panes.Length; i += 1) {
+            bool active = (i == _selectedIndex);
+            _tabBorders[i].Background = active ? ThemePalette.Slate800() : ThemePalette.Transparent();
+            _tabBorders[i].BorderBrush = active ? ThemePalette.Sky400() : ThemePalette.Transparent();
+            _tabLabels[i].Foreground = active ? ThemePalette.Slate50() : ThemePalette.Slate400();
+            _tabLabels[i].Text = _panes[i].Title;
         }
 
         _contentHost.Child = null;

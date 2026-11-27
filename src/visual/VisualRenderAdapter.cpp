@@ -14,7 +14,7 @@
 
 #include "aero/asset/GradientBrush.hpp"
 #include "aero/asset/MtsdfPathBaker.hpp"
-#include "aero/core/UIResourceStore.hpp"
+#include "aero/render/UIResourceStore.hpp"
 #include "aero/render/FontAtlas.hpp"
 #include "aero/render/ImageAtlas.hpp"
 #include "aero/render/RiveRenderer.hpp"
@@ -223,74 +223,7 @@ private:
     const float maxH = (txt.trim == TextTrimming::None)
         ? 1000000.0f
         : std::max(1.0f, textRect.height);
-    const std::uint64_t curFontRev = store->Fonts().Revision();
-    if (node.HasTextData() &&
-        txt.hasCachedLayout &&
-        txt.cachedRtl == node.layout.effectiveRtl &&
-        txt.cachedFontRev == curFontRev &&
-        std::fabs(txt.cachedMaxW - maxW) <= 1e-3f &&
-        (std::fabs(txt.cachedMaxH - maxH) <= 1e-3f ||
-         (txt.trim == TextTrimming::None &&
-          maxH >= txt.cachedLayout.totalHeight - 1e-3f &&
-          txt.cachedMaxH >= txt.cachedLayout.totalHeight - 1e-3f))) {
-        return &txt.cachedLayout;
-    }
-
-    TextLayoutResult computed{};
-    if (!txt.richSpans.empty()) {
-        std::vector<RichTextRunInput> runs;
-        runs.reserve(txt.richSpans.size());
-        for (const VisualTextSpan& sp : txt.richSpans) {
-            RichTextRunInput r{};
-            r.text = sp.text;
-            r.fontFamily = sp.fontFamily;
-            r.fontSize = sp.fontSize;
-            r.fontWeight = sp.fontWeight;
-            r.fontItalic = sp.fontItalic;
-            r.fgRgba = sp.fgRgba;
-            r.hasFg = sp.hasFg;
-            r.decorations = sp.decorations;
-            runs.push_back(r);
-        }
-        computed = store->Fonts().MeasureRichLayout(
-            runs,
-            txt.fontFamily,
-            txt.fontSize,
-            txt.fontWeight,
-            txt.fontItalic,
-            maxW,
-            txt.wrap,
-            txt.charSpacing,
-            txt.lineHeight,
-            node.layout.effectiveRtl,
-            txt.trim,
-            maxH);
-    } else {
-        computed = store->Fonts().MeasureLayout(
-            txt.text,
-            txt.fontFamily,
-            txt.fontSize,
-            maxW,
-            txt.wrap,
-            txt.charSpacing,
-            txt.fontWeight,
-            txt.fontItalic,
-            txt.lineHeight,
-            node.layout.effectiveRtl,
-            txt.trim,
-            maxH);
-    }
-    if (node.HasTextData()) {
-        txt.cachedLayout = std::move(computed);
-        txt.cachedMaxW = maxW;
-        txt.cachedMaxH = maxH;
-        txt.cachedRtl = node.layout.effectiveRtl;
-        txt.cachedFontRev = curFontRev;
-        txt.hasCachedLayout = true;
-        return &txt.cachedLayout;
-    }
-    outUncached = std::move(computed);
-    return &outUncached;
+    return VisualWorld::ResolveOrComputeNodeTextLayout(node, maxW, maxH, store, &outUncached);
 }
 
 [[nodiscard]] bool CanSkipLeafTextClip(
@@ -1179,18 +1112,12 @@ std::size_t VisualRenderAdapter::EmitTextVisual(
             tree.hasHintNextBounds_ = false;
         }
         auto lineAlignDx = [&](const TextLineMetrics& line) noexcept -> float {
-            TextAlignment effA = txt.align;
-            if (node.layout.effectiveRtl) {
-                if (effA == TextAlignment::Left) effA = TextAlignment::Right;
-                else if (effA == TextAlignment::Right) effA = TextAlignment::Left;
-            }
-            if (effA == TextAlignment::Center) {
-                return std::max(0.0f, (textRect.width - line.width) * 0.5f);
-            }
-            if (effA == TextAlignment::Right || (effA == TextAlignment::Justify && node.layout.effectiveRtl && line.endedByNewline)) {
-                return std::max(0.0f, textRect.width - line.width);
-            }
-            return 0.0f;
+            return ComputeAlignedLineOffsetX(
+                txt.align,
+                node.layout.effectiveRtl,
+                textRect.width,
+                line.width,
+                line.endedByNewline);
         };
 
         // Optional text selection highlight behind glyphs

@@ -2066,21 +2066,8 @@ public class BehaviorDataTrigger : BehaviorTriggerBase {
 
     private void TryHookSource(UIElement associatedObject) {
         if (associatedObject == null) { return; }
-        UIElement src = null;
-        if (ElementName.Length > 0) {
-            src = ResolveElementSource(associatedObject);
-        } else if (RelativeSourceMode == "Self") {
-            src = associatedObject;
-        } else if (RelativeSourceMode == "TemplatedParent") {
-            src = associatedObject.TemplatedParent;
-        } else if (RelativeSourceMode == "FindAncestor" || RelativeSourceMode == "AncestorType" ||
-                   RelativeSourceAncestorType.Length > 0) {
-            UIElement anc = associatedObject;
-            while (anc != null && RelativeSourceAncestorType.Length > 0 && !BindingEntry.MatchesAncestorType(anc, RelativeSourceAncestorType)) {
-                anc = BindingEntry.StepAncestor(anc);
-            }
-            src = anc;
-        }
+        UIElement src = DataTrigger.ResolveReactiveSourceElement(
+            associatedObject, ElementName, RelativeSourceMode, RelativeSourceAncestorType, true);
         if (src == null || HasHookedSource(associatedObject, src)) { return; }
         TrackTriggerWithTargets();
         _hookedTargets.Push(associatedObject);
@@ -2336,22 +2323,8 @@ public class BehaviorDataTrigger : BehaviorTriggerBase {
                 if (srcEl == null || srcEl._isDisposedTree ||
                     _reactiveBSrcTreeEpoch[i] != UIElement._treeParentEpoch ||
                     _reactiveBSrcChainEpoch[i] != t._ancestorChainEpoch) {
-                    srcEl = null;
-                    if (bdt.ElementName.Length > 0) {
-                        srcEl = bdt.ResolveElementSource(t);
-                    } else if (bdt.RelativeSourceMode == "Self") {
-                        srcEl = t;
-                    } else if (bdt.RelativeSourceMode == "TemplatedParent") {
-                        srcEl = t.TemplatedParent;
-                    } else if (bdt.RelativeSourceMode == "FindAncestor" || bdt.RelativeSourceMode == "AncestorType" ||
-                               bdt.RelativeSourceAncestorType.Length > 0) {
-                        UIElement anc = t;
-                        while (anc != null && bdt.RelativeSourceAncestorType.Length > 0 &&
-                               !BindingEntry.MatchesAncestorType(anc, bdt.RelativeSourceAncestorType)) {
-                            anc = BindingEntry.StepAncestor(anc);
-                        }
-                        srcEl = anc;
-                    }
+                    srcEl = DataTrigger.ResolveReactiveSourceElement(
+                        t, bdt.ElementName, bdt.RelativeSourceMode, bdt.RelativeSourceAncestorType, true);
                     if (srcEl != null && !srcEl._isDisposedTree) {
                         _reactiveBSrc[i] = srcEl;
                         _reactiveBSrcTreeEpoch[i] = UIElement._treeParentEpoch;

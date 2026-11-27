@@ -11,23 +11,9 @@
 #include <vector>
 
 #include "aero/app/AeroAppHost.hpp"
+#include "aero/app/AppBootstrap.hpp"
 #include "aero/core/StringUtils.hpp"
 #include "aero/runtime/AeroExecutionDomains.hpp"
-
-#if defined(_WIN32)
-#  ifndef WIN32_LEAN_AND_MEAN
-#    define WIN32_LEAN_AND_MEAN
-#  endif
-#  ifndef NOMINMAX
-#    define NOMINMAX
-#  endif
-#  include <windows.h>
-#  include <psapi.h>
-#elif defined(__APPLE__)
-#  include <mach/mach.h>
-#elif !defined(__EMSCRIPTEN__)
-#  include <unistd.h>
-#endif
 
 namespace {
 
@@ -60,100 +46,15 @@ void PrintUsage() {
         "  -h, --help              Show this help\n");
 }
 
-[[nodiscard]] double QueryWorkingSetMb() noexcept {
-#if defined(_WIN32)
-    PROCESS_MEMORY_COUNTERS pmc{};
-    if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
-        return static_cast<double>(pmc.WorkingSetSize) / (1024.0 * 1024.0);
-    }
-    return 0.0;
-#elif defined(__APPLE__)
-    mach_task_basic_info info{};
-    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
-    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
-                  reinterpret_cast<task_info_t>(&info), &count) == KERN_SUCCESS) {
-        return static_cast<double>(info.resident_size) / (1024.0 * 1024.0);
-    }
-    return 0.0;
-#elif !defined(__EMSCRIPTEN__)
-    std::ifstream in("/proc/self/statm");
-    long pagesTotal = 0;
-    long pagesRss = 0;
-    if (in >> pagesTotal >> pagesRss) {
-        const long pageSz = ::sysconf(_SC_PAGESIZE);
-        if (pageSz > 0) {
-            return static_cast<double>(pagesRss * pageSz) / (1024.0 * 1024.0);
-        }
-    }
-    return 0.0;
-#else
-    return 0.0;
-#endif
-}
-
-[[nodiscard]] std::string ReadViewerEnvVar(const char* name) {
-    if (!name || name[0] == '\0') {
-        return {};
-    }
-#ifdef _MSC_VER
-    char* buf = nullptr;
-    std::size_t len = 0u;
-    std::string val;
-    if (_dupenv_s(&buf, &len, name) == 0 && buf != nullptr) {
-        if (buf[0] != '\0') {
-            val = buf;
-        }
-        std::free(buf);
-    }
-    return val;
-#else
-    if (const char* v = std::getenv(name); v != nullptr && v[0] != '\0') {
-        return std::string(v);
-    }
-    return {};
-#endif
-}
+using aero::app::QueryWorkingSetMb;
+using aero::app::HasNonUniformRenderedPixels;
 
 [[nodiscard]] std::string ResolveDefaultViewerCacheDir() {
-    if (const std::string envCache = ReadViewerEnvVar("AERO_CACHE_DIR"); !envCache.empty()) {
-        return std::filesystem::path(envCache).lexically_normal().generic_string();
-    }
-#ifdef _WIN32
-    std::string baseDir = ReadViewerEnvVar("LOCALAPPDATA");
-    if (baseDir.empty()) {
-        baseDir = ReadViewerEnvVar("TEMP");
-    }
-    if (baseDir.empty()) {
-        baseDir = ReadViewerEnvVar("TMP");
-    }
-    if (!baseDir.empty()) {
-        return (std::filesystem::path(baseDir) / "AeroGUI2" / "cache").lexically_normal().generic_string();
-    }
-#else
-    if (const std::string xdg = ReadViewerEnvVar("XDG_CACHE_HOME"); !xdg.empty()) {
-        return (std::filesystem::path(xdg) / "aerogui2").lexically_normal().generic_string();
-    }
-    if (const std::string home = ReadViewerEnvVar("HOME"); !home.empty()) {
-        return (std::filesystem::path(home) / ".cache" / "aerogui2").lexically_normal().generic_string();
-    }
-#endif
-    std::error_code ec;
-    const std::filesystem::path tmp = std::filesystem::temp_directory_path(ec);
-    if (!ec && !tmp.empty()) {
-        return (tmp / "aerogui2_cache").lexically_normal().generic_string();
-    }
-    return {};
+    return aero::app::ResolveDefaultCacheDir();
 }
 
 [[nodiscard]] bool ReadFileText(const std::filesystem::path& path, std::string& out) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in.is_open()) {
-        return false;
-    }
-    std::ostringstream ss;
-    ss << in.rdbuf();
-    out = ss.str();
-    return true;
+    return aero::app::ReadUtf8TextFile(path, out);
 }
 
 [[nodiscard]] bool WritePpmFile(
@@ -161,49 +62,7 @@ void PrintUsage() {
     std::uint32_t width,
     std::uint32_t height,
     const std::vector<std::uint8_t>& rgba) {
-    if (rgba.size() != static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4u) {
-        return false;
-    }
-    std::error_code ec;
-    if (path.has_parent_path()) {
-        std::filesystem::create_directories(path.parent_path(), ec);
-    }
-    std::ofstream out(path, std::ios::binary | std::ios::trunc);
-    if (!out.is_open()) {
-        return false;
-    }
-    out << "P6\n" << width << " " << height << "\n255\n";
-    const std::size_t pixelCount = static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
-    std::vector<char> rgb(pixelCount * 3u);
-    for (std::size_t i = 0u; i < pixelCount; ++i) {
-        rgb[i * 3u + 0u] = static_cast<char>(rgba[i * 4u + 0u]);
-        rgb[i * 3u + 1u] = static_cast<char>(rgba[i * 4u + 1u]);
-        rgb[i * 3u + 2u] = static_cast<char>(rgba[i * 4u + 2u]);
-    }
-    out.write(rgb.data(), static_cast<std::streamsize>(rgb.size()));
-    return out.good();
-}
-
-[[nodiscard]] bool HasNonUniformRenderedPixels(const std::vector<std::uint8_t>& rgba) noexcept {
-    if (rgba.size() < 4u) {
-        return false;
-    }
-    const std::uint8_t r0 = rgba[0];
-    const std::uint8_t g0 = rgba[1];
-    const std::uint8_t b0 = rgba[2];
-    const std::uint8_t a0 = rgba[3];
-    bool anyNonZero = (r0 | g0 | b0 | a0) != 0u;
-    bool anyDiff = false;
-    for (std::size_t i = 4u; i + 3u < rgba.size(); i += 4u) {
-        if ((rgba[i] | rgba[i + 1u] | rgba[i + 2u] | rgba[i + 3u]) != 0u) {
-            anyNonZero = true;
-        }
-        if (rgba[i] != r0 || rgba[i + 1u] != g0 || rgba[i + 2u] != b0 || rgba[i + 3u] != a0) {
-            anyDiff = true;
-            break;
-        }
-    }
-    return anyNonZero && anyDiff;
+    return aero::app::WriteRgba8PpmFile(path, width, height, rgba);
 }
 
 void AppendUniqueDir(std::vector<std::string>& list, const std::filesystem::path& dir) {
@@ -216,11 +75,17 @@ void AppendUniqueDir(std::vector<std::string>& list, const std::filesystem::path
     }
 }
 
+[[nodiscard]] bool LooksLikeStdlibDir(const std::filesystem::path& p) noexcept {
+    std::error_code ec;
+    return std::filesystem::exists(p / "Aero.UI.Core" / "Core.rs", ec) ||
+           std::filesystem::exists(p / "Aero.UI" / "Core.rs", ec);
+}
+
 [[nodiscard]] std::string ResolveDefaultStdlibDir(const char* argv0) {
 #ifdef AERO_STDLIB_DIR
     {
         const std::filesystem::path p(AERO_STDLIB_DIR);
-        if (std::filesystem::exists(p / "Aero.UI" / "Core.rs")) {
+        if (LooksLikeStdlibDir(p)) {
             return p.lexically_normal().generic_string();
         }
     }
@@ -239,8 +104,7 @@ void AppendUniqueDir(std::vector<std::string>& list, const std::filesystem::path
         }
     }
     for (const auto& candidate : probes) {
-        std::error_code ec;
-        if (std::filesystem::exists(candidate / "Aero.UI" / "Core.rs", ec)) {
+        if (LooksLikeStdlibDir(candidate)) {
             return candidate.lexically_normal().generic_string();
         }
     }

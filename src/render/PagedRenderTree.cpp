@@ -7,7 +7,7 @@
 #include <cstring>
 
 #include "aero/core/StringUtils.hpp"
-#include "aero/core/UIResourceStore.hpp"
+#include "aero/render/UIResourceStore.hpp"
 #include "aero/render/FontAtlas.hpp"
 #include "aero/render/ImageAtlas.hpp"
 
@@ -1301,8 +1301,8 @@ std::uint32_t PagedRenderTree::EnsurePageForAllocation(
     auto pageMatchesState = [&](const CommandPage& pg) noexcept -> bool {
         return (pg.header.vertexCount + neededVertices <= kVerticesPerCommandPage) &&
                SameClipRect(pg.header, clipRect, effectiveClipActive) &&
-               (pg.header.reserved[0] == textureId) &&
-               (pg.header.reserved[1] == desiredBlend);
+               (pg.header.textureId == textureId) &&
+               (pg.header.blendMode == desiredBlend);
     };
 
     if (!pages_.empty() && pageMatchesState(pages_.back())) {
@@ -1351,8 +1351,8 @@ std::uint32_t PagedRenderTree::EnsurePageForAllocation(
     CommandPage newPage{};
     newPage.header.pageIndex = newPageIdx;
     newPage.header.firstNodeId = static_cast<std::uint32_t>(nodes_.size());
-    newPage.header.reserved[0] = textureId;
-    newPage.header.reserved[1] = desiredBlend;
+    newPage.header.textureId = textureId;
+    newPage.header.blendMode = desiredBlend;
     if (effectiveClipActive) {
         newPage.header.clipX = clipRect.x;
         newPage.header.clipY = clipRect.y;

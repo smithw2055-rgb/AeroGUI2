@@ -29,42 +29,10 @@ struct RasterizedPathMaskEntry {
     std::size_t byteSize = 0u;
 };
 
-/// Explicit per-view resource store owning FontAtlas, ImageAtlas,
+/// Explicit per-view render resource store owning FontAtlas, ImageAtlas,
 /// GradientBrushRegistry, MTSDF path cache, and asset search directories.
-/// Zero thread_local global state: pass explicit UIResourceStore& / pointers
-/// across views or bind via UIResourceStore::Default() for host-wide defaults.
 class UIResourceStore final {
 public:
-    using FontAtlasFactoryFn = std::shared_ptr<FontAtlas> (*)(std::uint16_t atlasSize);
-    using FontAtlasClearFn = void (*)(FontAtlas& atlas) noexcept;
-    using ImageAtlasFactoryFn = std::shared_ptr<ImageAtlas> (*)();
-    using ImageAtlasClearFn = void (*)(ImageAtlas& atlas) noexcept;
-    using ImageAtlasRegisterSlotFn = std::uint32_t (*)(
-        ImageAtlas& atlas,
-        std::uint32_t reuseSlotId,
-        std::uint32_t width,
-        std::uint32_t height,
-        std::vector<std::uint8_t>&& rgbaPixels);
-    using ImageAtlasRegisterAlpha8SlotFn = std::uint32_t (*)(
-        ImageAtlas& atlas,
-        std::uint32_t reuseSlotId,
-        std::uint32_t width,
-        std::uint32_t height,
-        std::vector<std::uint8_t>&& alphaPixels);
-    using ImageAtlasReleaseSlotFn = void (*)(ImageAtlas& atlas, std::uint32_t textureId) noexcept;
-    using ImageAtlasPackStaticMaskFn = bool (*)(
-        ImageAtlas& atlas,
-        std::uint64_t maskKey,
-        std::uint32_t width,
-        std::uint32_t height,
-        const std::uint8_t* rgbaPixels,
-        std::size_t byteSize,
-        std::uint32_t& outTexId,
-        float& outAtlasU0,
-        float& outAtlasV0,
-        float& outAtlasU1,
-        float& outAtlasV1);
-
     static constexpr std::uint16_t kDefaultFontAtlasSize = 1024u;
 
     explicit UIResourceStore(std::uint16_t fontAtlasSize = kDefaultFontAtlasSize);
@@ -76,19 +44,6 @@ public:
     UIResourceStore& operator=(UIResourceStore&&) = delete;
 
     [[nodiscard]] static UIResourceStore& Default() noexcept;
-
-    static void RegisterFontAtlasHooks(
-        FontAtlasFactoryFn factoryFn,
-        FontAtlasClearFn clearFn) noexcept;
-
-    static void RegisterImageAtlasHooks(
-        ImageAtlasFactoryFn factoryFn,
-        ImageAtlasClearFn clearFn) noexcept;
-    static void RegisterImageAtlasSlotHook(
-        ImageAtlasRegisterSlotFn registerSlotFn,
-        ImageAtlasReleaseSlotFn releaseSlotFn = nullptr,
-        ImageAtlasPackStaticMaskFn packStaticMaskFn = nullptr,
-        ImageAtlasRegisterAlpha8SlotFn registerAlpha8SlotFn = nullptr) noexcept;
 
     [[nodiscard]] FontAtlas& Fonts();
     [[nodiscard]] const FontAtlas& Fonts() const;

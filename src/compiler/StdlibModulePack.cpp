@@ -207,10 +207,8 @@ template <std::size_t N>
     return std::binary_search(arr.begin(), arr.end(), token);
 }
 
-constexpr std::array<std::string_view, 3> kRuntimeXamlIdentTokens = {
-    "CompiledXamlCatalog",
+constexpr std::array<std::string_view, 1> kRuntimeXamlIdentTokens = {
     "XamlReader",
-    "__AeroCompiledXamlCatalogInit",
 };
 static_assert(IsStrictlySortedTokens(kRuntimeXamlIdentTokens));
 
@@ -782,8 +780,10 @@ std::uint32_t InferRequiredStdlibPackages(const AeroV3CompileInput& input) noexc
     if ((input.stdlibPackages & AeroStdlibPkg_GameHud) != 0u) {
         mask |= AeroStdlibPkg_GameHud;
     }
-    if (!input.catalogXamlSources.empty()) {
-        mask |= AeroStdlibPkg_Controls | AeroStdlibPkg_RuntimeXaml;
+    for (const auto& sf : input.catalogXamlSources) {
+        if (!sf.xamlContent.empty()) {
+            ScanXamlForPackages(sf.xamlContent, mask);
+        }
     }
     if (!input.xamlContent.empty()) {
         ScanXamlForPackages(input.xamlContent, mask);

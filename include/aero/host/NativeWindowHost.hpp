@@ -268,8 +268,7 @@ private:
     bool win32WindowShown_ = false;
     bool win32InSizeMove_ = false;
     std::chrono::steady_clock::time_point win32LastModalTick_{};
-    struct Win32AudioState;
-    std::unique_ptr<Win32AudioState> win32Audio_;
+    std::unique_ptr<class Win32AudioEngine> win32Audio_;
 #elif defined(__EMSCRIPTEN__)
     std::string emCanvasSelector_;
     int webglContextHandle_ = 0;

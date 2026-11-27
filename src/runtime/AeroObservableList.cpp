@@ -67,7 +67,7 @@ struct PerHeapState {
 
 struct GlobalHookRegistry {
     std::mutex mutex;
-    std::unordered_set<SymbolId> wrapperTypes;
+    std::unordered_map<SymbolId, std::size_t> wrapperTypes;
     std::unordered_map<std::uint64_t, PerHeapState> heaps;
 };
 
@@ -442,19 +442,31 @@ void ReleaseHeapHookUser(ManagedHeap* heap) noexcept {
 
 } // namespace detail
 
-void ObservableListHelper::RegisterWrapperType(SymbolId wrapperTypeId) {
+void ObservableListHelper::RegisterWrapperType(
+    SymbolId wrapperTypeId,
+    std::size_t backingFieldIndex) {
     if (wrapperTypeId == 0) {
         return;
     }
     auto& reg = hookRegistry();
     std::lock_guard<std::mutex> lock(reg.mutex);
-    if (reg.wrapperTypes.insert(wrapperTypeId).second) {
+    const auto [it, inserted] = reg.wrapperTypes.emplace(wrapperTypeId, backingFieldIndex);
+    if (!inserted) {
+        it->second = backingFieldIndex;
+    } else {
         gWrapperTypeBloom.fetch_or(wrapperBloomMask(wrapperTypeId), std::memory_order_release);
         gHasWrapperTypes.store(true, std::memory_order_release);
     }
 }
 
 bool ObservableListHelper::IsWrapperType(SymbolId typeId) noexcept {
+    std::size_t unused = 0u;
+    return TryGetWrapperBackingFieldIndex(typeId, unused);
+}
+
+bool ObservableListHelper::TryGetWrapperBackingFieldIndex(
+    SymbolId typeId,
+    std::size_t& outFieldIndex) noexcept {
     if (typeId == 0 || !gHasWrapperTypes.load(std::memory_order_acquire)) {
         return false;
     }
@@ -464,7 +476,12 @@ bool ObservableListHelper::IsWrapperType(SymbolId typeId) noexcept {
     }
     auto& reg = hookRegistry();
     std::lock_guard<std::mutex> lock(reg.mutex);
-    return isWrapperTypeLocked(reg, typeId);
+    const auto it = reg.wrapperTypes.find(typeId);
+    if (it == reg.wrapperTypes.end()) {
+        return false;
+    }
+    outFieldIndex = it->second;
+    return true;
 }
 
 ObjectRef ObservableListHelper::ResolveBackingArray(
@@ -480,14 +497,15 @@ ObjectRef ObservableListHelper::ResolveBackingArray(
         return ObjectRef{};
     }
     const SymbolId tid = heap.objectTypeIdFast(listOrArrayRef);
-    if (!IsWrapperType(tid)) {
+    std::size_t backingIdx = 0u;
+    if (!TryGetWrapperBackingFieldIndex(tid, backingIdx)) {
         return ObjectRef{};
     }
-    Value field0{};
-    if (!heap.fieldGetInto(listOrArrayRef, 0u, field0)) {
+    Value backingVal{};
+    if (!heap.fieldGetInto(listOrArrayRef, backingIdx, backingVal)) {
         return ObjectRef{};
     }
-    const auto* arrRef = std::get_if<ObjectRef>(&field0);
+    const auto* arrRef = std::get_if<ObjectRef>(&backingVal);
     if (!arrRef || !arrRef->valid() || arrRef->kind != ObjectKind::Array ||
         !heap.isAlive(*arrRef)) {
         return ObjectRef{};

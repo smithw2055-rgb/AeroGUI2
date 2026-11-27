@@ -80,11 +80,12 @@ endif()
 # 1. Foundation (drawing + core + runtime + asset) [NO RTTI, SlimRuntime]
 # ============================================================================
 add_library(aerogui_foundation STATIC
-    src/core/AeroObject.cpp
-    src/core/TypeClass.cpp
-    src/core/UIResourceStore.cpp
+    src/core/ArbcCodec.cpp
+    src/core/ColorParser.cpp
     src/runtime/AeroExecutionDomains.cpp
     src/runtime/AeroObservableList.cpp
+    src/runtime/ScriptBackendFacade.cpp
+    src/asset/AssetUriResolver.cpp
     src/asset/GradientBrush.cpp
     src/asset/MtsdfPathBaker.cpp
 )
@@ -105,7 +106,11 @@ aero_apply_no_rtti_options(aerogui_foundation)
 # 2. Render (atlases + PagedRenderTree + rasterizer + GPU) [NO RTTI]
 # ============================================================================
 add_library(aerogui_render STATIC
+    src/render/UIResourceStore.cpp
+    src/render/TrueTypeFontParser.cpp
     src/render/FontAtlas.cpp
+    src/render/TextShapingBidi.cpp
+    src/render/ImageDecoders.cpp
     src/render/ImageAtlas.cpp
     src/render/RiveRenderer.cpp
     src/render/PagedRenderTree.cpp
@@ -129,10 +134,12 @@ aero_apply_no_rtti_options(aerogui_render)
 add_library(aerogui_visual STATIC
     src/visual/VisualTree.cpp
     src/visual/VisualLayoutSolver.cpp
+    src/visual/SyntaxHighlighter.cpp
     src/visual/DrawingCommandBuffer.cpp
     src/visual/VisualAnimationEngine.cpp
     src/visual/VisualInputRouter.cpp
     src/visual/VisualRenderAdapter.cpp
+    src/visual/NativeXmlDomBridge.cpp
     src/visual/VisualHostBindings.cpp
 )
 add_library(AeroGUI::Visual ALIAS aerogui_visual)
@@ -143,10 +150,11 @@ target_link_libraries(aerogui_visual
 aero_apply_no_rtti_options(aerogui_visual)
 
 # ============================================================================
-# 4. Platform Host (HostDrivers + NativeWindowHost) [NO RTTI]
+# 4. Platform Host (HostDrivers + Win32AudioEngine + NativeWindowHost) [NO RTTI]
 # ============================================================================
 add_library(aerogui_host STATIC
     src/host/HostDrivers.cpp
+    src/host/Win32AudioEngine.cpp
     src/host/NativeWindowHost.cpp
 )
 add_library(AeroGUI::Host ALIAS aerogui_host)
@@ -159,10 +167,6 @@ if(WIN32)
 endif()
 aero_apply_no_rtti_options(aerogui_host)
 
-add_library(aerogui_runtime INTERFACE)
-add_library(AeroGUI::Runtime ALIAS aerogui_runtime)
-target_link_libraries(aerogui_runtime INTERFACE aerogui_host)
-
 # ============================================================================
 # 5. Ahead-of-Time / XAML Compiler (ZERO GUI/render/host/Win32 deps)
 # ============================================================================
@@ -172,7 +176,10 @@ if(AERO_BUILD_COMPILER_TOOLS AND TARGET RealScript::Frontend)
         src/compiler/StdlibDllLoader.cpp
         src/compiler/XmlPullLexer.cpp
         src/compiler/XamlDom.cpp
+        src/compiler/XamlSchemaDef.cpp
         src/compiler/MarkupExtensionParser.cpp
+        src/compiler/XamlResourcePruner.cpp
+        src/compiler/XamlBrushAndStoryboardEmitter.cpp
         src/compiler/XamlToRsEmitter.cpp
         src/compiler/CSharpCompatLowerer.cpp
         src/compiler/MirReachabilityPruner.cpp
@@ -239,6 +246,7 @@ endif()
 # 6. App Runtime (Pure Slim /GR-, zero compiler) & Dev Host (+ Viewer Tool)
 # ============================================================================
 add_library(aerogui_app_runtime STATIC
+    src/app/AppBootstrap.cpp
     src/app/AeroAppHost.cpp
 )
 add_library(AeroGUI::AppRuntime ALIAS aerogui_app_runtime)
@@ -273,10 +281,6 @@ if(TARGET aerogui_app_dev_host)
 else()
     target_link_libraries(aerogui_app INTERFACE aerogui_app_runtime)
 endif()
-
-add_library(aerocore INTERFACE)
-add_library(AeroGUI::Core ALIAS aerocore)
-target_link_libraries(aerocore INTERFACE aerogui_app)
 
 if(NOT EMSCRIPTEN)
     add_executable(aero-viewer
@@ -456,10 +460,8 @@ set(_aero_export_targets
     aerogui_render
     aerogui_visual
     aerogui_host
-    aerogui_runtime
     aerogui_app_runtime
     aerogui_app
-    aerocore
 )
 if(TARGET aerogui_app_dev_host)
     list(APPEND _aero_export_targets aerogui_app_dev_host)

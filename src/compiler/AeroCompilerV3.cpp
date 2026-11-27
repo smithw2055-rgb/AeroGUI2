@@ -21,6 +21,7 @@
 #include "aero/compiler/StdlibDllLoader.hpp"
 #include "aero/compiler/StdlibModulePack.hpp"
 #include "aero/compiler/XamlToRsEmitter.hpp"
+#include "aero/core/ArbcCodec.hpp"
 #include "aero/core/StringUtils.hpp"
 #include "realscript/Version.h"
 #include "realscript/aot_cpp/AotCpp.h"
@@ -505,15 +506,6 @@ void PopulateStdlibDerivedCache(ProcessStdlibCacheEntry& entry) {
     }
 }
 
-[[nodiscard]] bool HasProcessStdlibCacheEntry(
-    const std::string& resolvedRootKey,
-    std::uint64_t stdlibHash,
-    bool enableReactiveMacros) {
-    const StdlibCacheKey key{resolvedRootKey, stdlibHash, enableReactiveMacros};
-    auto& procCache = GetProcessStdlibCache();
-    std::lock_guard<std::mutex> lock(procCache.lookupMutex);
-    return procCache.entries.find(key) != procCache.entries.end();
-}
 
 [[nodiscard]] bool ResolveStdlibCacheForCompile(
     const std::string& resolvedRootKey,
@@ -686,96 +678,14 @@ void AppendUint32Le(std::vector<std::uint8_t>& out, std::uint32_t v) {
 
 [[nodiscard]] std::vector<std::uint8_t> EncodeProgramBundle(
     const std::vector<rs_bc::Module>& modules) {
-    std::vector<std::uint8_t> bytes;
-    bytes.reserve(4096);
-    bytes.push_back('A');
-    bytes.push_back('R');
-    bytes.push_back('B');
-    bytes.push_back('C');
-    AppendUint32Le(bytes, static_cast<std::uint32_t>(modules.size()));
-    for (const auto& mod : modules) {
-        const auto modBytes = rs_bc::encodeModule(mod);
-        AppendUint32Le(bytes, static_cast<std::uint32_t>(modBytes.size()));
-        bytes.insert(bytes.end(), modBytes.begin(), modBytes.end());
-    }
-    return bytes;
+    return EncodeArbcBundle(modules);
 }
 
 [[nodiscard]] bool DecodeProgramBundle(
     const std::uint8_t* data,
     std::size_t size,
     std::vector<rs_bc::Module>& outModules) {
-    outModules.clear();
-    if (!data || size < 8u || std::memcmp(data, "ARBC", 4u) != 0) {
-        return false;
-    }
-    std::size_t pos = 4u;
-    auto readU32 = [&](std::uint32_t& out) -> bool {
-        if (pos + 4u > size) return false;
-        out = static_cast<std::uint32_t>(data[pos]) |
-              (static_cast<std::uint32_t>(data[pos + 1u]) << 8u) |
-              (static_cast<std::uint32_t>(data[pos + 2u]) << 16u) |
-              (static_cast<std::uint32_t>(data[pos + 3u]) << 24u);
-        pos += 4u;
-        return true;
-    };
-
-    std::uint32_t modCount = 0u;
-    if (!readU32(modCount) || modCount > 1024u) {
-        return false;
-    }
-
-    struct ModuleSlice final {
-        std::size_t offset = 0u;
-        std::size_t length = 0u;
-    };
-    std::vector<ModuleSlice> slices;
-    slices.reserve(modCount);
-    for (std::uint32_t i = 0u; i < modCount; ++i) {
-        std::uint32_t modSize = 0u;
-        if (!readU32(modSize) || pos + modSize > size) {
-            return false;
-        }
-        slices.push_back(ModuleSlice{pos, modSize});
-        pos += modSize;
-    }
-    if (pos != size) {
-        return false;
-    }
-
-    outModules.resize(modCount);
-    if (modCount >= 2u && size >= 131072u) {
-        std::vector<std::future<bool>> futures;
-        futures.reserve(modCount);
-        for (std::uint32_t i = 0u; i < modCount; ++i) {
-            const ModuleSlice sl = slices[i];
-            futures.push_back(std::async(std::launch::async, [&, i, sl]() -> bool {
-                rs_diag::DiagnosticBag diag;
-                return rs_bc::decodeModule(data + sl.offset, sl.length, outModules[i], diag) && !diag.hasErrors();
-            }));
-        }
-        bool allOk = true;
-        for (auto& fut : futures) {
-            if (!fut.get()) {
-                allOk = false;
-            }
-        }
-        if (!allOk) {
-            outModules.clear();
-            return false;
-        }
-        return true;
-    }
-
-    for (std::uint32_t i = 0u; i < modCount; ++i) {
-        const ModuleSlice sl = slices[i];
-        rs_diag::DiagnosticBag diag;
-        if (!rs_bc::decodeModule(data + sl.offset, sl.length, outModules[i], diag) || diag.hasErrors()) {
-            outModules.clear();
-            return false;
-        }
-    }
-    return true;
+    return DecodeArbcBundle(data, size, outModules, /*allowSingleModuleFallback=*/false, nullptr);
 }
 
 struct DualHash128 final {
@@ -1173,7 +1083,7 @@ constexpr std::uint32_t kProgramCacheVersion = 12u;
     const std::filesystem::path& cacheDir,
     std::uint64_t h1,
     std::uint64_t h2) {
-    return cacheDir / "programs" / ("prog_" + Hex64(h1) + "_" + Hex64(h2) + ".arbc");
+    return cacheDir / "programs" / ("prog_" + Hex64(h1) + "_" + Hex64(h2) + ".aprg");
 }
 
 [[nodiscard]] bool TryLoadProgramBundleFromDisk(

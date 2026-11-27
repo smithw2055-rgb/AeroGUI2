@@ -3,26 +3,10 @@
 #include <algorithm>
 #include <cctype>
 
+#include "aero/core/StringUtils.hpp"
+
 namespace aero {
 namespace {
-
-void AppendUtf8CodePoint(std::uint32_t cp, std::string& out) {
-    if (cp <= 0x7Fu) {
-        out.push_back(static_cast<char>(cp));
-    } else if (cp <= 0x7FFu) {
-        out.push_back(static_cast<char>(0xC0u | (cp >> 6)));
-        out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
-    } else if (cp <= 0xFFFFu) {
-        out.push_back(static_cast<char>(0xE0u | (cp >> 12)));
-        out.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
-        out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
-    } else if (cp <= 0x10FFFFu) {
-        out.push_back(static_cast<char>(0xF0u | (cp >> 18)));
-        out.push_back(static_cast<char>(0x80u | ((cp >> 12) & 0x3Fu)));
-        out.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
-        out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
-    }
-}
 
 [[nodiscard]] bool IsXmlWhitespace(char ch) noexcept {
     return ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n';
@@ -118,7 +102,7 @@ std::string DecodeXmlEntities(std::string_view raw, std::string* outError) {
                 cp = cp * base + d;
             }
             if (ok && cp > 0u && cp <= 0x10FFFFu) {
-                AppendUtf8CodePoint(cp, result);
+                str::AppendUtf8CodePoint(result, cp);
             } else {
                 if (outError != nullptr && outError->empty()) {
                     *outError = "Invalid numeric XML character reference '&" + std::string(entity) + ";'";
@@ -216,12 +200,16 @@ std::string XmlPullLexer::ResolveNamespace(std::string_view prefix) const {
     return {};
 }
 
-XmlToken XmlPullLexer::MakeError(int line, int col, std::string message) {
+XmlToken XmlPullLexer::MakeError(std::size_t startOffset, int line, int col, std::string message) {
     failed_ = true;
     XmlToken tok;
     tok.kind = XmlTokenKind::Error;
+    tok.startOffset = startOffset;
+    tok.endOffset = pos_;
     tok.line = line;
     tok.column = col;
+    tok.endLine = line_;
+    tok.endColumn = column_;
     tok.text = std::move(message);
     return tok;
 }
@@ -237,8 +225,8 @@ XmlToken XmlPullLexer::Next() {
             }
             return tok;
         }
-        XmlToken textTok = LexText(line_, column_);
-        if (!textTok.text.empty()) {
+        XmlToken textTok = LexText(pos_, line_, column_);
+        if (!textTok.text.empty() || textTok.kind == XmlTokenKind::Error) {
             if (textTok.kind == XmlTokenKind::Text && scopeStack_.empty()) {
                 bool onlyWs = true;
                 for (char ch : textTok.text) {
@@ -257,8 +245,12 @@ XmlToken XmlPullLexer::Next() {
 
     XmlToken eof;
     eof.kind = XmlTokenKind::EndOfFile;
+    eof.startOffset = pos_;
+    eof.endOffset = pos_;
     eof.line = line_;
     eof.column = column_;
+    eof.endLine = line_;
+    eof.endColumn = column_;
     return eof;
 }
 
@@ -276,29 +268,30 @@ std::vector<XmlToken> XmlPullLexer::LexAll() {
 }
 
 XmlToken XmlPullLexer::LexLessThan() {
+    const std::size_t startOffset = pos_;
     const int startLine = line_;
     const int startCol = column_;
     (void)Advance(); // consume '<'
 
     if (StartsWith("!--")) {
-        return LexComment(startLine, startCol);
+        return LexComment(startOffset, startLine, startCol);
     }
     if (StartsWith("![CDATA[")) {
-        return LexCData(startLine, startCol);
+        return LexCData(startOffset, startLine, startCol);
     }
     if (Peek() == '?') {
-        return LexProcessingInstruction(startLine, startCol);
+        return LexProcessingInstruction(startOffset, startLine, startCol);
     }
     if (Peek() == '!') {
-        return LexDoctype(startLine, startCol);
+        return LexDoctype(startOffset, startLine, startCol);
     }
     if (Peek() == '/') {
-        return LexEndElement(startLine, startCol);
+        return LexEndElement(startOffset, startLine, startCol);
     }
-    return LexStartElement(startLine, startCol);
+    return LexStartElement(startOffset, startLine, startCol);
 }
 
-XmlToken XmlPullLexer::LexComment(int startLine, int startCol) {
+XmlToken XmlPullLexer::LexComment(std::size_t startOffset, int startLine, int startCol) {
     pos_ += 3;
     column_ += 3;
     std::string text;
@@ -308,17 +301,21 @@ XmlToken XmlPullLexer::LexComment(int startLine, int startCol) {
             column_ += 3;
             XmlToken tok;
             tok.kind = XmlTokenKind::Comment;
+            tok.startOffset = startOffset;
+            tok.endOffset = pos_;
             tok.line = startLine;
             tok.column = startCol;
+            tok.endLine = line_;
+            tok.endColumn = column_;
             tok.text = std::move(text);
             return tok;
         }
         text.push_back(Advance());
     }
-    return MakeError(startLine, startCol, "Unterminated XML comment '<!--'");
+    return MakeError(startOffset, startLine, startCol, "Unterminated XML comment '<!--'");
 }
 
-XmlToken XmlPullLexer::LexCData(int startLine, int startCol) {
+XmlToken XmlPullLexer::LexCData(std::size_t startOffset, int startLine, int startCol) {
     pos_ += 8;
     column_ += 8;
     std::string text;
@@ -328,17 +325,21 @@ XmlToken XmlPullLexer::LexCData(int startLine, int startCol) {
             column_ += 3;
             XmlToken tok;
             tok.kind = XmlTokenKind::CData;
+            tok.startOffset = startOffset;
+            tok.endOffset = pos_;
             tok.line = startLine;
             tok.column = startCol;
+            tok.endLine = line_;
+            tok.endColumn = column_;
             tok.text = std::move(text);
             return tok;
         }
         text.push_back(Advance());
     }
-    return MakeError(startLine, startCol, "Unterminated XML CDATA section");
+    return MakeError(startOffset, startLine, startCol, "Unterminated XML CDATA section");
 }
 
-XmlToken XmlPullLexer::LexProcessingInstruction(int startLine, int startCol) {
+XmlToken XmlPullLexer::LexProcessingInstruction(std::size_t startOffset, int startLine, int startCol) {
     (void)Advance(); // consume '?'
     std::string target = ReadName();
     SkipWhitespace();
@@ -351,16 +352,20 @@ XmlToken XmlPullLexer::LexProcessingInstruction(int startLine, int startCol) {
             tok.kind = XmlTokenKind::ProcessingInstruction;
             tok.rawName = std::move(target);
             tok.text = std::move(data);
+            tok.startOffset = startOffset;
+            tok.endOffset = pos_;
             tok.line = startLine;
             tok.column = startCol;
+            tok.endLine = line_;
+            tok.endColumn = column_;
             return tok;
         }
         data.push_back(Advance());
     }
-    return MakeError(startLine, startCol, "Unterminated XML processing instruction '<?'");
+    return MakeError(startOffset, startLine, startCol, "Unterminated XML processing instruction '<?'");
 }
 
-XmlToken XmlPullLexer::LexDoctype(int startLine, int startCol) {
+XmlToken XmlPullLexer::LexDoctype(std::size_t startOffset, int startLine, int startCol) {
     (void)Advance(); // consume '!'
     int depth = 1;
     char quote = '\0';
@@ -381,25 +386,30 @@ XmlToken XmlPullLexer::LexDoctype(int startLine, int startCol) {
         }
     }
     if (depth > 0) {
-        return MakeError(startLine, startCol, "Unterminated XML <!DOCTYPE> declaration");
+        return MakeError(startOffset, startLine, startCol, "Unterminated XML <!DOCTYPE> declaration");
     }
     XmlToken tok;
     tok.kind = XmlTokenKind::ProcessingInstruction;
     tok.rawName = "!DOCTYPE";
+    tok.startOffset = startOffset;
+    tok.endOffset = pos_;
     tok.line = startLine;
     tok.column = startCol;
+    tok.endLine = line_;
+    tok.endColumn = column_;
     return tok;
 }
 
-XmlToken XmlPullLexer::LexEndElement(int startLine, int startCol) {
+XmlToken XmlPullLexer::LexEndElement(std::size_t startOffset, int startLine, int startCol) {
     (void)Advance(); // consume '/'
+    SkipWhitespace();
     const std::string rawName = ReadName();
     if (rawName.empty()) {
-        return MakeError(startLine, startCol, "Expected element name after '</'");
+        return MakeError(startOffset, startLine, startCol, "Expected element name after '</'");
     }
     SkipWhitespace();
     if (AtEnd() || Peek() != '>') {
-        return MakeError(line_, column_, "Expected '>' after closing element '</" + rawName + "'");
+        return MakeError(startOffset, line_, column_, "Expected '>' after closing element '</" + rawName + "'");
     }
     (void)Advance();
 
@@ -408,14 +418,19 @@ XmlToken XmlPullLexer::LexEndElement(int startLine, int startCol) {
     tok.rawName = rawName;
     SplitQualifiedName(rawName, tok.prefix, tok.localName);
     tok.namespaceUri = ResolveNamespace(tok.prefix);
+    tok.startOffset = startOffset;
+    tok.endOffset = pos_;
     tok.line = startLine;
     tok.column = startCol;
+    tok.endLine = line_;
+    tok.endColumn = column_;
 
     if (scopeStack_.empty()) {
-        return MakeError(startLine, startCol, "Unexpected closing element '</" + rawName + ">'");
+        return MakeError(startOffset, startLine, startCol, "Unexpected closing element '</" + rawName + ">'");
     }
     if (scopeStack_.back().rawName != rawName) {
         return MakeError(
+            startOffset,
             startLine,
             startCol,
             "Mismatched closing element '</" + rawName + ">', expected '</" + scopeStack_.back().rawName + ">'");
@@ -424,55 +439,80 @@ XmlToken XmlPullLexer::LexEndElement(int startLine, int startCol) {
     return tok;
 }
 
-XmlToken XmlPullLexer::LexStartElement(int startLine, int startCol) {
+XmlToken XmlPullLexer::LexStartElement(std::size_t startOffset, int startLine, int startCol) {
     const std::string rawName = ReadName();
     if (rawName.empty()) {
-        return MakeError(startLine, startCol, "Expected element name after '<'");
+        return MakeError(startOffset, startLine, startCol, "Expected element name after '<'");
     }
 
     ElementFrame frame;
     frame.rawName = rawName;
 
     std::vector<XmlAttribute> attrs;
+    std::size_t openTagAttrInsertOffset = pos_;
     for (;;) {
+        const std::size_t triviaStart = pos_;
         SkipWhitespace();
         if (AtEnd()) {
-            return MakeError(startLine, startCol, "Unterminated start tag '<" + rawName + "'");
+            return MakeError(startOffset, startLine, startCol, "Unterminated start tag '<" + rawName + "'");
         }
-        if (StartsWith("/>") || Peek() == '>') {
+        if (StartsWith("/>")) {
+            openTagAttrInsertOffset = triviaStart;
+            break;
+        }
+        if (Peek() == '>') {
+            openTagAttrInsertOffset = pos_;
             break;
         }
 
+        const std::size_t attrStartOffset = pos_;
         const int attrLine = line_;
         const int attrCol = column_;
         const std::string attrRawName = ReadName();
         if (attrRawName.empty()) {
-            return MakeError(attrLine, attrCol, "Expected attribute name inside '<" + rawName + "'");
+            return MakeError(attrStartOffset, attrLine, attrCol, "Expected attribute name inside '<" + rawName + "'");
         }
+        const std::size_t nameEndOffset = pos_;
+        const int nameEndLine = line_;
+        const int nameEndCol = column_;
+
         SkipWhitespace();
         if (AtEnd() || Peek() != '=') {
-            return MakeError(line_, column_, "Expected '=' after attribute '" + attrRawName + "'");
+            return MakeError(attrStartOffset, line_, column_, "Expected '=' after attribute '" + attrRawName + "'");
         }
         (void)Advance(); // consume '='
         SkipWhitespace();
 
         if (AtEnd() || (Peek() != '"' && Peek() != '\'')) {
-            return MakeError(line_, column_, "Expected quoted value for attribute '" + attrRawName + "'");
+            return MakeError(attrStartOffset, line_, column_, "Expected quoted value for attribute '" + attrRawName + "'");
         }
         const char quote = Advance();
+        const std::size_t valInnerStartOffset = pos_;
+        const int valStartLine = line_;
+        const int valStartCol = column_;
+
         std::string rawValue;
         bool closed = false;
+        std::size_t valInnerEndOffset = pos_;
+        int valEndLine = line_;
+        int valEndCol = column_;
         while (!AtEnd()) {
-            const char ch = Advance();
-            if (ch == quote) {
+            if (Peek() == quote) {
+                valInnerEndOffset = pos_;
+                valEndLine = line_;
+                valEndCol = column_;
+                (void)Advance();
                 closed = true;
                 break;
             }
-            rawValue.push_back(ch);
+            rawValue.push_back(Advance());
         }
         if (!closed) {
-            return MakeError(attrLine, attrCol, "Unterminated quoted value for attribute '" + attrRawName + "'");
+            return MakeError(attrStartOffset, attrLine, attrCol, "Unterminated quoted value for attribute '" + attrRawName + "'");
         }
+        const std::size_t attrEndOffset = pos_;
+        const int attrEndLine = line_;
+        const int attrEndCol = column_;
 
         std::string entityErr;
         XmlAttribute attr;
@@ -481,9 +521,24 @@ XmlToken XmlPullLexer::LexStartElement(int startLine, int startCol) {
         attr.value = DecodeXmlEntities(rawValue, &entityErr);
         attr.line = attrLine;
         attr.column = attrCol;
+        attr.nameEndLine = nameEndLine;
+        attr.nameEndColumn = nameEndCol;
+        attr.valueStartLine = valStartLine;
+        attr.valueStartColumn = valStartCol;
+        attr.valueEndLine = valEndLine;
+        attr.valueEndColumn = valEndCol;
+        attr.endLine = attrEndLine;
+        attr.endColumn = attrEndCol;
+        attr.leadingTriviaOffset = triviaStart;
+        attr.startOffset = attrStartOffset;
+        attr.nameEndOffset = nameEndOffset;
+        attr.valueInnerStartOffset = valInnerStartOffset;
+        attr.valueInnerEndOffset = valInnerEndOffset;
+        attr.endOffset = attrEndOffset;
+        attr.quoteChar = quote;
 
         if (!entityErr.empty()) {
-            return MakeError(attrLine, attrCol, entityErr);
+            return MakeError(attrStartOffset, attrLine, attrCol, entityErr);
         }
 
         if (attr.rawName == "xmlns") {
@@ -505,7 +560,7 @@ XmlToken XmlPullLexer::LexStartElement(int startLine, int startCol) {
     } else if (Peek() == '>') {
         (void)Advance();
     } else {
-        return MakeError(startLine, startCol, "Expected '>' closing '<" + rawName + "'");
+        return MakeError(startOffset, startLine, startCol, "Expected '>' closing '<" + rawName + "'");
     }
 
     scopeStack_.push_back(std::move(frame));
@@ -518,6 +573,11 @@ XmlToken XmlPullLexer::LexStartElement(int startLine, int startCol) {
     tok.isEmptyElement = isEmpty;
     tok.line = startLine;
     tok.column = startCol;
+    tok.endLine = line_;
+    tok.endColumn = column_;
+    tok.startOffset = startOffset;
+    tok.endOffset = pos_;
+    tok.openTagAttrInsertOffset = openTagAttrInsertOffset;
 
     for (auto& attr : attrs) {
         if (!attr.isXmlns && !attr.prefix.empty()) {
@@ -532,7 +592,7 @@ XmlToken XmlPullLexer::LexStartElement(int startLine, int startCol) {
     return tok;
 }
 
-XmlToken XmlPullLexer::LexText(int startLine, int startCol) {
+XmlToken XmlPullLexer::LexText(std::size_t startOffset, int startLine, int startCol) {
     std::string raw;
     while (!AtEnd() && Peek() != '<') {
         raw.push_back(Advance());
@@ -541,13 +601,17 @@ XmlToken XmlPullLexer::LexText(int startLine, int startCol) {
     std::string entityErr;
     std::string decoded = DecodeXmlEntities(raw, &entityErr);
     if (!entityErr.empty()) {
-        return MakeError(startLine, startCol, entityErr);
+        return MakeError(startOffset, startLine, startCol, entityErr);
     }
 
     XmlToken tok;
     tok.kind = XmlTokenKind::Text;
+    tok.startOffset = startOffset;
+    tok.endOffset = pos_;
     tok.line = startLine;
     tok.column = startCol;
+    tok.endLine = line_;
+    tok.endColumn = column_;
     tok.text = std::move(decoded);
     return tok;
 }

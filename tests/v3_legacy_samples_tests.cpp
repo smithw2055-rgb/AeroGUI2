@@ -1,25 +1,14 @@
-#include "aero/app/AeroAppHost.hpp"
+#define AERO_TEST_WITH_APP_HOST 1
+#include "common/AeroTestHarness.hpp"
 #include "aero/asset/GradientBrush.hpp"
 #include "aero/compiler/AeroCompilerV3.hpp"
 #include "aero/core/RsAliases.hpp"
-#include "aero/core/UIResourceStore.hpp"
+#include "aero/render/UIResourceStore.hpp"
 #include "aero/render/ZeroCopyGpuStream.hpp"
 
-#include <algorithm>
 #include <array>
 #include <chrono>
-#include <cmath>
-#include <cstdint>
-#include <cstdlib>
-#include <filesystem>
-#include <fstream>
 #include <iomanip>
-#include <iostream>
-#include <sstream>
-#include <string>
-#include <string_view>
-#include <unordered_set>
-#include <vector>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -67,24 +56,31 @@ void ConfigureStdlibForTest(
 
 void Require(bool cond, std::string_view msg) {
     if (!cond) {
-        std::cerr << "[FAIL] " << msg << "\n";
-        ++gFailureCount;
+        aero::test::ReportFailure(gFailureCount, msg);
     }
 }
 
-[[nodiscard]] std::string ReadFileText(const fs::path& path) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in.is_open()) {
-        return {};
-    }
-    std::ostringstream ss;
-    ss << in.rdbuf();
-    return ss.str();
-}
+using aero::test::ReadFileText;
+using aero::test::NormalizeSlash;
+using aero::test::ImageMetrics;
+using aero::test::ComputeExactImageMetrics;
+using aero::test::CountChangedPixels;
+using aero::test::NodeViewportBounds;
+using aero::test::ReadIntMember;
+using aero::test::ReadBoolMember;
+using aero::test::ReadFloatMember;
+using aero::test::ReadStringMember;
+using aero::test::ReadObjectMember;
+using aero::test::ReadListCountMember;
+using aero::test::TryReadNodeTypeName;
+using aero::test::FindDescendantByOwnerName;
+using aero::test::FindDescendantByTypeName;
+using aero::test::CollectVisualNodesByOwnerName;
+using aero::test::CollectDescendantsByTypeName;
+using aero::test::CollectSubtreeText;
 
-[[nodiscard]] std::string NormalizeSlash(std::string s) {
-    std::replace(s.begin(), s.end(), '\\', '/');
-    return s;
+[[nodiscard]] std::uint32_t PackRgba(std::uint8_t r, std::uint8_t g, std::uint8_t b, std::uint8_t a) noexcept {
+    return aero::test::PackRgbaBigEndian(r, g, b, a);
 }
 
 [[nodiscard]] std::string RelativeToSamplesDir(const std::string& pathStr) {
@@ -104,19 +100,6 @@ void Require(bool cond, std::string_view msg) {
         }
     }
     return false;
-}
-
-struct ImageMetrics {
-    std::size_t distinctColors = 0u;
-    double nonBlankPercent = 0.0;
-    std::uint64_t fnv1a64 = 0u;
-};
-
-[[nodiscard]] std::uint32_t PackRgba(std::uint8_t r, std::uint8_t g, std::uint8_t b, std::uint8_t a) noexcept {
-    return (static_cast<std::uint32_t>(r) << 24) |
-           (static_cast<std::uint32_t>(g) << 16) |
-           (static_cast<std::uint32_t>(b) << 8) |
-           static_cast<std::uint32_t>(a);
 }
 
 [[nodiscard]] std::uint32_t QuantizedClearColorRgba(const aero::Color& clearColor) {
@@ -145,203 +128,18 @@ void MaybeDumpScreenshot(
         "Failed to dump screenshot: " + outPath.string());
 }
 
-[[nodiscard]] ImageMetrics ComputeExactImageMetrics(
-    const std::vector<std::uint8_t>& rgba,
-    std::uint32_t clearRgba) {
-    ImageMetrics m{};
-    const std::size_t pixelCount = rgba.size() / 4u;
-    if (pixelCount == 0u) {
-        return m;
-    }
-
-    std::unordered_set<std::uint32_t> uniqueColors;
-    uniqueColors.reserve(1024u);
-    std::size_t nonBlank = 0u;
-
-    std::uint64_t hash = 14695981039346656037ULL;
-    constexpr std::uint64_t kPrime = 1099511628211ULL;
-
-    for (std::size_t i = 0u; i < pixelCount; ++i) {
-        const std::size_t off = i * 4u;
-        const std::uint8_t r = rgba[off];
-        const std::uint8_t g = rgba[off + 1u];
-        const std::uint8_t b = rgba[off + 2u];
-        const std::uint8_t a = rgba[off + 3u];
-        const std::uint32_t packed = PackRgba(r, g, b, a);
-        uniqueColors.insert(packed);
-        if (packed != clearRgba) {
-            ++nonBlank;
-        }
-        hash ^= r; hash *= kPrime;
-        hash ^= g; hash *= kPrime;
-        hash ^= b; hash *= kPrime;
-        hash ^= a; hash *= kPrime;
-    }
-
-    m.distinctColors = uniqueColors.size();
-    m.nonBlankPercent = (100.0 * static_cast<double>(nonBlank)) / static_cast<double>(pixelCount);
-    m.fnv1a64 = hash;
-    return m;
-}
-
-[[nodiscard]] std::size_t CountChangedPixels(
-    const std::vector<std::uint8_t>& a,
-    const std::vector<std::uint8_t>& b) {
-    if (a.size() != b.size()) {
-        return a.size() / 4u;
-    }
-    std::size_t diffPixels = 0u;
-    for (std::size_t i = 0u; i + 3u < a.size(); i += 4u) {
-        const int dr = std::abs(static_cast<int>(a[i]) - static_cast<int>(b[i]));
-        const int dg = std::abs(static_cast<int>(a[i + 1u]) - static_cast<int>(b[i + 1u]));
-        const int db = std::abs(static_cast<int>(a[i + 2u]) - static_cast<int>(b[i + 2u]));
-        const int da = std::abs(static_cast<int>(a[i + 3u]) - static_cast<int>(b[i + 3u]));
-        if (dr + dg + db + da > 6) {
-            ++diffPixels;
-        }
-    }
-    return diffPixels;
-}
-
 [[nodiscard]] bool RequireNodeCenter(
     const aero::AeroAppHost& host,
     std::string_view name,
     float& outCx,
     float& outCy,
     aero::VisualNodeId* outId = nullptr) {
-    const aero::VisualNodeId id = host.FindVisualByOwnerName(name);
-    if (!id.IsValid()) {
-        Require(false, "Expected named VisualNode '" + std::string(name) + "' not found");
+    std::string err;
+    if (!aero::test::ResolveNodeCenter(host, name, outCx, outCy, outId, nullptr, &err)) {
+        Require(false, err);
         return false;
     }
-    const aero::VisualNode* node = host.World().GetNode(id);
-    if (!node) {
-        Require(false, "Named VisualNode '" + std::string(name) + "' resolved to null node");
-        return false;
-    }
-    const aero::Rect r = node->layout.layoutRect;
-    if (r.width <= 1.0f || r.height <= 1.0f) {
-        Require(false, "Named VisualNode '" + std::string(name) + "' has degenerate layoutRect (" +
-            std::to_string(r.width) + "x" + std::to_string(r.height) + ")");
-        return false;
-    }
-    if (outId) {
-        *outId = id;
-    }
-    const aero::Point localCenter{r.x + r.width * 0.5f, r.y + r.height * 0.5f};
-    const aero::Point vpCenter = node->layout.hasPerspective3D
-        ? node->WorldMatrix3D().ProjectPoint2D(localCenter)
-        : node->layout.worldTransform.TransformPoint(localCenter);
-    outCx = vpCenter.x;
-    outCy = vpCenter.y;
     return true;
-}
-
-[[nodiscard]] bool ReadIntMember(
-    const aero::AeroAppHost& host,
-    aero::ObjectRef obj,
-    std::string_view path,
-    std::int64_t& outVal) {
-    aero::UnifiedValue v{};
-    if (!host.ReadScriptMember(obj, path, v)) {
-        return false;
-    }
-    return v.tryGetInt64(outVal);
-}
-
-[[nodiscard]] bool ReadBoolMember(
-    const aero::AeroAppHost& host,
-    aero::ObjectRef obj,
-    std::string_view path,
-    bool& outVal) {
-    aero::UnifiedValue v{};
-    if (!host.ReadScriptMember(obj, path, v)) {
-        return false;
-    }
-    return v.tryGetBool(outVal);
-}
-
-[[nodiscard]] bool ReadFloatMember(
-    const aero::AeroAppHost& host,
-    aero::ObjectRef obj,
-    std::string_view path,
-    float& outVal) {
-    aero::UnifiedValue v{};
-    if (!host.ReadScriptMember(obj, path, v)) {
-        return false;
-    }
-    return v.tryGetFloat(outVal);
-}
-
-[[nodiscard]] bool ReadStringMember(
-    const aero::AeroAppHost& host,
-    aero::ObjectRef obj,
-    std::string_view path,
-    std::string& outVal) {
-    aero::UnifiedValue v{};
-    if (!host.ReadScriptMember(obj, path, v)) {
-        return false;
-    }
-    if (const auto* sv = std::get_if<aero::rs_rt::StringValue>(&v)) {
-        outVal = sv->str();
-        return true;
-    }
-    if (const auto* ref = std::get_if<aero::rs_rt::ObjectRef>(&v);
-        ref && ref->valid() && ref->kind == aero::rs_rt::ObjectKind::String) {
-        if (const auto opt = host.Domains().stringViewAcrossDomains(*ref)) {
-            outVal.assign(opt->data(), opt->size());
-            return true;
-        }
-    }
-    return false;
-}
-
-[[nodiscard]] bool ReadObjectMember(
-    const aero::AeroAppHost& host,
-    aero::ObjectRef obj,
-    std::string_view path,
-    aero::ObjectRef& outRef) {
-    aero::UnifiedValue v{};
-    if (!host.ReadScriptMember(obj, path, v)) {
-        return false;
-    }
-    if (const auto* ref = std::get_if<aero::rs_rt::ObjectRef>(&v); ref && ref->valid()) {
-        outRef = *ref;
-        return true;
-    }
-    return false;
-}
-
-[[nodiscard]] bool ReadListCountMember(
-    aero::AeroAppHost& host,
-    aero::ObjectRef obj,
-    std::string_view listPath,
-    std::int64_t& outCount) {
-    aero::ObjectRef listRef{};
-    if (!ReadObjectMember(host, obj, listPath, listRef)) {
-        return false;
-    }
-    if (listRef.kind == aero::rs_rt::ObjectKind::Array) {
-        if (const auto len = host.Domains().uiHeap().arrayLength(listRef)) {
-            outCount = static_cast<std::int64_t>(*len);
-            return true;
-        }
-    }
-    aero::UnifiedValue arrVal{};
-    if (host.ReadScriptMember(listRef, "_items", arrVal)) {
-        if (const auto* arrRef = std::get_if<aero::rs_rt::ObjectRef>(&arrVal);
-            arrRef && arrRef->valid() && arrRef->kind == aero::rs_rt::ObjectKind::Array) {
-            if (const auto len = host.Domains().uiHeap().arrayLength(*arrRef)) {
-                outCount = static_cast<std::int64_t>(*len);
-                return true;
-            }
-        }
-    }
-    aero::UnifiedValue res{};
-    if (host.InvokeScriptMethod(listRef, "Count", {}, &res)) {
-        return res.tryGetInt64(outCount);
-    }
-    return false;
 }
 
 [[nodiscard]] bool BuildDiscoveredSample(
@@ -896,29 +694,6 @@ void TestGalleryStandaloneSubPages(std::uint32_t clearRgba) {
     }
 }
 
-[[nodiscard]] aero::VisualNodeId FindDescendantByOwnerName(
-    aero::AeroAppHost& host,
-    aero::VisualNodeId rootId,
-    std::string_view ownerName) {
-    const aero::VisualWorld& world = host.World();
-    std::vector<aero::VisualNodeId> q{rootId};
-    for (std::size_t i = 0u; i < q.size(); ++i) {
-        const aero::VisualNode* n = world.GetNode(q[i]);
-        if (!n) { continue; }
-        std::string name;
-        if (q[i] != rootId &&
-            n->hasScriptOwner &&
-            n->scriptOwner.valid() &&
-            ReadStringMember(host, n->scriptOwner, "Name", name) &&
-            name == ownerName) {
-            return q[i];
-        }
-        for (aero::VisualNodeId cid : n->children) {
-            q.push_back(cid);
-        }
-    }
-    return aero::VisualNodeId{};
-}
 
 void TestInteractiveButtons(aero::rs_comp::CompilerSession& session) {
     std::cout << "[Interactive] Buttons...\n";
@@ -1149,28 +924,6 @@ void TestInteractiveTicTacToe(aero::rs_comp::CompilerSession& session) {
     Require(CountChangedPixels(frame0, frame1) > 0u, "TicTacToe visuals should change after move");
 }
 
-[[nodiscard]] bool TryReadNodeTypeName(
-    aero::AeroAppHost& host,
-    const aero::VisualNode* n,
-    std::string& outTypeName);
-[[nodiscard]] aero::VisualNodeId FindDescendantByTypeName(
-    aero::AeroAppHost& host,
-    aero::VisualNodeId rootId,
-    std::string_view typeName);
-[[nodiscard]] aero::Rect NodeViewportBounds(const aero::VisualNode& node) noexcept;
-void CollectVisualNodesByOwnerName(
-    const aero::AeroAppHost& host,
-    std::string_view ownerName,
-    std::vector<aero::VisualNodeId>& outIds);
-void CollectDescendantsByTypeName(
-    aero::AeroAppHost& host,
-    aero::VisualNodeId rootId,
-    std::string_view typeName,
-    std::vector<aero::VisualNodeId>& outIds);
-void CollectSubtreeText(
-    const aero::VisualWorld& world,
-    aero::VisualNodeId rootId,
-    std::string& outJoined);
 
 void TestInteractiveInventory(aero::rs_comp::CompilerSession& session) {
     std::cout << "[Interactive] Inventory...\n";
@@ -1993,80 +1746,6 @@ void TestInteractiveCustomControlAndTheme(aero::rs_comp::CompilerSession& sessio
     }
 }
 
-void CollectVisualNodesByOwnerName(
-    const aero::AeroAppHost& host,
-    std::string_view ownerName,
-    std::vector<aero::VisualNodeId>& outIds) {
-    outIds.clear();
-    const aero::VisualWorld& world = host.World();
-    const std::size_t slots = world.ArenaSlotCount();
-    for (std::size_t s = 0u; s < slots; ++s) {
-        const aero::VisualNode* n = world.NodeAtSlot(s);
-        if (!n || !n->hasScriptOwner || !n->scriptOwner.valid()) {
-            continue;
-        }
-        std::string name;
-        if (ReadStringMember(host, n->scriptOwner, "Name", name) && name == ownerName) {
-            outIds.push_back(n->id);
-        }
-    }
-}
-
-[[nodiscard]] bool TryReadNodeTypeName(
-    aero::AeroAppHost& host,
-    const aero::VisualNode* n,
-    std::string& outTypeName) {
-    if (!n || !n->hasScriptOwner || !n->scriptOwner.valid()) {
-        return false;
-    }
-    aero::UnifiedValue res{};
-    if (!host.InvokeScriptMethod(n->scriptOwner, "GetTypeName", {}, &res)) {
-        return false;
-    }
-    if (const auto* sv = std::get_if<aero::rs_rt::StringValue>(&res)) {
-        outTypeName = sv->str();
-        return true;
-    }
-    if (const auto* ref = std::get_if<aero::rs_rt::ObjectRef>(&res);
-        ref && ref->valid() && ref->kind == aero::rs_rt::ObjectKind::String) {
-        if (const auto opt = host.Domains().stringViewAcrossDomains(*ref)) {
-            outTypeName.assign(opt->data(), opt->size());
-            return true;
-        }
-    }
-    return false;
-}
-
-[[nodiscard]] aero::VisualNodeId FindDescendantByTypeName(
-    aero::AeroAppHost& host,
-    aero::VisualNodeId rootId,
-    std::string_view typeName) {
-    const aero::VisualWorld& world = host.World();
-    std::vector<aero::VisualNodeId> q{rootId};
-    for (std::size_t i = 0u; i < q.size(); ++i) {
-        const aero::VisualNode* n = world.GetNode(q[i]);
-        if (!n) { continue; }
-        std::string tn;
-        if (q[i] != rootId && TryReadNodeTypeName(host, n, tn) && tn == typeName) {
-            return q[i];
-        }
-        for (aero::VisualNodeId cid : n->children) {
-            q.push_back(cid);
-        }
-    }
-    return aero::VisualNodeId{};
-}
-
-[[nodiscard]] aero::Rect NodeViewportBounds(const aero::VisualNode& node) noexcept {
-    aero::Rect r = node.layout.layoutRect;
-    if (node.layout.hasPerspective3D) {
-        return node.WorldMatrix3D().TransformRectBounds(r);
-    }
-    if (!node.layout.worldTransform.IsIdentity()) {
-        return node.layout.worldTransform.TransformRectBounds(r);
-    }
-    return r;
-}
 
 void TestInteractiveScoreboard(aero::rs_comp::CompilerSession&) {
     std::cout << "[Interactive] Scoreboard...\n";
@@ -2457,45 +2136,6 @@ void TestInteractiveScoreboard(aero::rs_comp::CompilerSession&) {
     }
 }
 
-void CollectDescendantsByTypeName(
-    aero::AeroAppHost& host,
-    aero::VisualNodeId rootId,
-    std::string_view typeName,
-    std::vector<aero::VisualNodeId>& outIds) {
-    outIds.clear();
-    const aero::VisualWorld& world = host.World();
-    std::vector<aero::VisualNodeId> q{rootId};
-    for (std::size_t i = 0u; i < q.size(); ++i) {
-        const aero::VisualNode* n = world.GetNode(q[i]);
-        if (!n) { continue; }
-        std::string tn;
-        if (q[i] != rootId && TryReadNodeTypeName(host, n, tn) && tn == typeName) {
-            outIds.push_back(q[i]);
-        }
-        for (aero::VisualNodeId cid : n->children) {
-            q.push_back(cid);
-        }
-    }
-}
-
-void CollectSubtreeText(
-    const aero::VisualWorld& world,
-    aero::VisualNodeId rootId,
-    std::string& outJoined) {
-    outJoined.clear();
-    std::vector<aero::VisualNodeId> q{rootId};
-    for (std::size_t i = 0u; i < q.size(); ++i) {
-        const aero::VisualNode* n = world.GetNode(q[i]);
-        if (!n) { continue; }
-        if (n->kind == aero::VisualKind::Text && !n->Text().text.empty()) {
-            if (!outJoined.empty()) { outJoined.push_back(' '); }
-            outJoined.append(n->Text().text);
-        }
-        for (aero::VisualNodeId cid : n->children) {
-            q.push_back(cid);
-        }
-    }
-}
 
 void TestInteractiveDataBinding(aero::rs_comp::CompilerSession& session) {
     std::cout << "[Interactive] DataBinding...\n";
@@ -5347,6 +4987,46 @@ void TestRegressionReviewFixes(aero::rs_comp::CompilerSession& session) {
         bool downEnAfter = true;
         Require(ReadBoolMember(host, downBtn->scriptOwner, "IsEnabled", downEnAfter) && !downEnAfter,
             "UserControl StatStr MinRepeatButton must disable DownButton when Value reaches MinValue=3");
+        // Also verify UpButton/DownButton click sync with BarStr & POINTS AVAILABLE MultiBinding on the same session
+        const aero::VisualNodeId upBtnId = FindDescendantByOwnerName(host, statStrId, "UpButton");
+        const aero::VisualNode* upBtn = host.World().GetNode(upBtnId);
+        Require(upBtn != nullptr, "UserControl StatStr UpButton missing");
+        if (upBtn) {
+            auto readPointsAvailableText = [&]() -> std::string {
+                std::vector<aero::VisualNodeId> bfs{host.World().Root()};
+                for (std::size_t bi = 0; bi < bfs.size(); ++bi) {
+                    const aero::VisualNode* bn = host.World().GetNode(bfs[bi]);
+                    if (!bn) { continue; }
+                    if (bn->kind == aero::VisualKind::Text && bn->Text().text == "POINTS AVAILABLE:" && bn->parent.IsValid()) {
+                        const aero::VisualNode* panel = host.World().GetNode(bn->parent);
+                        if (panel) {
+                            for (aero::VisualNodeId ch : panel->children) {
+                                if (ch == bfs[bi]) { continue; }
+                                const aero::VisualNode* sib = host.World().GetNode(ch);
+                                if (sib && sib->kind == aero::VisualKind::Text) {
+                                    return sib->Text().text;
+                                }
+                                std::string joined;
+                                CollectSubtreeText(host.World(), ch, joined);
+                                if (!joined.empty()) { return joined; }
+                            }
+                        }
+                    }
+                    for (aero::VisualNodeId ch : bn->children) { bfs.push_back(ch); }
+                }
+                return {};
+            };
+            const aero::Rect upVp = NodeViewportBounds(*upBtn);
+            host.InjectClick(upVp.x + upVp.width * 0.5f, upVp.y + upVp.height * 0.5f);
+            for (int f = 0; f < 30; ++f) { host.StepFrame(1.0f / 60.0f, f == 29); }
+            float statUp = 0.0f, barUp = 0.0f;
+            (void)ReadFloatMember(host, statStrNode->scriptOwner, "Value", statUp);
+            (void)ReadFloatMember(host, barStrNode->scriptOwner, "Value", barUp);
+            Require(std::fabs(statUp - 4.0f) < 0.05f && std::fabs(barUp - 4.0f) < 0.05f,
+                "UserControl UpButton from 3.0 must sync StatStr/BarStr Value to ~4.0");
+            Require(readPointsAvailableText() == "12",
+                "UserControl POINTS AVAILABLE MultiBinding must update after StatStr change");
+        }
         MaybeDumpScreenshot(host, "verify_usercontrol.ppm", 1280u, 720u);
     }
 
@@ -6115,6 +5795,83 @@ void TestRound3All18Fixes(aero::rs_comp::CompilerSession& session) {
                 "Gallery #17 second 'Remove' via shared Style ContextMenu must remove second item (got " +
                 std::to_string(itemsAfter2.size()) + ")");
         }
+
+        // #18 TreeView single-click SelectedItem + SelectedItemChanged flash & double-click expand/collapse
+        {
+            const aero::VisualNodeId cid = openSample("TreeView");
+            const aero::VisualNodeId tree1Id = FindDescendantByOwnerName(host, cid, "Tree1");
+            const aero::VisualNodeId rect1Id = FindDescendantByOwnerName(host, cid, "Rect1");
+            const aero::VisualNode* tree1Node = tree1Id.IsValid() ? host.World().GetNode(tree1Id) : nullptr;
+            Require(tree1Node && tree1Node->hasScriptOwner && rect1Id.IsValid(),
+                "Gallery #18 Tree1 or Rect1 missing");
+
+            std::vector<aero::VisualNodeId> treeItems;
+            CollectDescendantsByTypeName(host, tree1Id, "TreeViewItem", treeItems);
+            aero::VisualNodeId lvl2ItemId{};
+            aero::VisualNodeId lvl2TextId{};
+            for (aero::VisualNodeId tid : treeItems) {
+                std::vector<aero::VisualNodeId> queue{tid};
+                for (std::size_t qi = 0; qi < queue.size(); ++qi) {
+                    const aero::VisualNode* n = host.World().GetNode(queue[qi]);
+                    if (!n) { continue; }
+                    if (queue[qi] != tid && n->hasScriptOwner) {
+                        std::string tn;
+                        if (ReadStringMember(host, n->scriptOwner, "__TypeName", tn) && tn == "TreeViewItem") {
+                            continue;
+                        }
+                    }
+                    if (n->kind == aero::VisualKind::Text && n->Text().text == "Level 2") {
+                        lvl2ItemId = tid;
+                        lvl2TextId = queue[qi];
+                        break;
+                    }
+                    for (aero::VisualNodeId ch : n->children) { queue.push_back(ch); }
+                }
+                if (lvl2ItemId.IsValid()) { break; }
+            }
+            const aero::VisualNode* lvl2ItemNode = lvl2ItemId.IsValid() ? host.World().GetNode(lvl2ItemId) : nullptr;
+            const aero::VisualNode* lvl2TextNode = lvl2TextId.IsValid() ? host.World().GetNode(lvl2TextId) : nullptr;
+            Require(lvl2ItemNode && lvl2ItemNode->hasScriptOwner && lvl2TextNode,
+                "Gallery #18 'Level 2' TreeViewItem or header Text node missing");
+            if (tree1Node && lvl2ItemNode && lvl2TextNode) {
+                const aero::Rect txtVp0 = NodeViewportBounds(*lvl2TextNode);
+                host.InjectClick(txtVp0.x + txtVp0.width * 0.5f, txtVp0.y + txtVp0.height * 0.5f);
+                host.StepFrame(1.0f / 60.0f, false);
+                host.StepFrame(1.0f / 60.0f, true);
+                Require(host.AnimEngine().ActiveTrackCount() >= 1u,
+                    "Gallery #18 TreeView.SelectedItemChanged should start Rect1 flash animation");
+                for (int f = 0; f < 38; ++f) { host.StepFrame(1.0f / 60.0f, f == 37); }
+
+                bool selAfterSingle = false, expAfterSingle = true;
+                Require(ReadBoolMember(host, lvl2ItemNode->scriptOwner, "IsSelected", selAfterSingle) && selAfterSingle,
+                    "Gallery #18 single click should select 'Level 2'");
+                Require(ReadBoolMember(host, lvl2ItemNode->scriptOwner, "IsExpanded", expAfterSingle) && !expAfterSingle,
+                    "Gallery #18 single click on header must NOT expand 'Level 2'");
+
+                aero::ObjectRef selItemRef{};
+                Require(ReadObjectMember(host, tree1Node->scriptOwner, "SelectedItem", selItemRef) &&
+                        selItemRef == lvl2ItemNode->scriptOwner,
+                    "Gallery #18 Tree1.SelectedItem should reference 'Level 2' TreeViewItem");
+
+                const aero::Rect txtVp1 = NodeViewportBounds(*host.World().GetNode(lvl2TextId));
+                host.InjectClick(txtVp1.x + txtVp1.width * 0.5f, txtVp1.y + txtVp1.height * 0.5f);
+                host.StepFrame(0.05f, false);
+                host.InjectClick(txtVp1.x + txtVp1.width * 0.5f, txtVp1.y + txtVp1.height * 0.5f);
+                for (int f = 0; f < 40; ++f) { host.StepFrame(1.0f / 60.0f, f == 39); }
+                bool expAfterDbl1 = false;
+                Require(ReadBoolMember(host, lvl2ItemNode->scriptOwner, "IsExpanded", expAfterDbl1) && expAfterDbl1,
+                    "Gallery #18 double click #1 must expand 'Level 2'");
+
+                const aero::Rect txtVp2 = NodeViewportBounds(*host.World().GetNode(lvl2TextId));
+                host.InjectClick(txtVp2.x + txtVp2.width * 0.5f, txtVp2.y + txtVp2.height * 0.5f);
+                host.StepFrame(0.05f, false);
+                host.InjectClick(txtVp2.x + txtVp2.width * 0.5f, txtVp2.y + txtVp2.height * 0.5f);
+                for (int f = 0; f < 25; ++f) { host.StepFrame(1.0f / 60.0f, f == 24); }
+                bool expAfterDbl2 = true;
+                Require(ReadBoolMember(host, lvl2ItemNode->scriptOwner, "IsExpanded", expAfterDbl2) && !expAfterDbl2,
+                    "Gallery #18 double click #2 must collapse 'Level 2'");
+            }
+        }
     }
 }
 
@@ -6221,222 +5978,6 @@ void TestRound4All6Fixes(aero::rs_comp::CompilerSession& session) {
             std::to_string(initCmdCount) + " cmds, got " +
             std::to_string(resetList ? resetList->commands.size() : 0u) + ")");
         }
-    }
-
-    // B. UserControl: clicking NumericUpDown +/- buttons syncs StatStr.Value, BarStr.Value & Points Available
-    {
-        aero::AeroV3CompileInput ci;
-        aero::AeroAppHostConfig hc;
-        Require(BuildDiscoveredSample(fs::path(AERO_SAMPLES_DIR) / "UserControl", &session, ci, hc, 800u, 600u),
-            "UserControl round4 discover failed");
-        aero::AeroAppHost host(hc);
-        std::string err;
-        const bool loaded = host.CompileAndLoad(ci, &err);
-        Require(loaded, "UserControl round4 load failed: " + err);
-        for (int f = 0; loaded && f < 20; ++f) { host.StepFrame(1.0f / 60.0f, f == 19); }
-
-        const aero::VisualNodeId statStrId = loaded ? host.FindVisualByOwnerName("StatStr") : aero::VisualNodeId{};
-        const aero::VisualNodeId barStrId = loaded ? host.FindVisualByOwnerName("BarStr") : aero::VisualNodeId{};
-        const aero::VisualNodeId upBtnId = statStrId.IsValid() ? FindDescendantByOwnerName(host, statStrId, "UpButton") : aero::VisualNodeId{};
-        const aero::VisualNodeId downBtnId = statStrId.IsValid() ? FindDescendantByOwnerName(host, statStrId, "DownButton") : aero::VisualNodeId{};
-        const aero::VisualNode* statNode = statStrId.IsValid() ? host.World().GetNode(statStrId) : nullptr;
-        const aero::VisualNode* barNode = barStrId.IsValid() ? host.World().GetNode(barStrId) : nullptr;
-        const aero::VisualNode* upNode = upBtnId.IsValid() ? host.World().GetNode(upBtnId) : nullptr;
-        const aero::VisualNode* downNode = downBtnId.IsValid() ? host.World().GetNode(downBtnId) : nullptr;
-        Require(statNode && statNode->hasScriptOwner && barNode && barNode->hasScriptOwner && upNode && downNode,
-            "UserControl round4 StatStr UpButton/DownButton or BarStr missing");
-        if (loaded && statNode && statNode->hasScriptOwner && barNode && barNode->hasScriptOwner && upNode && downNode) {
-            auto readPointsAvailableText = [&]() -> std::string {
-                std::vector<aero::VisualNodeId> bfs{host.World().Root()};
-                for (std::size_t bi = 0; bi < bfs.size(); ++bi) {
-                    const aero::VisualNode* bn = host.World().GetNode(bfs[bi]);
-                    if (!bn) { continue; }
-                    if (bn->kind == aero::VisualKind::Text && bn->Text().text == "POINTS AVAILABLE:" && bn->parent.IsValid()) {
-                        const aero::VisualNode* panel = host.World().GetNode(bn->parent);
-                        if (panel) {
-                            for (aero::VisualNodeId ch : panel->children) {
-                                if (ch == bfs[bi]) { continue; }
-                                const aero::VisualNode* sib = host.World().GetNode(ch);
-                                if (sib && sib->kind == aero::VisualKind::Text) {
-                                    return sib->Text().text;
-                                }
-                                std::string joined;
-                                CollectSubtreeText(host.World(), ch, joined);
-                                if (!joined.empty()) { return joined; }
-                            }
-                        }
-                    }
-                    for (aero::VisualNodeId ch : bn->children) { bfs.push_back(ch); }
-                }
-                return {};
-            };
-
-            float stat0 = 0.0f;
-            float bar0 = 0.0f;
-            (void)ReadFloatMember(host, statNode->scriptOwner, "Value", stat0);
-            (void)ReadFloatMember(host, barNode->scriptOwner, "Value", bar0);
-            Require(std::fabs(stat0 - 10.0f) < 0.05f && std::fabs(bar0 - 10.0f) < 0.05f,
-                "UserControl round4 initial StatStr/BarStr Value expected ~10.0 (got stat=" +
-                std::to_string(stat0) + ", bar=" + std::to_string(bar0) + ")");
-
-            const aero::Rect upVp = NodeViewportBounds(*upNode);
-            host.InjectClick(upVp.x + upVp.width * 0.5f, upVp.y + upVp.height * 0.5f);
-            for (int f = 0; f < 30; ++f) { host.StepFrame(1.0f / 60.0f, f == 29); }
-
-            float stat1 = 0.0f;
-            float bar1 = 0.0f;
-            (void)ReadFloatMember(host, statNode->scriptOwner, "Value", stat1);
-            (void)ReadFloatMember(host, barNode->scriptOwner, "Value", bar1);
-            const std::string ptsText1 = readPointsAvailableText();
-            Require(std::fabs(stat1 - 11.0f) < 0.05f && std::fabs(bar1 - 11.0f) < 0.05f,
-                "UserControl round4 UpButton click must sync StatStr/BarStr Value to ~11.0 (stat=" +
-                std::to_string(stat1) + ", bar=" + std::to_string(bar1) + ")");
-            Require(ptsText1 == "5",
-                "UserControl round4 POINTS AVAILABLE MultiBinding expected '5' after UpButton (got '" + ptsText1 + "')");
-
-            const aero::Rect downVp = NodeViewportBounds(*downNode);
-            host.InjectClick(downVp.x + downVp.width * 0.5f, downVp.y + downVp.height * 0.5f);
-            for (int f = 0; f < 30; ++f) { host.StepFrame(1.0f / 60.0f, f == 29); }
-
-            float stat2 = 0.0f;
-            float bar2 = 0.0f;
-            (void)ReadFloatMember(host, statNode->scriptOwner, "Value", stat2);
-            (void)ReadFloatMember(host, barNode->scriptOwner, "Value", bar2);
-            const std::string ptsText2 = readPointsAvailableText();
-            Require(std::fabs(stat2 - 10.0f) < 0.05f && std::fabs(bar2 - 10.0f) < 0.05f,
-                "UserControl round4 DownButton click must sync StatStr/BarStr Value back to ~10.0 (stat=" +
-                std::to_string(stat2) + ", bar=" + std::to_string(bar2) + ")");
-            Require(ptsText2 == "6",
-                "UserControl round4 POINTS AVAILABLE MultiBinding expected '6' after DownButton (got '" + ptsText2 + "')");
-        }
-    }
-
-    // C. Gallery TreeView: single-click syncs SelectedItem + SelectedItemChanged, double-click expands/collapses
-    {
-        aero::AeroV3CompileInput ci;
-        aero::AeroAppHostConfig hc;
-        Require(BuildDiscoveredSample(fs::path(AERO_SAMPLES_DIR) / "Gallery", &session, ci, hc, 1280u, 800u),
-            "Gallery round4 discover failed");
-        ci.treeShakeStdlib = true;
-        ci.allowStdlibCache = false;
-        aero::AeroAppHost host(hc);
-        std::string err;
-        Require(host.CompileAndLoad(ci, &err), "Gallery round4 load failed: " + err);
-        for (int f = 0; f < 20; ++f) { host.StepFrame(1.0f / 60.0f, f == 19); }
-
-        aero::UnifiedValue ret{};
-        bool ok = false;
-        Require(host.InvokeScriptMethod(
-                    host.RootScriptObject(),
-                    "SelectSampleByName",
-                    {aero::UnifiedValue{std::string_view("TreeView")}},
-                    &ret) &&
-                ret.tryGetBool(ok) && ok,
-            "Gallery round4 SelectSampleByName('TreeView') failed");
-        for (int f = 0; f < 45; ++f) { host.StepFrame(1.0f / 60.0f, f == 44); }
-
-        const aero::VisualNodeId c1 = host.FindVisualByOwnerName("SampleContainer1");
-        const aero::VisualNodeId c2 = host.FindVisualByOwnerName("SampleContainer2");
-        const aero::VisualNode* n1 = c1.IsValid() ? host.World().GetNode(c1) : nullptr;
-        const aero::VisualNode* n2 = c2.IsValid() ? host.World().GetNode(c2) : nullptr;
-        const aero::VisualNodeId cid = (n1 && n1->layout.visibility == aero::Visibility::Visible && !n1->children.empty())
-            ? c1
-            : ((n2 && n2->layout.visibility == aero::Visibility::Visible && !n2->children.empty()) ? c2 : aero::VisualNodeId{});
-        Require(cid.IsValid(), "Gallery round4 active container missing");
-
-        const aero::VisualNodeId tree1Id = FindDescendantByOwnerName(host, cid, "Tree1");
-        const aero::VisualNodeId rect1Id = FindDescendantByOwnerName(host, cid, "Rect1");
-        const aero::VisualNode* tree1Node = tree1Id.IsValid() ? host.World().GetNode(tree1Id) : nullptr;
-        Require(tree1Node && tree1Node->hasScriptOwner && rect1Id.IsValid(),
-            "Gallery round4 Tree1 or Rect1 missing");
-
-        std::vector<aero::VisualNodeId> treeItems;
-        CollectDescendantsByTypeName(host, tree1Id, "TreeViewItem", treeItems);
-        aero::VisualNodeId lvl2ItemId{};
-        aero::VisualNodeId lvl2TextId{};
-        for (aero::VisualNodeId tid : treeItems) {
-            std::vector<aero::VisualNodeId> queue{tid};
-            for (std::size_t qi = 0; qi < queue.size(); ++qi) {
-                const aero::VisualNode* n = host.World().GetNode(queue[qi]);
-                if (!n) { continue; }
-                if (queue[qi] != tid && n->hasScriptOwner) {
-                    std::string tn;
-                    if (ReadStringMember(host, n->scriptOwner, "__TypeName", tn) && tn == "TreeViewItem") {
-                        continue;
-                    }
-                }
-                if (n->kind == aero::VisualKind::Text && n->Text().text == "Level 2") {
-                    lvl2ItemId = tid;
-                    lvl2TextId = queue[qi];
-                    break;
-                }
-                for (aero::VisualNodeId ch : n->children) { queue.push_back(ch); }
-            }
-            if (lvl2ItemId.IsValid()) { break; }
-        }
-        const aero::VisualNode* lvl2ItemNode = lvl2ItemId.IsValid() ? host.World().GetNode(lvl2ItemId) : nullptr;
-        const aero::VisualNode* lvl2TextNode = lvl2TextId.IsValid() ? host.World().GetNode(lvl2TextId) : nullptr;
-        Require(lvl2ItemNode && lvl2ItemNode->hasScriptOwner && lvl2TextNode,
-            "Gallery round4 'Level 2' TreeViewItem or header Text node missing");
-
-        // Single-click Level 2 header -> SelectedItem syncs on right, SelectedItemChanged fires, stays collapsed
-        const aero::Rect txtVp0 = NodeViewportBounds(*lvl2TextNode);
-        host.InjectClick(txtVp0.x + txtVp0.width * 0.5f, txtVp0.y + txtVp0.height * 0.5f);
-        host.StepFrame(1.0f / 60.0f, false);
-        host.StepFrame(1.0f / 60.0f, true);
-        Require(host.AnimEngine().ActiveTrackCount() >= 1u,
-            "Gallery round4 TreeView.SelectedItemChanged should start Rect1 flash animation");
-        for (int f = 0; f < 38; ++f) { host.StepFrame(1.0f / 60.0f, f == 37); }
-
-        bool selAfterSingle = false;
-        bool expAfterSingle = true;
-        Require(ReadBoolMember(host, lvl2ItemNode->scriptOwner, "IsSelected", selAfterSingle) && selAfterSingle,
-            "Gallery round4 single click should select 'Level 2'");
-        Require(ReadBoolMember(host, lvl2ItemNode->scriptOwner, "IsExpanded", expAfterSingle) && !expAfterSingle,
-            "Gallery round4 single click on header must NOT expand 'Level 2'");
-
-        aero::ObjectRef selItemRef{};
-        Require(ReadObjectMember(host, tree1Node->scriptOwner, "SelectedItem", selItemRef) &&
-                selItemRef == lvl2ItemNode->scriptOwner,
-            "Gallery round4 Tree1.SelectedItem should reference 'Level 2' TreeViewItem");
-
-        bool syncedRightLabel = false;
-        if (tree1Node->parent.IsValid()) {
-            std::vector<aero::VisualNodeId> bfs{tree1Node->parent};
-            for (std::size_t bi = 0; bi < bfs.size(); ++bi) {
-                const aero::VisualNodeId cur = bfs[bi];
-                if (cur == tree1Id) { continue; }
-                const aero::VisualNode* cn = host.World().GetNode(cur);
-                if (!cn) { continue; }
-                if (cn->kind == aero::VisualKind::Text && cn->Text().text == "Level 2") {
-                    syncedRightLabel = true;
-                    break;
-                }
-                for (aero::VisualNodeId ch : cn->children) { bfs.push_back(ch); }
-            }
-        }
-        Require(syncedRightLabel,
-            "Gallery round4 right-hand TextBlock bound to Tree1.SelectedItem.Header must sync to 'Level 2'");
-
-        // Double-click #1 -> expands 'Level 2'
-        const aero::Rect txtVp1 = NodeViewportBounds(*host.World().GetNode(lvl2TextId));
-        host.InjectClick(txtVp1.x + txtVp1.width * 0.5f, txtVp1.y + txtVp1.height * 0.5f);
-        host.StepFrame(0.05f, false);
-        host.InjectClick(txtVp1.x + txtVp1.width * 0.5f, txtVp1.y + txtVp1.height * 0.5f);
-        for (int f = 0; f < 40; ++f) { host.StepFrame(1.0f / 60.0f, f == 39); }
-        bool expAfterDbl1 = false;
-        Require(ReadBoolMember(host, lvl2ItemNode->scriptOwner, "IsExpanded", expAfterDbl1) && expAfterDbl1,
-            "Gallery round4 double click #1 must expand 'Level 2'");
-
-        // Double-click #2 -> collapses 'Level 2'
-        const aero::Rect txtVp2 = NodeViewportBounds(*host.World().GetNode(lvl2TextId));
-        host.InjectClick(txtVp2.x + txtVp2.width * 0.5f, txtVp2.y + txtVp2.height * 0.5f);
-        host.StepFrame(0.05f, false);
-        host.InjectClick(txtVp2.x + txtVp2.width * 0.5f, txtVp2.y + txtVp2.height * 0.5f);
-        for (int f = 0; f < 25; ++f) { host.StepFrame(1.0f / 60.0f, f == 24); }
-        bool expAfterDbl2 = true;
-        Require(ReadBoolMember(host, lvl2ItemNode->scriptOwner, "IsExpanded", expAfterDbl2) && !expAfterDbl2,
-            "Gallery round4 double click #2 must collapse 'Level 2'");
     }
 }
 
@@ -6659,59 +6200,36 @@ int main(int argc, char** argv) {
     if (want("bench")) { TestAll23LegacyAnd5V3Samples(clearRgba); }
     if (want("subpages")) { TestGalleryStandaloneSubPages(clearRgba); }
 
-    if (!filters.empty()) {
-        if (want("backgroundblur")) { TestInteractiveBackgroundBlur(sharedSession); }
-        if (want("buttons")) { TestInteractiveButtons(sharedSession); }
-        if (want("customcontrol")) { TestInteractiveCustomControlAndTheme(sharedSession); }
-        if (want("databinding")) { TestInteractiveDataBinding(sharedSession); }
-        if (want("gallery")) { TestInteractiveGallery(sharedSession); }
-        if (want("--only-gallery-subpages") || want("gallerysubpages")) {
-            TestInteractiveGalleryReportedSubPages(sharedSession);
+    const bool runAllInteractive = want("interactive");
+    auto runInteractiveIf = [&](std::string_view key, auto&& fn, std::string_view altKey = {}) {
+        if (runAllInteractive || (!filters.empty() && (want(key) || (!altKey.empty() && want(altKey))))) {
+            fn();
         }
-        if (want("integration")) { TestInteractiveIntegration(sharedSession); }
-        if (want("login")) { TestInteractiveLogin(sharedSession); }
-        if (want("tictactoe")) { TestInteractiveTicTacToe(sharedSession); }
-        if (want("inventory")) { TestInteractiveInventory(sharedSession); }
-        if (want("questlog")) { TestInteractiveQuestLog(sharedSession); }
-        if (want("localization")) { TestInteractiveLocalization(sharedSession); }
-        if (want("menu3d")) { TestInteractiveMenu3D(sharedSession, clearRgba); }
-        if (want("usercontrol")) { TestInteractiveUserControl(sharedSession); }
-        if (want("wpf")) { TestInteractiveWpfQuickStart(sharedSession); }
-        if (want("scoreboard")) { TestInteractiveScoreboard(sharedSession); }
-        if (want("rive")) { TestInteractiveRive(sharedSession); }
-        if (want("customrender")) { TestInteractiveCustomRender(sharedSession); }
-        if (want("brushshaders")) { TestInteractiveBrushShaders(sharedSession); }
-        if (want("reviewfixes")) { TestRegressionReviewFixes(sharedSession); }
-        if (want("round3fixes")) { TestRound3All18Fixes(sharedSession); }
-        if (want("round4fixes")) { TestRound4All6Fixes(sharedSession); }
-        if (want("galleryleak")) { TestGalleryContainerLazyAndMemoryLeak(sharedSession, clearRgba); }
-    }
+    };
 
-    if (want("interactive")) {
-        TestInteractiveBackgroundBlur(sharedSession);
-        TestInteractiveButtons(sharedSession);
-        TestInteractiveDataBinding(sharedSession);
-        TestInteractiveGallery(sharedSession);
-        TestInteractiveGalleryReportedSubPages(sharedSession);
-        TestInteractiveIntegration(sharedSession);
-        TestInteractiveLogin(sharedSession);
-        TestInteractiveTicTacToe(sharedSession);
-        TestInteractiveInventory(sharedSession);
-        TestInteractiveQuestLog(sharedSession);
-        TestInteractiveLocalization(sharedSession);
-        TestInteractiveMenu3D(sharedSession, clearRgba);
-        TestInteractiveUserControl(sharedSession);
-        TestInteractiveWpfQuickStart(sharedSession);
-        TestInteractiveCustomControlAndTheme(sharedSession);
-        TestInteractiveScoreboard(sharedSession);
-        TestInteractiveRive(sharedSession);
-        TestInteractiveCustomRender(sharedSession);
-        TestInteractiveBrushShaders(sharedSession);
-        TestRegressionReviewFixes(sharedSession);
-        TestRound3All18Fixes(sharedSession);
-        TestRound4All6Fixes(sharedSession);
-        TestGalleryContainerLazyAndMemoryLeak(sharedSession, clearRgba);
-    }
+    runInteractiveIf("backgroundblur", [&] { TestInteractiveBackgroundBlur(sharedSession); });
+    runInteractiveIf("buttons", [&] { TestInteractiveButtons(sharedSession); });
+    runInteractiveIf("databinding", [&] { TestInteractiveDataBinding(sharedSession); });
+    runInteractiveIf("gallery", [&] { TestInteractiveGallery(sharedSession); });
+    runInteractiveIf("gallerysubpages", [&] { TestInteractiveGalleryReportedSubPages(sharedSession); }, "--only-gallery-subpages");
+    runInteractiveIf("integration", [&] { TestInteractiveIntegration(sharedSession); });
+    runInteractiveIf("login", [&] { TestInteractiveLogin(sharedSession); });
+    runInteractiveIf("tictactoe", [&] { TestInteractiveTicTacToe(sharedSession); });
+    runInteractiveIf("inventory", [&] { TestInteractiveInventory(sharedSession); });
+    runInteractiveIf("questlog", [&] { TestInteractiveQuestLog(sharedSession); });
+    runInteractiveIf("localization", [&] { TestInteractiveLocalization(sharedSession); });
+    runInteractiveIf("menu3d", [&] { TestInteractiveMenu3D(sharedSession, clearRgba); });
+    runInteractiveIf("usercontrol", [&] { TestInteractiveUserControl(sharedSession); });
+    runInteractiveIf("wpf", [&] { TestInteractiveWpfQuickStart(sharedSession); });
+    runInteractiveIf("customcontrol", [&] { TestInteractiveCustomControlAndTheme(sharedSession); });
+    runInteractiveIf("scoreboard", [&] { TestInteractiveScoreboard(sharedSession); });
+    runInteractiveIf("rive", [&] { TestInteractiveRive(sharedSession); });
+    runInteractiveIf("customrender", [&] { TestInteractiveCustomRender(sharedSession); });
+    runInteractiveIf("brushshaders", [&] { TestInteractiveBrushShaders(sharedSession); });
+    runInteractiveIf("reviewfixes", [&] { TestRegressionReviewFixes(sharedSession); });
+    runInteractiveIf("round3fixes", [&] { TestRound3All18Fixes(sharedSession); });
+    runInteractiveIf("round4fixes", [&] { TestRound4All6Fixes(sharedSession); });
+    runInteractiveIf("galleryleak", [&] { TestGalleryContainerLazyAndMemoryLeak(sharedSession, clearRgba); });
 
     if (gFailureCount != 0) {
         std::cerr << "\nv3_legacy_samples_tests FAILED with " << gFailureCount << " failure(s).\n";

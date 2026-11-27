@@ -1,4 +1,4 @@
-#include "aero/render/ZeroCopyGpuStream.hpp"
+#include "aero/render/SoftwareRasterizer.hpp"
 
 #include <algorithm>
 #include <array>
@@ -21,7 +21,7 @@
 
 #include "aero/asset/GradientBrush.hpp"
 #include "aero/asset/MtsdfPathBaker.hpp"
-#include "aero/core/UIResourceStore.hpp"
+#include "aero/render/UIResourceStore.hpp"
 #include "aero/render/FontAtlas.hpp"
 #include "aero/render/ImageAtlas.hpp"
 
@@ -39,11 +39,31 @@ using aero::render::detail::SafeCeilToInt;
 using aero::render::detail::SafeFloorToInt;
 using aero::render::detail::SpanNeedsEffectPass;
 
-thread_local int gRasterBandX0 = 0;
-thread_local int gRasterBandX1 = 0x3FFFFFFF;
-thread_local int gRasterBandY0 = 0;
-thread_local int gRasterBandY1 = 0x3FFFFFFF;
+struct RasterBandClip {
+    int x0 = 0;
+    int x1 = 0x3FFFFFFF;
+    int y0 = 0;
+    int y1 = 0x3FFFFFFF;
+};
+
+thread_local RasterBandClip gRasterBandClip{};
 thread_local bool gInScanlineBand = false;
+
+struct ScopedRasterBandClip {
+    RasterBandClip prev;
+    ScopedRasterBandClip(int newY0, int newY1) noexcept : prev(gRasterBandClip) {
+        gRasterBandClip.y0 = newY0;
+        gRasterBandClip.y1 = newY1;
+    }
+    ScopedRasterBandClip(int newX0, int newX1, int newY0, int newY1) noexcept : prev(gRasterBandClip) {
+        gRasterBandClip = RasterBandClip{newX0, newX1, newY0, newY1};
+    }
+    ~ScopedRasterBandClip() noexcept {
+        gRasterBandClip = prev;
+    }
+    ScopedRasterBandClip(const ScopedRasterBandClip&) = delete;
+    ScopedRasterBandClip& operator=(const ScopedRasterBandClip&) = delete;
+};
 
 class ScanlineWorkerPool {
 public:
@@ -1558,10 +1578,10 @@ void RasterizeSingleNode(
         clipMaxX = std::min(clipMaxX, optPremulLayer->originX + optPremulLayer->width);
         clipMaxY = std::min(clipMaxY, optPremulLayer->originY + optPremulLayer->height);
     }
-    const int effClipMinX = optPremulLayer ? clipMinX : std::max(clipMinX, gRasterBandX0);
-    const int effClipMaxX = optPremulLayer ? clipMaxX : std::min(clipMaxX, gRasterBandX1);
-    const int effClipMinY = std::max(clipMinY, gRasterBandY0);
-    const int effClipMaxY = std::min(clipMaxY, gRasterBandY1);
+    const int effClipMinX = optPremulLayer ? clipMinX : std::max(clipMinX, gRasterBandClip.x0);
+    const int effClipMaxX = optPremulLayer ? clipMaxX : std::min(clipMaxX, gRasterBandClip.x1);
+    const int effClipMinY = std::max(clipMinY, gRasterBandClip.y0);
+    const int effClipMaxY = std::min(clipMaxY, gRasterBandClip.y1);
     if (effClipMaxX <= effClipMinX || effClipMaxY <= effClipMinY) {
         return;
     }
@@ -1572,7 +1592,7 @@ void RasterizeSingleNode(
     const ImageAtlas& imageAtlasRef = (tree.ResourceStore() && tree.ResourceStore()->TryImages())
         ? *tree.ResourceStore()->TryImages()
         : ImageAtlas::Instance();
-    const std::uint32_t boundTextureId = page.header.reserved[0];
+    const std::uint32_t boundTextureId = page.header.textureId;
     bool resolvedNodeTex = false;
     std::uint32_t cachedNodeTexW = 0u;
     std::uint32_t cachedNodeTexH = 0u;
@@ -1610,8 +1630,8 @@ void RasterizeSingleNode(
         const float maxY = std::max(std::max(v0.y, v1.y), std::max(v2.y, v3.y));
         const int pyStart = SafeFloorToInt(minY, clipMinY, clipMaxY);
         const int pyEnd = SafeCeilToInt(maxY, clipMinY, clipMaxY);
-        const int quadBandPyStart = std::max(pyStart, gRasterBandY0);
-        const int quadBandPyEnd = std::min(pyEnd, gRasterBandY1);
+        const int quadBandPyStart = std::max(pyStart, gRasterBandClip.y0);
+        const int quadBandPyEnd = std::min(pyEnd, gRasterBandClip.y1);
         if (quadBandPyStart >= quadBandPyEnd) {
             continue;
         }
@@ -2933,8 +2953,8 @@ void ExecuteBackdropBlurSpan(
         }
     }
     if (gInScanlineBand) {
-        my0 = std::max(my0, gRasterBandY0);
-        my1 = std::min(my1, gRasterBandY1);
+        my0 = std::max(my0, gRasterBandClip.y0);
+        my1 = std::min(my1, gRasterBandClip.y1);
     }
     float cellW = 1.0f, cellH = 1.0f, cellBoxX0 = 0.0f, cellBoxY0 = 0.0f, scaledW = 1.0f, scaledH = 1.0f;
     float cellRenderedW = mr.width, cellRenderedH = mr.height;
@@ -3065,10 +3085,7 @@ void RasterizeNodeSpanRecursive(
                         static_cast<std::size_t>(subLayer.width) * static_cast<std::size_t>(subLayer.height) * 4u,
                         true);
 
-                    const int savedBandY0 = gRasterBandY0;
-                    const int savedBandY1 = gRasterBandY1;
-                    gRasterBandY0 = subLayer.originY;
-                    gRasterBandY1 = subLayer.originY + subLayer.height;
+                    ScopedRasterBandClip subLayerBandGuard(subLayer.originY, subLayer.originY + subLayer.height);
                     const std::size_t baseSubCursor = ioBlurCursor;
                     const bool hasInnerBlurSpan =
                         (baseSubCursor < blurSpans.size() && blurSpans[baseSubCursor].firstNodeId < span.endNodeId);
@@ -3084,10 +3101,7 @@ void RasterizeNodeSpanRecursive(
                             subLayer.height,
                             [&](int relY0, int relY1) {
                                 ScopedBandTexCacheGuard subBandTexGuard;
-                                const int p0 = gRasterBandY0;
-                                const int p1 = gRasterBandY1;
-                                gRasterBandY0 = subLayer.originY + relY0;
-                                gRasterBandY1 = subLayer.originY + relY1;
+                                ScopedRasterBandClip innerBandGuard(subLayer.originY + relY0, subLayer.originY + relY1);
                                 std::size_t localC = baseSubCursor;
                                 RasterizeNodeSpanRecursive(
                                     tree,
@@ -3101,8 +3115,6 @@ void RasterizeNodeSpanRecursive(
                                 if (relY0 == 0) {
                                     endSubCursor = localC;
                                 }
-                                gRasterBandY0 = p0;
-                                gRasterBandY1 = p1;
                             });
                         ioBlurCursor = endSubCursor;
                         while (ioBlurCursor < blurSpans.size() && blurSpans[ioBlurCursor].firstNodeId < span.endNodeId) {
@@ -3112,8 +3124,6 @@ void RasterizeNodeSpanRecursive(
                         RasterizeNodeSpanRecursive(
                             tree, span.firstNodeId, span.endNodeId, ioBlurCursor, viewportWidth, viewportHeight, outRgba8, &subLayer);
                     }
-                    gRasterBandY0 = savedBandY0;
-                    gRasterBandY1 = savedBandY1;
 
                     ApplySpanPostProcessEffect(tree.ResourceStore(), tree.RootDpiScale(), subLayer, span);
 
@@ -3154,8 +3164,8 @@ void RasterizeNodeSpanRecursive(
                         compY1 = std::min(compY1, optPremulLayer->originY + optPremulLayer->height);
                     }
                     if (gInScanlineBand) {
-                        compY0 = std::max(compY0, gRasterBandY0);
-                        compY1 = std::min(compY1, gRasterBandY1);
+                        compY0 = std::max(compY0, gRasterBandClip.y0);
+                        compY1 = std::min(compY1, gRasterBandClip.y1);
                     }
 
                     for (int py = compY0; py < compY1; ++py) {
@@ -3189,11 +3199,11 @@ void RasterizeNodeSpanRecursive(
 
 } // namespace
 
-void ZeroCopyGpuStream::ReleaseTransientPools() noexcept {
+void SoftwareRasterizer::ReleaseTransientPools() noexcept {
     gTlPremulLayerPool.Clear();
 }
 
-void ZeroCopyGpuStream::RasterizeTreeToRgba8(
+void SoftwareRasterizer::RasterizeTreeToRgba8(
     const PagedRenderTree& tree,
     std::uint32_t viewportWidth,
     std::uint32_t viewportHeight,
@@ -3291,10 +3301,7 @@ void ZeroCopyGpuStream::RasterizeTreeToRgba8(
                     vpHInt,
                     [&](int y0, int y1) {
                         ScopedBandTexCacheGuard bandTexGuard;
-                        const int prevY0 = gRasterBandY0;
-                        const int prevY1 = gRasterBandY1;
-                        gRasterBandY0 = y0;
-                        gRasterBandY1 = y1;
+                        ScopedRasterBandClip sliceBandGuard(y0, y1);
                         for (std::size_t idx = 0u; idx < sliceLen; ++idx) {
                             const auto& yr = yRangesPtr[idx];
                             if (yr.second > y0 && yr.first < y1) {
@@ -3307,8 +3314,6 @@ void ZeroCopyGpuStream::RasterizeTreeToRgba8(
                                     nullptr);
                             }
                         }
-                        gRasterBandY0 = prevY0;
-                        gRasterBandY1 = prevY1;
                     });
                 return;
             }
@@ -3316,15 +3321,10 @@ void ZeroCopyGpuStream::RasterizeTreeToRgba8(
                 static_cast<int>(viewportHeight),
                 [&](int y0, int y1) {
                     ScopedBandTexCacheGuard bandTexGuard;
-                    const int prevY0 = gRasterBandY0;
-                    const int prevY1 = gRasterBandY1;
-                    gRasterBandY0 = y0;
-                    gRasterBandY1 = y1;
+                    ScopedRasterBandClip sliceBandGuard(y0, y1);
                     std::size_t localBlurCursor = startCursor;
                     RasterizeNodeSpanRecursive(
                         tree, sliceStart, sliceEnd, localBlurCursor, viewportWidth, viewportHeight, rawOut, nullptr);
-                    gRasterBandY0 = prevY0;
-                    gRasterBandY1 = prevY1;
                 });
         };
 
@@ -3395,7 +3395,7 @@ void ZeroCopyGpuStream::RasterizeTreeToRgba8(
         nullptr);
 }
 
-bool ZeroCopyGpuStream::RasterizeBlurSpanPatchPremulRgba8(
+bool SoftwareRasterizer::RasterizeBlurSpanPatchPremulRgba8(
     const PagedRenderTree& tree,
     const BlurLayerSpan& span,
     std::size_t& ioBlurCursor,
@@ -3533,7 +3533,7 @@ bool ZeroCopyGpuStream::RasterizeBlurSpanPatchPremulRgba8(
     return true;
 }
 
-bool ZeroCopyGpuStream::ComputeBackdropBlurPatchPremulRgba8(
+bool SoftwareRasterizer::ComputeBackdropBlurPatchPremulRgba8(
     const BlurLayerSpan& span,
     std::uint32_t viewportWidth,
     std::uint32_t viewportHeight,
@@ -3686,7 +3686,7 @@ bool ZeroCopyGpuStream::ComputeBackdropBlurPatchPremulRgba8(
     return true;
 }
 
-void ZeroCopyGpuStream::RasterizeTreeDirtyRectsToRgba8(
+void SoftwareRasterizer::RasterizeTreeDirtyRectsToRgba8(
     const PagedRenderTree& tree,
     std::uint32_t viewportWidth,
     std::uint32_t viewportHeight,
@@ -3877,10 +3877,6 @@ void ZeroCopyGpuStream::RasterizeTreeDirtyRectsToRgba8(
 
     auto renderTileRowBand = [&](int tyBegin, int tyEnd) {
         ScopedBandTexCacheGuard bandTexGuard;
-        const int prevX0 = gRasterBandX0;
-        const int prevX1 = gRasterBandX1;
-        const int prevY0 = gRasterBandY0;
-        const int prevY1 = gRasterBandY1;
 
         for (int tyInt = tyBegin; tyInt < tyEnd; ++tyInt) {
             const std::uint32_t ty = static_cast<std::uint32_t>(tyInt);
@@ -3913,10 +3909,7 @@ void ZeroCopyGpuStream::RasterizeTreeDirtyRectsToRgba8(
                     std::fill_n(dst32, stripCols, clearPacked);
                 }
 
-                gRasterBandX0 = sx0;
-                gRasterBandX1 = sx1;
-                gRasterBandY0 = sy0;
-                gRasterBandY1 = sy1;
+                ScopedRasterBandClip stripBandGuard(sx0, sx1, sy0, sy1);
                 for (std::uint32_t ni = 0u; ni < nNodes; ++ni) {
                     const NodePxBounds& nb = nodeBoundsPtr[ni];
                     if (nb.x1 > sx0 && nb.x0 < sx1 && nb.y1 > sy0 && nb.y0 < sy1) {
@@ -3926,10 +3919,6 @@ void ZeroCopyGpuStream::RasterizeTreeDirtyRectsToRgba8(
             }
         }
 
-        gRasterBandX0 = prevX0;
-        gRasterBandX1 = prevX1;
-        gRasterBandY0 = prevY0;
-        gRasterBandY1 = prevY1;
     };
 
     if (dirtyTileCount >= 4u && tilesY >= 4u && vpH >= 64) {

@@ -1,18 +1,7 @@
-#include "aero/app/AeroAppHost.hpp"
+#define AERO_TEST_WITH_APP_HOST 1
+#include "common/AeroTestHarness.hpp"
 #include "aero/compiler/AeroCompilerV3.hpp"
 #include "aero/core/RsAliases.hpp"
-
-#include <algorithm>
-#include <cmath>
-#include <cstdint>
-#include <filesystem>
-#include <fstream>
-#include <iostream>
-#include <sstream>
-#include <string>
-#include <string_view>
-#include <unordered_set>
-#include <vector>
 
 namespace {
 
@@ -20,20 +9,16 @@ int gFailureCount = 0;
 
 void Require(bool cond, std::string_view msg) {
     if (!cond) {
-        std::cerr << "[FAIL] " << msg << "\n";
-        ++gFailureCount;
+        aero::test::ReportFailure(gFailureCount, msg);
     }
 }
 
-[[nodiscard]] std::string ReadFileText(const std::filesystem::path& path) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in.is_open()) {
-        return {};
-    }
-    std::ostringstream ss;
-    ss << in.rdbuf();
-    return ss.str();
-}
+using aero::test::ReadFileText;
+using aero::test::CountChangedPixels;
+using aero::test::ReadIntMember;
+using aero::test::ReadFloatMember;
+using aero::test::ReadBoolMember;
+using aero::test::ReadStringMember;
 
 [[nodiscard]] aero::AeroV3CompileInput BuildSampleCompileInput(
     std::string_view sampleSubdir,
@@ -72,41 +57,7 @@ void Require(bool cond, std::string_view msg) {
 }
 
 [[nodiscard]] std::size_t CountDistinctColors(const std::vector<std::uint8_t>& rgba) {
-    std::unordered_set<std::uint32_t> colors;
-    const std::size_t pixelCount = rgba.size() / 4u;
-    const std::size_t step = std::max<std::size_t>(1u, pixelCount / 12000u);
-    for (std::size_t i = 0u; i < pixelCount; i += step) {
-        const std::size_t off = i * 4u;
-        const std::uint32_t packed =
-            (static_cast<std::uint32_t>(rgba[off]) << 24) |
-            (static_cast<std::uint32_t>(rgba[off + 1u]) << 16) |
-            (static_cast<std::uint32_t>(rgba[off + 2u]) << 8) |
-            static_cast<std::uint32_t>(rgba[off + 3u]);
-        colors.insert(packed);
-        if (colors.size() >= 64u) {
-            break;
-        }
-    }
-    return colors.size();
-}
-
-[[nodiscard]] std::size_t CountChangedPixels(
-    const std::vector<std::uint8_t>& a,
-    const std::vector<std::uint8_t>& b) {
-    if (a.size() != b.size()) {
-        return a.size() / 4u;
-    }
-    std::size_t diffPixels = 0u;
-    for (std::size_t i = 0u; i + 3u < a.size(); i += 4u) {
-        const int dr = std::abs(static_cast<int>(a[i]) - static_cast<int>(b[i]));
-        const int dg = std::abs(static_cast<int>(a[i + 1u]) - static_cast<int>(b[i + 1u]));
-        const int db = std::abs(static_cast<int>(a[i + 2u]) - static_cast<int>(b[i + 2u]));
-        const int da = std::abs(static_cast<int>(a[i + 3u]) - static_cast<int>(b[i + 3u]));
-        if (dr + dg + db + da > 6) {
-            ++diffPixels;
-        }
-    }
-    return diffPixels;
+    return aero::test::CountDistinctColorsSampled(rgba, 12000u, 64u);
 }
 
 [[nodiscard]] bool RequireNodeCenter(
@@ -116,107 +67,12 @@ void Require(bool cond, std::string_view msg) {
     float& outCy,
     aero::VisualNodeId* outId = nullptr,
     aero::Rect* outRect = nullptr) {
-    const aero::VisualNodeId id = host.FindVisualByOwnerName(name);
-    if (!id.IsValid()) {
-        Require(false, "Expected named VisualNode '" + std::string(name) + "' not found");
+    std::string err;
+    if (!aero::test::ResolveNodeCenter(host, name, outCx, outCy, outId, outRect, &err)) {
+        Require(false, err);
         return false;
     }
-    const aero::VisualNode* node = host.World().GetNode(id);
-    if (!node) {
-        Require(false, "Named VisualNode '" + std::string(name) + "' resolved to null node");
-        return false;
-    }
-    const aero::Rect r = node->layout.layoutRect;
-    if (r.width <= 1.0f || r.height <= 1.0f) {
-        Require(false, "Named VisualNode '" + std::string(name) + "' has degenerate layoutRect (" +
-            std::to_string(r.width) + "x" + std::to_string(r.height) + ")");
-        return false;
-    }
-    if (outId) {
-        *outId = id;
-    }
-    if (outRect) {
-        *outRect = r;
-    }
-    const aero::Point localCenter{r.x + r.width * 0.5f, r.y + r.height * 0.5f};
-    const aero::Point vpCenter = node->layout.hasPerspective3D
-        ? node->WorldMatrix3D().ProjectPoint2D(localCenter)
-        : node->layout.worldTransform.TransformPoint(localCenter);
-    outCx = vpCenter.x;
-    outCy = vpCenter.y;
     return true;
-}
-
-[[nodiscard]] bool ReadIntMember(
-    const aero::AeroAppHost& host,
-    aero::ObjectRef obj,
-    std::string_view path,
-    std::int64_t& outVal) {
-    aero::UnifiedValue v{};
-    if (!host.ReadScriptMember(obj, path, v)) {
-        return false;
-    }
-    return v.tryGetInt64(outVal);
-}
-
-[[nodiscard]] bool ReadFloatMember(
-    const aero::AeroAppHost& host,
-    aero::ObjectRef obj,
-    std::string_view path,
-    float& outVal) {
-    aero::UnifiedValue v{};
-    if (!host.ReadScriptMember(obj, path, v)) {
-        return false;
-    }
-    if (v.tryGetFloat(outVal)) {
-        return true;
-    }
-    double dv = 0.0;
-    if (v.tryGetDouble(dv)) {
-        outVal = static_cast<float>(dv);
-        return true;
-    }
-    std::int64_t iv = 0;
-    if (v.tryGetInt64(iv)) {
-        outVal = static_cast<float>(iv);
-        return true;
-    }
-    return false;
-}
-
-[[nodiscard]] bool ReadBoolMember(
-    const aero::AeroAppHost& host,
-    aero::ObjectRef obj,
-    std::string_view path,
-    bool& outVal) {
-    aero::UnifiedValue v{};
-    if (!host.ReadScriptMember(obj, path, v)) {
-        return false;
-    }
-    return v.tryGetBool(outVal);
-}
-
-[[nodiscard]] bool ReadStringMember(
-    const aero::AeroAppHost& host,
-    aero::ObjectRef obj,
-    std::string_view path,
-    std::string& outVal) {
-    aero::UnifiedValue v{};
-    if (!host.ReadScriptMember(obj, path, v)) {
-        return false;
-    }
-    if (const auto* sv = std::get_if<aero::rs_rt::StringValue>(&v)) {
-        outVal = sv->str();
-        return true;
-    }
-    if (const auto* ref = std::get_if<aero::rs_rt::ObjectRef>(&v);
-        ref && ref->valid() && ref->kind == aero::rs_rt::ObjectKind::String) {
-        if (const auto opt = host.Domains().stringViewAcrossDomains(*ref)) {
-            outVal.assign(opt->data(), opt->size());
-            return true;
-        }
-    }
-    return false;
 }
 
 void TestSample01CodeFirstCounter(aero::rs_comp::CompilerSession& session) {

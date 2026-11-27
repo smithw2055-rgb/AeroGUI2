@@ -15,7 +15,7 @@
 
 #include "aero/asset/GradientBrush.hpp"
 #include "aero/asset/MtsdfPathBaker.hpp"
-#include "aero/core/UIResourceStore.hpp"
+#include "aero/render/UIResourceStore.hpp"
 #include "aero/drawing/Geometry.hpp"
 #include "aero/host/HostDrivers.hpp"
 #include "aero/host/NativeWindowHost.hpp"
@@ -32,17 +32,18 @@
 #include "aero/visual/VisualRenderAdapter.hpp"
 #include "aero/visual/VisualTree.hpp"
 
+#include "common/AeroTestHarness.hpp"
+
 namespace {
 
 int gFailureCount = 0;
 
-#define AERO_CHECK(cond)                                                                      \
-    do {                                                                                      \
-        if (!(cond)) {                                                                        \
-            std::fprintf(stderr, "CHECK FAILED (%s:%d): %s\n", __FILE__, __LINE__, #cond);   \
-            ++gFailureCount;                                                                  \
-            return false;                                                                     \
-        }                                                                                     \
+#define AERO_CHECK(cond)                                                            \
+    do {                                                                            \
+        if (!(cond)) {                                                              \
+            aero::test::ReportFailure(gFailureCount, #cond, __FILE__, __LINE__);    \
+            return false;                                                           \
+        }                                                                           \
     } while (false)
 
 // ============================================================================

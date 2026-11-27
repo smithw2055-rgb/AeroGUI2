@@ -5,13 +5,7 @@
 #include <cstdint>
 #include <string_view>
 
-namespace realscript::runtime {
-struct QuatfValue;
-} // namespace realscript::runtime
-
 namespace aero {
-
-using Float4Value = ::realscript::runtime::QuatfValue;
 
 struct Color {
     float r = 0.0f;
@@ -25,8 +19,27 @@ struct Color {
     constexpr bool operator!=(const Color& other) const noexcept {
         return !(*this == other);
     }
-    [[nodiscard]] Float4Value ToFloat4() const noexcept;
-    [[nodiscard]] static Color FromFloat4(const Float4Value& v) noexcept;
+
+    [[nodiscard]] constexpr std::uint32_t PackRgba8() const noexcept {
+        auto clampU8 = [](float v) noexcept -> std::uint32_t {
+            if (!(v > 0.0f)) return 0u;
+            if (v >= 1.0f) return 255u;
+            return static_cast<std::uint32_t>(v * 255.0f + 0.5f);
+        };
+        return clampU8(r) |
+               (clampU8(g) << 8u) |
+               (clampU8(b) << 16u) |
+               (clampU8(a) << 24u);
+    }
+
+    [[nodiscard]] static constexpr Color FromRgba8(std::uint32_t rgba, float opacityScale = 1.0f) noexcept {
+        constexpr float kInv255 = 1.0f / 255.0f;
+        return Color{
+            static_cast<float>(rgba & 0xFFu) * kInv255,
+            static_cast<float>((rgba >> 8u) & 0xFFu) * kInv255,
+            static_cast<float>((rgba >> 16u) & 0xFFu) * kInv255,
+            static_cast<float>((rgba >> 24u) & 0xFFu) * kInv255 * opacityScale};
+    }
 };
 
 struct Size {
@@ -51,8 +64,6 @@ struct Point {
     constexpr bool operator!=(const Point& other) const noexcept {
         return !(*this == other);
     }
-    [[nodiscard]] Float4Value ToFloat4() const noexcept;
-    [[nodiscard]] static Point FromFloat4(const Float4Value& v) noexcept;
 };
 
 struct Rect {
@@ -68,8 +79,6 @@ struct Rect {
     constexpr bool operator!=(const Rect& other) const noexcept {
         return !(*this == other);
     }
-    [[nodiscard]] Float4Value ToFloat4() const noexcept;
-    [[nodiscard]] static Rect FromFloat4(const Float4Value& v) noexcept;
 };
 
 // Full 2D affine transform in column-vector convention:
@@ -571,8 +580,6 @@ struct Thickness {
     constexpr bool operator!=(const Thickness& other) const noexcept {
         return !(*this == other);
     }
-    [[nodiscard]] Float4Value ToFloat4() const noexcept;
-    [[nodiscard]] static Thickness FromFloat4(const Float4Value& v) noexcept;
 };
 
 struct CornerRadius {
@@ -594,8 +601,6 @@ struct CornerRadius {
     constexpr bool operator!=(const CornerRadius& other) const noexcept {
         return !(*this == other);
     }
-    [[nodiscard]] Float4Value ToFloat4() const noexcept;
-    [[nodiscard]] static CornerRadius FromFloat4(const Float4Value& v) noexcept;
 };
 
 enum class Visibility : std::uint8_t {
@@ -636,44 +641,11 @@ enum class StretchDirection : std::uint8_t {
     Both = 2
 };
 
-enum class ExpandDirection : std::uint8_t {
-    Down = 0,
-    Up = 1,
-    Left = 2,
-    Right = 3
-};
-
 enum class Dock : std::uint8_t {
     Left = 0,
     Top = 1,
     Right = 2,
     Bottom = 3
-};
-
-enum class ClickMode : std::uint8_t {
-    Release = 0,
-    Press = 1,
-    Hover = 2
-};
-
-enum class SelectionMode : std::uint8_t {
-    Single = 0,
-    Multiple = 1,
-    Extended = 2
-};
-
-enum class TabStripPlacement : std::uint8_t {
-    Top = 0,
-    Bottom = 1,
-    Left = 2,
-    Right = 3
-};
-
-enum class ScrollBarVisibility : std::uint8_t {
-    Disabled = 0,
-    Auto = 1,
-    Hidden = 2,
-    Visible = 3
 };
 
 enum class TextWrapping : std::uint8_t {

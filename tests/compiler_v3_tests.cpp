@@ -10,6 +10,7 @@
 #include <variant>
 #include <vector>
 
+#include "common/AeroTestHarness.hpp"
 #include "aero/compiler/AeroCompilerV3.hpp"
 #include "aero/compiler/MarkupExtensionParser.hpp"
 #include "aero/compiler/StdlibModulePack.hpp"
@@ -36,8 +37,7 @@ long long gColdStdlibCompileMs = 0;
 
 void Require(bool cond, std::string_view message) {
     if (!cond) {
-        std::cerr << "[FAIL] " << message << "\n";
-        ++gFailureCount;
+        aero::test::ReportFailure(gFailureCount, message);
     }
 }
 
@@ -1957,8 +1957,14 @@ public partial class CleanView : UserControl {
         aero::AeroV3CompileInput catSymProbe;
         catSymProbe.scriptSources.push_back(aero::SourceFile{"Cat.rs", "CompiledXamlCatalog.NormalizeUriKey(\"a\");"});
         Require(aero::InferRequiredStdlibPackages(catSymProbe) ==
+                    aero::AeroStdlibPkg_Core,
+            "CompiledXamlCatalog identifier must only require AeroStdlibPkg_Core");
+
+        aero::AeroV3CompileInput xrSymProbe;
+        xrSymProbe.scriptSources.push_back(aero::SourceFile{"Xr.rs", "var root = XamlReader.Parse(\"<Border/>\");"});
+        Require(aero::InferRequiredStdlibPackages(xrSymProbe) ==
                     (aero::AeroStdlibPkg_Core | aero::AeroStdlibPkg_Controls | aero::AeroStdlibPkg_RuntimeXaml),
-            "CompiledXamlCatalog identifier must infer AeroStdlibPkg_RuntimeXaml");
+            "XamlReader identifier must infer AeroStdlibPkg_RuntimeXaml");
     }
 
     const auto realStdlib = aero::LoadStdlibModulePack();

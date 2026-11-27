@@ -13,7 +13,7 @@
 
 #include "aero/core/RsAliases.hpp"
 #include "aero/drawing/Geometry.hpp"
-#include "aero/foundation/ChunkedArena.hpp"
+#include "aero/core/ChunkedArena.hpp"
 #include "aero/render/FontAtlas.hpp"
 
 namespace aero {
@@ -816,6 +816,12 @@ public:
         bool showCaret,
         std::uint32_t selRgba,
         std::uint32_t caretRgba) noexcept;
+    [[nodiscard]] static const TextLayoutResult* ResolveOrComputeNodeTextLayout(
+        const VisualNode& node,
+        float maxWidth,
+        float maxHeight,
+        UIResourceStore* store,
+        TextLayoutResult* optScratchFallback = nullptr);
     [[nodiscard]] const TextLayoutResult* GetOrComputeTextLayout(
         const VisualNode& node,
         float maxWidth,

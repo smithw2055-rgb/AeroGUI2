@@ -232,6 +232,63 @@ void recordParsedAttribute(
         name.rfind("ObservableCollection__", 0) == 0;
 }
 
+[[nodiscard]] bool tryResolveWrapperBackingField(
+    const TypeSymbol& type,
+    std::size_t& outFieldIdx) noexcept {
+    if (type.kind != TypeKind::Class || type.fields.empty() || !isCollectionWrapperShortName(type.name)) {
+        return false;
+    }
+    for (std::size_t fi = 0u; fi < type.fields.size(); ++fi) {
+        const auto& f = type.fields[fi];
+        if (!f.staticField && (f.name == "_items" || f.name == "items")) {
+            outFieldIdx = f.index;
+            return true;
+        }
+    }
+    if (type.fields.size() == 1u && !type.fields[0].staticField) {
+        outFieldIdx = type.fields[0].index;
+        return true;
+    }
+    for (std::size_t fi = 0u; fi < type.fields.size(); ++fi) {
+        const auto& f = type.fields[fi];
+        if (!f.staticField && f.type == realscript::semantic::PrimitiveType::Array) {
+            outFieldIdx = f.index;
+            return true;
+        }
+    }
+    return false;
+}
+
+[[nodiscard]] bool tryResolveAotWrapperBackingField(
+    const realscript::aot::TypeDescriptor& td,
+    std::size_t& outFieldIdx) noexcept {
+    const std::string_view shortName = td.name ? std::string_view(td.name) : std::string_view{};
+    if (td.kind != TypeKind::Class || !td.fields || td.fieldCount == 0u ||
+        !isCollectionWrapperShortName(shortName)) {
+        return false;
+    }
+    for (std::uint32_t fi = 0u; fi < td.fieldCount; ++fi) {
+        const auto& fd = td.fields[fi];
+        if (!fd.staticField && fd.name &&
+            (std::string_view(fd.name) == "_items" || std::string_view(fd.name) == "items")) {
+            outFieldIdx = fd.index;
+            return true;
+        }
+    }
+    if (td.fieldCount == 1u && !td.fields[0].staticField) {
+        outFieldIdx = td.fields[0].index;
+        return true;
+    }
+    for (std::uint32_t fi = 0u; fi < td.fieldCount; ++fi) {
+        const auto& fd = td.fields[fi];
+        if (!fd.staticField && fd.type == realscript::semantic::PrimitiveType::Array) {
+            outFieldIdx = fd.index;
+            return true;
+        }
+    }
+    return false;
+}
+
 [[nodiscard]] bool isImplicitlyObservableTypeName(std::string_view name) noexcept {
     if (const auto colon = name.rfind(':'); colon != std::string_view::npos) {
         name = name.substr(colon + 1u);
@@ -768,7 +825,7 @@ void ExecutionDomainContext::noteSubscribedObjectMutated(
         dirtyObservableTokenSet_.clear();
         return;
     }
-    const std::int32_t tok = it->second;
+    const std::int32_t tok = it->second.token;
     if (dirtyObservableTokenSet_.insert(tok).second) {
         dirtyObservableTokens_.push_back(tok);
     }
@@ -788,16 +845,18 @@ void ExecutionDomainContext::handleFieldMutated(
     const std::uint64_t heapKey = heap.heapId();
     const std::uint64_t objKey = refKey(object);
     const auto typeIdOpt = heap.objectTypeId(object);
-    const bool isWrapper = typeIdOpt.has_value() && ObservableListHelper::IsWrapperType(*typeIdOpt);
+    std::size_t wrapperArrFieldIdx = 0u;
+    const bool isWrapper = typeIdOpt.has_value() &&
+        ObservableListHelper::TryGetWrapperBackingFieldIndex(*typeIdOpt, wrapperArrFieldIdx);
 
     if (isWrapper) {
-        if (fieldIndex == 0u) {
+        if (fieldIndex == wrapperArrFieldIdx) {
             if (dirtyBit < 64u) {
                 ObservableListHelper::UnbindAllForOwnerField(heap, object, dirtyBit);
             }
-            Value field0{};
-            if (heap.fieldGetInto(object, 0u, field0)) {
-                if (const auto* arrRef = std::get_if<ObjectRef>(&field0);
+            Value arrFieldVal{};
+            if (heap.fieldGetInto(object, wrapperArrFieldIdx, arrFieldVal)) {
+                if (const auto* arrRef = std::get_if<ObjectRef>(&arrFieldVal);
                     arrRef && arrRef->valid() && arrRef->kind == ObjectKind::Array &&
                     arrRef->heapId == static_cast<std::uint32_t>(heapKey)) {
                     ObservableListHelper::EnableTracking(heap, *arrRef);
@@ -959,15 +1018,16 @@ std::int32_t ExecutionDomainContext::getOrAssignObservableToken(ObjectRef ref) {
     const std::uint64_t tokKey = (heap->heapId() << 48) ^ refKey(ref);
     std::lock_guard<std::mutex> lock(mutex_);
     if (const auto it = objectTokensByRefKey_.find(tokKey); it != objectTokensByRefKey_.end()) {
-        return it->second;
+        return it->second.token;
     }
     if (objectTokensByRefKey_.size() >= 16384u) {
         for (auto it = objectTokensByRefKey_.begin(); it != objectTokensByRefKey_.end();) {
-            const std::uint64_t hPart = (it->first >> 48) & 0xFFFFull;
-            const auto slot = static_cast<std::uint32_t>((it->first >> 32) & 0xFFFFull);
-            (void)hPart;
-            (void)slot;
-            ++it;
+            const ManagedHeap* ownerHeap = it->second.isSimHeap ? simHeap_.get() : uiHeap_.get();
+            if (!ownerHeap || !ownerHeap->isAlive(it->second.ref)) {
+                it = objectTokensByRefKey_.erase(it);
+            } else {
+                ++it;
+            }
         }
     }
     std::int32_t assigned = nextObjectToken_++;
@@ -977,7 +1037,9 @@ std::int32_t ExecutionDomainContext::getOrAssignObservableToken(ObjectRef ref) {
     if (assigned <= 0) {
         assigned = 1;
     }
-    objectTokensByRefKey_.emplace(tokKey, assigned);
+    objectTokensByRefKey_.emplace(
+        tokKey,
+        SubscribedTokenEntry{assigned, ref, heap == simHeap_.get()});
     hasSubscribedTokens_.store(true, std::memory_order_release);
     return assigned;
 }
@@ -1151,18 +1213,19 @@ void ExecutionDomainContext::ensureProgramMetadataComputedLocked(
             if (uiHeap_) uiHeap_->registerTypeParent(type->id, type->baseTypeId);
         }
 
-        const bool isWrapper = type->kind == TypeKind::Class &&
-            type->fields.size() == 1u &&
-            isCollectionWrapperShortName(type->name);
-        if (isWrapper) {
-            ObservableListHelper::RegisterWrapperType(type->id);
+        std::size_t wrapperArrIdx = 0u;
+        if (tryResolveWrapperBackingField(*type, wrapperArrIdx)) {
+            ObservableListHelper::RegisterWrapperType(type->id, wrapperArrIdx);
+            std::vector<std::uint8_t> wrapperBitMap(
+                std::max<std::size_t>(type->fields.size(), wrapperArrIdx + 1u), 0xffu);
+            wrapperBitMap[wrapperArrIdx] = 0u;
             if (pushToHeaps) {
-                dirtyBatch.emplace_back(type->id, std::vector<std::uint8_t>{0u});
+                dirtyBatch.emplace_back(type->id, wrapperBitMap);
             }
             TypeObservableMeta meta;
             meta.isObservable = true;
             meta.isCollectionWrapper = true;
-            meta.fieldToBitMap = {0u};
+            meta.fieldToBitMap = std::move(wrapperBitMap);
             typeMeta_[type->id] = std::move(meta);
             newObservableBloom |= ComputeSimCommandBloomMask(type->id);
             sawAnyObservable = true;
@@ -1344,26 +1407,42 @@ void ExecutionDomainContext::registerAotProgramAttributes(
             }
 
             const std::string_view shortName = td.name ? std::string_view(td.name) : std::string_view{};
-            const bool isWrapper = td.kind == TypeKind::Class &&
-                td.fieldCount == 1u &&
-                isCollectionWrapperShortName(shortName);
-            if (isWrapper) {
-                ObservableListHelper::RegisterWrapperType(td.id);
-                if (simHeap_) simHeap_->enableTypeDirtyTracking(td.id, {0u});
-                if (uiHeap_) uiHeap_->enableTypeDirtyTracking(td.id, {0u});
+            std::size_t wrapperArrIdx = 0u;
+            if (tryResolveAotWrapperBackingField(td, wrapperArrIdx)) {
+                ObservableListHelper::RegisterWrapperType(td.id, wrapperArrIdx);
+                std::vector<std::uint8_t> wrapperBitMap(
+                    std::max<std::size_t>(td.fieldCount, wrapperArrIdx + 1u), 0xffu);
+                wrapperBitMap[wrapperArrIdx] = 0u;
+                if (simHeap_) simHeap_->enableTypeDirtyTracking(td.id, wrapperBitMap);
+                if (uiHeap_) uiHeap_->enableTypeDirtyTracking(td.id, wrapperBitMap);
                 TypeObservableMeta meta;
                 meta.isObservable = true;
                 meta.isCollectionWrapper = true;
-                meta.fieldToBitMap = {0u};
+                meta.fieldToBitMap = std::move(wrapperBitMap);
                 typeMeta_[td.id] = std::move(meta);
                 newObservableBloom |= ComputeSimCommandBloomMask(td.id);
                 sawAnyObservable = true;
                 continue;
             }
 
-            const std::string canon = makeCanonicalTypeName(
-                td.moduleName ? td.moduleName : "",
-                shortName);
+            std::vector<std::string> ownerCanons;
+            {
+                std::unordered_set<SymbolId> visitedChain;
+                const realscript::aot::TypeDescriptor* curTd = &td;
+                while (curTd && visitedChain.insert(curTd->id).second) {
+                    std::string cName = makeCanonicalTypeName(
+                        curTd->moduleName ? curTd->moduleName : "",
+                        curTd->name ? curTd->name : "");
+                    if (!cName.empty()) {
+                        ownerCanons.push_back(std::move(cName));
+                    }
+                    if (curTd->baseTypeId == 0 || curTd->baseTypeId == curTd->id) {
+                        break;
+                    }
+                    const auto bIt = typeById.find(curTd->baseTypeId);
+                    curTd = (bIt != typeById.end()) ? bIt->second : nullptr;
+                }
+            }
             const bool typeObs = classObs[td.id];
             const bool typeSim = classSim[td.id];
             if (typeSim) {
@@ -1383,15 +1462,29 @@ void ExecutionDomainContext::registerAotProgramAttributes(
                     const std::string_view fname = fd.name ? std::string_view(fd.name) : std::string_view{};
                     bool observable = false;
                     if (!fd.synthetic) {
-                        observable = typeObs ||
-                            ((lookupFlag(attrs.fieldFlags, canon + "::" + std::string(fname)) &
-                              static_cast<std::uint8_t>(DomainAttrFlag::Observable)) != 0u);
+                        observable = typeObs;
+                        if (!observable) {
+                            for (const auto& ownerCanon : ownerCanons) {
+                                if ((lookupFlag(attrs.fieldFlags, ownerCanon + "::" + std::string(fname)) &
+                                     static_cast<std::uint8_t>(DomainAttrFlag::Observable)) != 0u) {
+                                    observable = true;
+                                    break;
+                                }
+                            }
+                        }
                     } else if (!fname.empty() && fname[0] == '$') {
                         const std::string propName(fname.substr(1u));
                         if (propName.rfind("sequence_", 0) != 0) {
-                            observable = typeObs ||
-                                ((lookupFlag(attrs.propFlags, canon + "::" + propName) &
-                                  static_cast<std::uint8_t>(DomainAttrFlag::Observable)) != 0u);
+                            observable = typeObs;
+                            if (!observable) {
+                                for (const auto& ownerCanon : ownerCanons) {
+                                    if ((lookupFlag(attrs.propFlags, ownerCanon + "::" + propName) &
+                                         static_cast<std::uint8_t>(DomainAttrFlag::Observable)) != 0u) {
+                                        observable = true;
+                                        break;
+                                    }
+                                }
+                            }
                         }
                     }
                     if (observable) {
@@ -2230,7 +2323,10 @@ UiTaskId ExecutionDomainContext::spawnCallbackTask(
     return id;
 }
 
-bool ExecutionDomainContext::stepUiTask(UiTaskId taskId, const Interpreter* uiInterpreter) {
+bool ExecutionDomainContext::stepUiTask(
+    UiTaskId taskId,
+    const Interpreter* uiInterpreter,
+    realscript::aot::ExecutionContext* uiAotContext) {
     UiAsyncTaskFrame* frame = nullptr;
     for (const auto& item : uiTasks_) {
         if (item->taskId == taskId) {
@@ -2284,7 +2380,7 @@ bool ExecutionDomainContext::stepUiTask(UiTaskId taskId, const Interpreter* uiIn
         return true;
     }
 
-    if (!uiInterpreter) return false;
+    if (!uiInterpreter && !uiAotContext) return false;
     const ObjectRef targetObject = frame->targetWeakRef.ref;
     ManagedHeap* targetHeap = heapForObject(targetObject);
     if (!targetHeap || !targetHeap->isAlive(targetObject)) {
@@ -2314,20 +2410,42 @@ bool ExecutionDomainContext::stepUiTask(UiTaskId taskId, const Interpreter* uiIn
         if (!frame->sequenceEntryArgs.empty()) {
             frame->sequenceEntryArgs[0] = Value{targetObject};
         }
-        exec = invokeMethod(
-            DomainKind::UiPresentation,
-            uiInterpreter,
-            frame->sequenceEntrySymbolId,
-            frame->sequenceEntryArgs.data(),
-            frame->sequenceEntryArgs.size());
+        if (uiInterpreter) {
+            exec = invokeMethod(
+                DomainKind::UiPresentation,
+                uiInterpreter,
+                frame->sequenceEntrySymbolId,
+                frame->sequenceEntryArgs.data(),
+                frame->sequenceEntryArgs.size());
+        } else {
+            exec.succeeded = uiAotContext->invoke(
+                frame->sequenceEntrySymbolId,
+                frame->sequenceEntryArgs.data(),
+                frame->sequenceEntryArgs.size(),
+                exec.value);
+            if (!exec.succeeded) {
+                exec.error = uiAotContext->error();
+            }
+        }
     } else {
         const Value arg0{targetObject};
-        exec = invokeMethod(
-            DomainKind::UiPresentation,
-            uiInterpreter,
-            frame->sequenceStepSymbolId,
-            &arg0,
-            1u);
+        if (uiInterpreter) {
+            exec = invokeMethod(
+                DomainKind::UiPresentation,
+                uiInterpreter,
+                frame->sequenceStepSymbolId,
+                &arg0,
+                1u);
+        } else {
+            exec.succeeded = uiAotContext->invoke(
+                frame->sequenceStepSymbolId,
+                &arg0,
+                1u,
+                exec.value);
+            if (!exec.succeeded) {
+                exec.error = uiAotContext->error();
+            }
+        }
     }
     ++frame->stepIndex;
 
@@ -2366,14 +2484,16 @@ bool ExecutionDomainContext::stepUiTask(UiTaskId taskId, const Interpreter* uiIn
     return true;
 }
 
-std::size_t ExecutionDomainContext::stepAllUiTasks(const Interpreter* uiInterpreter) {
+std::size_t ExecutionDomainContext::stepAllUiTasks(
+    const Interpreter* uiInterpreter,
+    realscript::aot::ExecutionContext* uiAotContext) {
     std::size_t steppedCount = 0;
     const std::size_t count = uiTasks_.size();
     for (std::size_t i = 0; i < count; ++i) {
         const UiTaskId id = uiTasks_[i]->taskId;
         const auto beforeStatus = uiTasks_[i]->status;
         if (beforeStatus == UiTaskStatus::Suspended || beforeStatus == UiTaskStatus::Pending) {
-            (void)stepUiTask(id, uiInterpreter);
+            (void)stepUiTask(id, uiInterpreter, uiAotContext);
             const auto afterStatus = uiTasks_[i]->status;
             if (afterStatus != UiTaskStatus::Cancelled && afterStatus != UiTaskStatus::Faulted) {
                 ++steppedCount;

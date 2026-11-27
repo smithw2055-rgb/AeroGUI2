@@ -2,7 +2,8 @@
 #error "v3_slim_no_rtti_and_aot_tests MUST be compiled with /GR- (RTTI disabled)"
 #endif
 
-#include "aero/app/AeroAppHost.hpp"
+#define AERO_TEST_WITH_APP_HOST 1
+#include "common/AeroTestHarness.hpp"
 #include "aero/core/RsAliases.hpp"
 #include "aero/host/HostDrivers.hpp"
 #include "aero/host/NativeWindowHost.hpp"
@@ -18,20 +19,8 @@
 
 #include <realscript/aot_cpp/AotRuntime.h>
 
-#include <algorithm>
 #include <chrono>
-#include <cmath>
-#include <cstdint>
-#include <cstdlib>
-#include <filesystem>
-#include <fstream>
-#include <iostream>
 #include <memory>
-#include <sstream>
-#include <string>
-#include <string_view>
-#include <unordered_set>
-#include <vector>
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -46,69 +35,23 @@ int gFailureCount = 0;
 
 void Require(bool cond, std::string_view msg) {
     if (!cond) {
-        std::cerr << "[FAIL] " << msg << "\n";
-        ++gFailureCount;
+        aero::test::ReportFailure(gFailureCount, msg);
     }
 }
 
 [[nodiscard]] bool WriteTextFile(const std::filesystem::path& p, std::string_view text) {
-    std::error_code ec;
-    std::filesystem::create_directories(p.parent_path(), ec);
-    std::ofstream out(p, std::ios::binary | std::ios::trunc);
-    if (!out.is_open()) {
-        return false;
-    }
-    out.write(text.data(), static_cast<std::streamsize>(text.size()));
-    return out.good();
+    return aero::test::WriteFileText(p, text);
 }
 
 [[nodiscard]] std::string ReadTextFile(const std::filesystem::path& p) {
-    std::ifstream in(p, std::ios::binary);
-    if (!in.is_open()) {
-        return {};
-    }
-    std::ostringstream ss;
-    ss << in.rdbuf();
-    return ss.str();
+    return aero::test::ReadFileText(p);
 }
 
 [[nodiscard]] std::size_t CountDistinctColors(const std::vector<std::uint8_t>& rgba) {
-    std::unordered_set<std::uint32_t> colors;
-    const std::size_t pixelCount = rgba.size() / 4u;
-    const std::size_t step = std::max<std::size_t>(1u, pixelCount / 10000u);
-    for (std::size_t i = 0u; i < pixelCount; i += step) {
-        const std::size_t off = i * 4u;
-        const std::uint32_t packed =
-            (static_cast<std::uint32_t>(rgba[off]) << 24) |
-            (static_cast<std::uint32_t>(rgba[off + 1u]) << 16) |
-            (static_cast<std::uint32_t>(rgba[off + 2u]) << 8) |
-            static_cast<std::uint32_t>(rgba[off + 3u]);
-        colors.insert(packed);
-        if (colors.size() >= 64u) {
-            break;
-        }
-    }
-    return colors.size();
+    return aero::test::CountDistinctColorsSampled(rgba, 10000u, 64u);
 }
 
-[[nodiscard]] std::size_t CountChangedPixels(
-    const std::vector<std::uint8_t>& a,
-    const std::vector<std::uint8_t>& b) {
-    if (a.size() != b.size()) {
-        return a.size() / 4u;
-    }
-    std::size_t diff = 0u;
-    for (std::size_t i = 0u; i + 3u < a.size(); i += 4u) {
-        const int delta =
-            std::abs(static_cast<int>(a[i]) - static_cast<int>(b[i])) +
-            std::abs(static_cast<int>(a[i + 1u]) - static_cast<int>(b[i + 1u])) +
-            std::abs(static_cast<int>(a[i + 2u]) - static_cast<int>(b[i + 2u]));
-        if (delta > 6) {
-            ++diff;
-        }
-    }
-    return diff;
-}
+using aero::test::CountChangedPixels;
 
 [[nodiscard]] int RunCommandDirect(const std::string& cmdLine) {
 #if defined(_WIN32)

@@ -6,7 +6,7 @@
 #include <cstring>
 
 #include "aero/asset/GradientBrush.hpp"
-#include "aero/core/UIResourceStore.hpp"
+#include "aero/render/UIResourceStore.hpp"
 #include "aero/render/FontAtlas.hpp"
 #include "aero/render/ImageAtlas.hpp"
 
@@ -2939,12 +2939,12 @@ GpuBackendFrameStats OpenGlDeviceBackend::ExecuteSubmission(
             const CommandPageHeader& hdr = tree.GetPage(pageIdx).header;
             const BlendingMode bm = forceNormalBlend
                 ? BlendingMode::Normal
-                : ((hdr.reserved[1] <= 3u)
-                       ? static_cast<BlendingMode>(hdr.reserved[1])
+                : ((hdr.blendMode <= 3u)
+                       ? static_cast<BlendingMode>(hdr.blendMode)
                        : BlendingMode::Normal);
             setGlBlendMode(bm);
 
-            const std::uint32_t texId = hdr.reserved[0];
+            const std::uint32_t texId = hdr.textureId;
             if (texId != boundBatchTextureId) {
                 const AeroGLuint nextTex = ResolveBatchImageTexture(texId, tree.ResourceStore());
                 if (nextTex != boundUnit1Tex) {

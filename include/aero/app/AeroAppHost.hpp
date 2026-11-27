@@ -13,10 +13,10 @@
 #include <vector>
 
 #include "aero/core/RsAliases.hpp"
-#include "aero/core/UIResourceStore.hpp"
 #include "aero/host/HostDrivers.hpp"
 #include "aero/host/NativeWindowHost.hpp"
 #include "aero/render/PagedRenderTree.hpp"
+#include "aero/render/UIResourceStore.hpp"
 #include "aero/render/ZeroCopyGpuStream.hpp"
 #include "aero/runtime/AeroExecutionDomains.hpp"
 #include "aero/visual/DrawingCommandBuffer.hpp"
@@ -78,6 +78,8 @@ struct AeroStencilJitStats {
 };
 
 #ifdef AERO_HAS_COMPILER_V3
+class AeroAppHost;
+
 /// Discovers a sample directory's entry XAML, bundled auxiliary XAMLs, script sources,
 /// and resource/asset search paths into compile and host configurations.
 [[nodiscard]] bool DiscoverSampleProject(
@@ -90,6 +92,14 @@ struct AeroStencilJitStats {
 void DiscoverCatalogXamlSources(
     const std::filesystem::path& sampleDir,
     std::vector<CatalogXamlEntry>& outCatalogEntries);
+
+[[nodiscard]] bool CompileAndLoadIntoAppHost(
+    AeroAppHost& host,
+    const AeroV3CompileInput& input,
+    std::string* outError = nullptr);
+
+[[nodiscard]] const AeroV3CompileResult* GetAppHostLastCompileResult(
+    const AeroAppHost& host) noexcept;
 #endif
 
 class AeroAppHost final {
@@ -127,15 +137,20 @@ public:
 
     void RegisterAssetDirectory(std::string_view dir);
     void DiscoverAssetDirectories(const std::filesystem::path& sampleRoot);
-    void SetDevCompileResultOpaque(std::shared_ptr<void> result) noexcept;
+    using DevOpaqueDeleterFn = void (*)(void*) noexcept;
+    void SetDevCompileResultOpaque(void* result, DevOpaqueDeleterFn deleter) noexcept;
     [[nodiscard]] const void* DevCompileResultOpaque() const noexcept;
     void SetLastErrorMessage(std::string message);
 
 #ifdef AERO_HAS_COMPILER_V3
     [[nodiscard]] bool CompileAndLoad(
         const AeroV3CompileInput& input,
-        std::string* outError = nullptr);
-    [[nodiscard]] const AeroV3CompileResult* LastCompileResult() const noexcept;
+        std::string* outError = nullptr) {
+        return CompileAndLoadIntoAppHost(*this, input, outError);
+    }
+    [[nodiscard]] const AeroV3CompileResult* LastCompileResult() const noexcept {
+        return GetAppHostLastCompileResult(*this);
+    }
 #endif
 
     // Execution backend 2: C++17 AOT ProgramDescriptor (zero Interpreter)
@@ -291,6 +306,8 @@ private:
     [[nodiscard]] bool MountScriptRootObject(ObjectRef candidate);
     void FlushBindings();
     void FlushBindingsPostLayout();
+    [[nodiscard]] bool FlushPendingSimCommands(bool notifyDirtyObjects);
+    void RunUiHeapGcMaintenance(std::int32_t idleBudgetMs, bool sweepDeadObjectBoxes);
     void StepFrameInternal(float dtSeconds, bool forceRenderSync, bool skipScriptFrameCallbacks);
     void SetupStencilJitIfEnabled();
     void EnsureSimStencilJit() const;
@@ -341,8 +358,9 @@ private:
     std::unique_ptr<rs_aot::ExecutionContext> aotContext_;
     std::unique_ptr<rs_aot::ExecutionContext> simAotContext_;
 
-    // Fixed ODR layout shared identically by AeroGUI::AppRuntime (/GR-) and AeroGUI::AppDevHost.
-    std::shared_ptr<void> devCompileResultOpaque_;
+    // RTTI-independent opaque holder (zero std::shared_ptr _Ref_count_base ABI divergence across /GR- and /GR).
+    void* devCompileResultPtr_ = nullptr;
+    DevOpaqueDeleterFn devCompileResultDeleter_ = nullptr;
 
     CachedDispatchSymbols symbols_{};
     std::string preferredEntryClass_;

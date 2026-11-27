@@ -1,4 +1,5 @@
 #include "aero/app/AeroAppHost.hpp"
+#include "aero/app/AppBootstrap.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -21,6 +22,8 @@
 #endif
 #include <realscript/semantic/Semantic.h>
 
+#include "aero/core/ArbcCodec.hpp"
+#include "aero/core/ArbcCodec.hpp"
 #include "aero/core/StringUtils.hpp"
 #include "aero/render/FontAtlas.hpp"
 #include "aero/render/ImageAtlas.hpp"
@@ -37,6 +40,8 @@
 #include <malloc.h>
 #endif
 
+#include "aero/runtime/ScriptBackendFacade.hpp"
+
 namespace aero {
 
 namespace {
@@ -51,507 +56,25 @@ namespace {
     std::uint32_t width,
     std::uint32_t height,
     const std::uint8_t* rgba8) {
-    if (!rgba8 || width == 0u || height == 0u || filePath.empty()) {
-        return false;
-    }
-    const std::filesystem::path p(filePath);
-    std::error_code ec;
-    if (p.has_parent_path()) {
-        std::filesystem::create_directories(p.parent_path(), ec);
-    }
-    std::ofstream out(p, std::ios::binary | std::ios::trunc);
-    if (!out.is_open()) {
-        return false;
-    }
-    out << "P6\n" << width << " " << height << "\n255\n";
-    const std::size_t pixelCount = static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
-    std::vector<char> rgbBuf(pixelCount * 3u);
-    for (std::size_t i = 0u; i < pixelCount; ++i) {
-        rgbBuf[i * 3u + 0u] = static_cast<char>(rgba8[i * 4u + 0u]);
-        rgbBuf[i * 3u + 1u] = static_cast<char>(rgba8[i * 4u + 1u]);
-        rgbBuf[i * 3u + 2u] = static_cast<char>(rgba8[i * 4u + 2u]);
-    }
-    out.write(rgbBuf.data(), static_cast<std::streamsize>(rgbBuf.size()));
-    return out.good();
-}
-
-[[nodiscard]] bool IsStdlibModuleName(std::string_view moduleName) noexcept {
-    return moduleName.rfind("Aero.", 0u) == 0u ||
-           moduleName.rfind("RealScript.", 0u) == 0u;
-}
-
-[[nodiscard]] std::string NormalizeDoubleColonToDot(std::string_view s) {
-    std::string out;
-    out.reserve(s.size());
-    for (std::size_t i = 0u; i < s.size(); ++i) {
-        if (i + 1u < s.size() && s[i] == ':' && s[i + 1u] == ':') {
-            out.push_back('.');
-            ++i;
-        } else {
-            out.push_back(s[i]);
-        }
-    }
-    return out;
-}
-
-[[nodiscard]] bool EndsWithSymbol(std::string_view full, std::string_view suffix) noexcept {
-    if (full.size() < suffix.size() || suffix.empty()) {
-        return false;
-    }
-    if (full == suffix) {
-        return true;
-    }
-    if (full.compare(full.size() - suffix.size(), suffix.size(), suffix) != 0) {
-        return false;
-    }
-    if (suffix.front() == ':' || suffix.front() == '.') {
-        return true;
-    }
-    const char prev = full[full.size() - suffix.size() - 1u];
-    return prev == '.' || prev == ':';
-}
-
-[[nodiscard]] bool NameMatchesTypeSpec(
-    std::string_view moduleName,
-    std::string_view typeName,
-    std::string_view spec) noexcept {
-    if (spec.empty() || typeName.empty()) {
-        return false;
-    }
-    if (typeName == spec) {
-        return true;
-    }
-    std::string dotQualified;
-    std::string colonQualified;
-    if (!moduleName.empty()) {
-        dotQualified.reserve(moduleName.size() + 1u + typeName.size());
-        dotQualified.append(moduleName);
-        dotQualified.push_back('.');
-        dotQualified.append(typeName);
-        colonQualified.reserve(moduleName.size() + 2u + typeName.size());
-        colonQualified.append(moduleName);
-        colonQualified.append("::");
-        colonQualified.append(typeName);
-    }
-    if (!dotQualified.empty() && (dotQualified == spec || colonQualified == spec)) {
-        return true;
-    }
-    // Also tolerate Foo.Bar.Class when moduleName is Foo.Bar
-    std::string normalized(spec);
-    for (std::size_t pos = 0u; (pos = normalized.find("::", pos)) != std::string::npos;) {
-        normalized.replace(pos, 2u, ".");
-    }
-    return normalized == dotQualified || normalized == typeName;
+    return app::WriteRgba8PpmBuffer(std::filesystem::path(filePath), width, height, rgba8);
 }
 
 [[nodiscard]] std::uint64_t VisualNodeKey(VisualNodeId id) noexcept {
     return (static_cast<std::uint64_t>(id.generation) << 32u) | static_cast<std::uint64_t>(id.index);
 }
 
-[[nodiscard]] UnifiedValue DefaultFieldValue(rs_sem::PrimitiveType prim, rs_sem::SymbolId typeId) noexcept {
-    switch (prim) {
-        case rs_sem::PrimitiveType::Bool:
-            return UnifiedValue{false};
-        case rs_sem::PrimitiveType::Byte:
-            return UnifiedValue{rs_rt::ByteValue{0u}};
-        case rs_sem::PrimitiveType::SByte:
-            return UnifiedValue{rs_rt::SByteValue{0}};
-        case rs_sem::PrimitiveType::Short:
-            return UnifiedValue{rs_rt::ShortValue{0}};
-        case rs_sem::PrimitiveType::UShort:
-            return UnifiedValue{rs_rt::UShortValue{0u}};
-        case rs_sem::PrimitiveType::Int:
-            return UnifiedValue{std::int64_t{0}};
-        case rs_sem::PrimitiveType::UInt:
-            return UnifiedValue{rs_rt::UIntValue{0u}};
-        case rs_sem::PrimitiveType::Long:
-            return UnifiedValue{rs_rt::LongValue{0}};
-        case rs_sem::PrimitiveType::ULong:
-            return UnifiedValue{rs_rt::ULongValue{0u}};
-        case rs_sem::PrimitiveType::Float:
-            return UnifiedValue{rs_rt::FloatValue{0.0f}};
-        case rs_sem::PrimitiveType::Double:
-            return UnifiedValue{0.0};
-        case rs_sem::PrimitiveType::Char:
-            return UnifiedValue{rs_rt::CharValue{0u}};
-        case rs_sem::PrimitiveType::String:
-            return UnifiedValue{rs_rt::NullString{}};
-        case rs_sem::PrimitiveType::Object:
-            return UnifiedValue{rs_rt::NullObject{}};
-        case rs_sem::PrimitiveType::Array:
-            return UnifiedValue{rs_rt::NullArray{}};
-        case rs_sem::PrimitiveType::Handle: {
-            rs_rt::NativeHandle nh{};
-            nh.typeId = typeId;
-            return UnifiedValue{nh};
-        }
-        case rs_sem::PrimitiveType::Enum: {
-            rs_rt::EnumValue ev{};
-            ev.typeId = typeId;
-            ev.value = 0;
-            return UnifiedValue{ev};
-        }
-        case rs_sem::PrimitiveType::Struct:
-            if (const auto inlineStruct = rs_rt::makeDefaultInlineStructValue(typeId)) {
-                return *inlineStruct;
-            }
-            return UnifiedValue{};
-        default:
-            return UnifiedValue{};
-    }
-}
-
-[[nodiscard]] bool IsBytecodeTypeDerivedFrom(
-    const ProgramImage& image,
-    const rs_sem::TypeSymbol* type,
-    std::string_view baseShortName) noexcept {
-    std::unordered_set<SymbolId> visited;
-    const rs_sem::TypeSymbol* cur = type;
-    while (cur && visited.insert(cur->id).second) {
-        if (cur->name == baseShortName) {
-            return true;
-        }
-        if (cur->baseTypeId == 0u || cur->baseTypeId == cur->id) {
-            break;
-        }
-        cur = image.resolveType(cur->baseTypeId);
-    }
-    return false;
-}
-
-[[nodiscard]] const rs_aot::TypeDescriptor* FindAotTypeById(
-    const rs_aot::ProgramDescriptor& prog,
-    SymbolId typeId) noexcept {
-    if (!prog.types || typeId == 0u) {
-        return nullptr;
-    }
-    for (std::uint32_t i = 0u; i < prog.typeCount; ++i) {
-        if (prog.types[i].id == typeId) {
-            return &prog.types[i];
-        }
-    }
-    return nullptr;
-}
-
-[[nodiscard]] bool IsAotTypeDerivedFrom(
-    const rs_aot::ProgramDescriptor& prog,
-    const rs_aot::TypeDescriptor* type,
-    std::string_view baseShortName) noexcept {
-    std::unordered_set<SymbolId> visited;
-    const rs_aot::TypeDescriptor* cur = type;
-    while (cur && visited.insert(cur->id).second) {
-        if (cur->name && std::string_view(cur->name) == baseShortName) {
-            return true;
-        }
-        if (cur->baseTypeId == 0u || cur->baseTypeId == cur->id) {
-            break;
-        }
-        cur = FindAotTypeById(prog, cur->baseTypeId);
-    }
-    return false;
-}
-
-[[nodiscard]] SymbolId FindBytecodeFunctionSymbol(
-    const ProgramImage& image,
-    std::string_view exactOrSuffix,
-    bool excludeStdlibModules = false) noexcept {
-    if (exactOrSuffix.empty()) {
-        return 0u;
-    }
-    if (!excludeStdlibModules) {
-        if (const auto direct = image.findFunction(std::string(exactOrSuffix))) {
-            return *direct;
-        }
-    }
-    const std::string dotQuery = NormalizeDoubleColonToDot(exactOrSuffix);
-    std::string_view bareQuery = exactOrSuffix;
-    if (bareQuery.rfind("::", 0u) == 0u) {
-        bareQuery.remove_prefix(2u);
-    }
-    if (!excludeStdlibModules && dotQuery != exactOrSuffix) {
-        if (const auto directDot = image.findFunction(dotQuery)) {
-            return *directDot;
-        }
-    }
-    for (const auto& mod : image.modules()) {
-        if (excludeStdlibModules && IsStdlibModuleName(mod.name)) {
-            continue;
-        }
-        for (const auto& fn : mod.functions) {
-            if (fn.name == exactOrSuffix || fn.name == bareQuery || fn.name == dotQuery) {
-                return fn.symbolId;
-            }
-            const std::string qualColon = mod.name.empty() ? fn.name : (mod.name + "::" + fn.name);
-            const std::string qualDot = mod.name.empty() ? fn.name : (mod.name + "." + fn.name);
-            if (EndsWithSymbol(fn.name, exactOrSuffix) ||
-                EndsWithSymbol(fn.name, dotQuery) ||
-                EndsWithSymbol(qualColon, exactOrSuffix) ||
-                EndsWithSymbol(qualDot, dotQuery)) {
-                return fn.symbolId;
-            }
-        }
-    }
-    return 0u;
-}
-
-[[nodiscard]] SymbolId FindAotFunctionSymbol(
-    const rs_aot::ProgramDescriptor& prog,
-    std::string_view exactOrSuffix,
-    bool excludeStdlibPrefixes = false) noexcept {
-    if (!prog.functions || exactOrSuffix.empty()) {
-        return 0u;
-    }
-    const std::string dotQuery = NormalizeDoubleColonToDot(exactOrSuffix);
-    std::string_view bareQuery = exactOrSuffix;
-    if (bareQuery.rfind("::", 0u) == 0u) {
-        bareQuery.remove_prefix(2u);
-    }
-    auto isStdlibFn = [](std::string_view fname) noexcept {
-        return fname.rfind("Aero.", 0u) == 0u ||
-               fname.rfind("RealScript.", 0u) == 0u ||
-               fname.rfind("Aero::", 0u) == 0u ||
-               fname.rfind("RealScript::", 0u) == 0u;
-    };
-    for (std::uint32_t i = 0u; i < prog.functionCount; ++i) {
-        const auto& fn = prog.functions[i];
-        if (!fn.name) {
-            continue;
-        }
-        const std::string_view fname(fn.name);
-        if (excludeStdlibPrefixes && isStdlibFn(fname)) {
-            continue;
-        }
-        if (fname == exactOrSuffix || fname == dotQuery || fname == bareQuery) {
-            return fn.symbolId;
-        }
-    }
-    for (std::uint32_t i = 0u; i < prog.functionCount; ++i) {
-        const auto& fn = prog.functions[i];
-        if (!fn.name) {
-            continue;
-        }
-        const std::string_view fname(fn.name);
-        if (excludeStdlibPrefixes && isStdlibFn(fname)) {
-            continue;
-        }
-        if (EndsWithSymbol(fname, exactOrSuffix) ||
-            EndsWithSymbol(fname, dotQuery) ||
-            EndsWithSymbol(fname, bareQuery)) {
-            return fn.symbolId;
-        }
-    }
-    return 0u;
-}
-
-[[nodiscard]] SymbolId FindBytecodeClassMethod(
-    const ProgramImage& image,
-    SymbolId typeId,
-    std::string_view methodName,
-    std::size_t nonSelfArgCount) noexcept {
-    std::unordered_set<SymbolId> visited;
-    const rs_sem::TypeSymbol* cur = image.resolveType(typeId);
-    while (cur && visited.insert(cur->id).second) {
-        const std::string qualColon =
-            (cur->moduleName.empty() ? std::string{} : (cur->moduleName + ".")) +
-            cur->name + "::" + std::string(methodName);
-        if (const auto direct = image.findFunction(qualColon)) {
-            return *direct;
-        }
-        const std::string shortDot = cur->name + "." + std::string(methodName);
-        for (const auto& mod : image.modules()) {
-            if (!cur->moduleName.empty() && mod.name != cur->moduleName) {
-                continue;
-            }
-            for (const auto& fn : mod.functions) {
-                if (fn.name == shortDot || EndsWithSymbol(fn.name, shortDot)) {
-                    return fn.symbolId;
-                }
-            }
-        }
-        for (const auto& m : cur->methods) {
-            const std::size_t explicitParams =
-                (m.method && !m.staticMethod && !m.parameters.empty())
-                    ? (m.parameters.size() - 1u)
-                    : m.parameters.size();
-            if (m.name == methodName && explicitParams == nonSelfArgCount) {
-                return m.id;
-            }
-        }
-        if (cur->baseTypeId == 0u || cur->baseTypeId == cur->id) {
-            break;
-        }
-        cur = image.resolveType(cur->baseTypeId);
-    }
-    return 0u;
-}
-
-[[nodiscard]] SymbolId FindAotClassMethod(
-    const rs_aot::ProgramDescriptor& prog,
-    SymbolId typeId,
-    std::string_view methodName,
-    std::uint32_t totalArgCountIncludingSelf) noexcept {
-    std::unordered_set<SymbolId> visited;
-    const rs_aot::TypeDescriptor* cur = FindAotTypeById(prog, typeId);
-    while (cur && visited.insert(cur->id).second) {
-        std::string fullPrefix;
-        if (cur->moduleName && cur->moduleName[0] != '\0') {
-            fullPrefix.append(cur->moduleName);
-            fullPrefix.push_back('.');
-        }
-        if (cur->name) {
-            fullPrefix.append(cur->name);
-        }
-        const std::string shortSuffix = std::string(cur->name ? cur->name : "") + "::" + std::string(methodName);
-        const std::string dotSuffix = std::string(cur->name ? cur->name : "") + "." + std::string(methodName);
-        const std::string ctorAltSuffix = std::string(cur->name ? cur->name : "") + ".." + std::string(methodName);
-        const std::string fullColon = fullPrefix + "::" + std::string(methodName);
-        const std::string fullDot = fullPrefix + "." + std::string(methodName);
-        const std::string fullCtorAlt = fullPrefix + ".." + std::string(methodName);
-
-        if (prog.functions) {
-            for (std::uint32_t i = 0u; i < prog.functionCount; ++i) {
-                const auto& fn = prog.functions[i];
-                if (!fn.name || fn.parameterCount != totalArgCountIncludingSelf) {
-                    continue;
-                }
-                const std::string_view fname(fn.name);
-                if (fname == fullColon || fname == fullDot || fname == fullCtorAlt ||
-                    EndsWithSymbol(fname, shortSuffix) ||
-                    EndsWithSymbol(fname, dotSuffix) ||
-                    EndsWithSymbol(fname, ctorAltSuffix)) {
-                    return fn.symbolId;
-                }
-            }
-        }
-        if (cur->baseTypeId == 0u || cur->baseTypeId == cur->id) {
-            break;
-        }
-        cur = FindAotTypeById(prog, cur->baseTypeId);
-    }
-    return 0u;
-}
-
-[[nodiscard]] bool ReadMemberFromHeap(
+[[nodiscard]] ScriptBackendView MakeBackendView(
     const ExecutionDomainContext& domains,
     const ProgramImage* image,
     const Interpreter* interp,
     const rs_aot::ProgramDescriptor* aotProg,
-    rs_aot::ExecutionContext* aotCtx,
-    ObjectRef obj,
-    std::string_view memberName,
-    UnifiedValue& outValue) {
-    if (!obj.valid() || memberName.empty()) {
-        return false;
-    }
-    ManagedHeap* heap = domains.heapForObject(obj);
-    if (!heap || !heap->isAlive(obj)) {
-        return false;
-    }
-    const SymbolId typeId = heap->objectTypeIdFast(obj);
-    if (typeId == 0u) {
-        return false;
-    }
-
-    if (image) {
-        if (const auto slot = domains.resolvePropertySlot(*image, typeId, memberName)) {
-            rs_rt::RuntimeError err{};
-            if (domains.readPropertySlotFast(domains.activeDomain(), obj, *slot, outValue, &err, interp)) {
-                return true;
-            }
-            if (slot->isAutoProperty && slot->backingFieldIndex != PropertySlotHandle::InvalidIndex) {
-                UnifiedValue fp{};
-                if (heap->fieldGetInto(obj, slot->backingFieldIndex, fp)) {
-                    outValue = std::move(fp);
-                    return true;
-                }
-            }
-            if (slot->getterSymbolId != 0u && (interp || domains.hasDesktopJitInvoker())) {
-                const UnifiedValue arg0{obj};
-                const auto exec = domains.invokeMethod(domains.activeDomain(), interp, slot->getterSymbolId, &arg0, 1u);
-                if (exec.succeeded) {
-                    outValue = exec.value;
-                    return true;
-                }
-            }
-        }
-        if (const rs_sem::TypeSymbol* ts = image->resolveType(typeId)) {
-            const std::string backing = "$" + std::string(memberName);
-            for (const auto& f : ts->fields) {
-                if (!f.staticField && (f.name == memberName || f.name == backing)) {
-                    UnifiedValue fp{};
-                    if (heap->fieldGetInto(obj, f.index, fp)) {
-                        outValue = std::move(fp);
-                        return true;
-                    }
-                }
-            }
-        }
-        const SymbolId getterSym = FindBytecodeClassMethod(
-            *image, typeId, "get_" + std::string(memberName), 0u);
-        if (getterSym != 0u && (interp || domains.hasDesktopJitInvoker())) {
-            const UnifiedValue arg0{obj};
-            const auto exec = domains.invokeMethod(domains.activeDomain(), interp, getterSym, &arg0, 1u);
-            if (exec.succeeded) {
-                outValue = exec.value;
-                return true;
-            }
-        }
-    }
-
-    if (aotProg && aotCtx) {
-        const std::string backing = "$" + std::string(memberName);
-        std::unordered_set<SymbolId> visited;
-        const rs_aot::TypeDescriptor* cur = FindAotTypeById(*aotProg, typeId);
-        while (cur && visited.insert(cur->id).second) {
-            if (cur->fields) {
-                for (std::uint32_t fi = 0u; fi < cur->fieldCount; ++fi) {
-                    const auto& fd = cur->fields[fi];
-                    if (fd.staticField || !fd.name) {
-                        continue;
-                    }
-                    const std::string_view fname(fd.name);
-                    if (fname == memberName || fname == backing) {
-                        UnifiedValue fp{};
-                        if (heap->fieldGetInto(obj, fd.index, fp)) {
-                            outValue = std::move(fp);
-                            return true;
-                        }
-                    }
-                }
-            }
-            if (cur->baseTypeId == 0u || cur->baseTypeId == cur->id) {
-                break;
-            }
-            cur = FindAotTypeById(*aotProg, cur->baseTypeId);
-        }
-        const SymbolId getterSym = FindAotClassMethod(
-            *aotProg, typeId, "get_" + std::string(memberName), 1u);
-        if (getterSym != 0u) {
-            const UnifiedValue selfArg{obj};
-            if (aotCtx->invoke(getterSym, &selfArg, 1u, outValue)) {
-                return true;
-            }
-        }
-    }
-
-    return false;
-}
-
-[[nodiscard]] bool ReadScriptStringValue(
-    const ExecutionDomainContext& domains,
-    const UnifiedValue& val,
-    std::string& outStr) {
-    if (const auto* sv = std::get_if<StringValue>(&val)) {
-        outStr = sv->str();
-        return true;
-    }
-    if (const auto* ov = std::get_if<ObjectRef>(&val); ov && ov->valid()) {
-        if (const auto sv = domains.stringViewAcrossDomains(*ov)) {
-            outStr.assign(*sv);
-            return true;
-        }
-    }
-    return false;
+    rs_aot::ExecutionContext* aotCtx) noexcept {
+    return ScriptBackendView{
+        const_cast<ExecutionDomainContext*>(&domains),
+        image,
+        interp,
+        aotProg,
+        aotCtx};
 }
 
 [[nodiscard]] bool DecodeProgramBundleBytes(
@@ -559,57 +82,7 @@ namespace {
     std::size_t size,
     std::vector<rs_bc::Module>& outModules,
     std::string& outError) {
-    outModules.clear();
-    if (!data || size == 0u) {
-        outError = "DecodeProgramBundleBytes: empty bytecode buffer";
-        return false;
-    }
-
-    rs_diag::DiagnosticBag diag;
-    if (size >= 8u && std::memcmp(data, "ARBC", 4u) == 0) {
-        std::size_t pos = 4u;
-        auto readU32 = [&](std::uint32_t& out) -> bool {
-            if (pos + 4u > size) {
-                return false;
-            }
-            out = static_cast<std::uint32_t>(data[pos]) |
-                  (static_cast<std::uint32_t>(data[pos + 1u]) << 8u) |
-                  (static_cast<std::uint32_t>(data[pos + 2u]) << 16u) |
-                  (static_cast<std::uint32_t>(data[pos + 3u]) << 24u);
-            pos += 4u;
-            return true;
-        };
-
-        std::uint32_t modCount = 0u;
-        if (!readU32(modCount) || modCount == 0u || modCount > 1024u) {
-            outError = "DecodeProgramBundleBytes: invalid ARBC module count";
-            return false;
-        }
-        outModules.resize(modCount);
-        for (std::uint32_t i = 0u; i < modCount; ++i) {
-            std::uint32_t modSize = 0u;
-            if (!readU32(modSize) || pos + modSize > size) {
-                outError = "DecodeProgramBundleBytes: truncated ARBC module payload";
-                outModules.clear();
-                return false;
-            }
-            if (!rs_bc::decodeModule(data + pos, modSize, outModules[i], diag) || diag.hasErrors()) {
-                outError = "DecodeProgramBundleBytes: failed decoding ARBC module";
-                outModules.clear();
-                return false;
-            }
-            pos += modSize;
-        }
-        return true;
-    }
-
-    rs_bc::Module singleMod;
-    if (!rs_bc::decodeModule(data, size, singleMod, diag) || diag.hasErrors()) {
-        outError = "DecodeProgramBundleBytes: failed decoding single bytecode module";
-        return false;
-    }
-    outModules.push_back(std::move(singleMod));
-    return true;
+    return DecodeArbcBundle(data, size, outModules, /*allowSingleModuleFallback=*/true, &outError);
 }
 
 } // namespace
@@ -696,64 +169,23 @@ void AeroAppHost::RegisterAssetDirectory(std::string_view dir) {
 }
 
 void AeroAppHost::DiscoverAssetDirectories(const std::filesystem::path& sampleRoot) {
-    namespace fs = std::filesystem;
-    std::error_code ec;
-    if (sampleRoot.empty() || !fs::exists(sampleRoot, ec)) {
-        return;
-    }
-    const fs::path root = sampleRoot.lexically_normal();
-    auto registerDirIfExists = [&](const fs::path& dir) {
-        std::error_code dirEc;
-        if (fs::is_directory(dir, dirEc)) {
-            RegisterAssetDirectoryInternal(dir.lexically_normal().generic_string());
-        }
-    };
-    const fs::path dataDir = root / "Data";
-    const fs::path baseDirs[] = {root, dataDir};
-    const char* kSubDirs[] = {
-        "",
-        "Images",
-        "Images/Items",
-        "Fonts",
-        "Sounds",
-        "Samples",
-        "Samples/Images",
-        "Samples/Fonts",
-        "Theme",
-        "Theme/Fonts",
-    };
-    for (const fs::path& base : baseDirs) {
-        for (const char* sub : kSubDirs) {
-            registerDirIfExists(sub[0] == '\0' ? base : (base / sub));
-        }
-    }
-
-    std::error_code probeEc;
-    fs::path probe = root.is_absolute() ? root : fs::absolute(root, probeEc);
-    if (probeEc || probe.empty()) {
-        probe = root;
-    }
-    for (int up = 0; up < 5 && !probe.empty(); ++up) {
-        registerDirIfExists(probe / "Theme" / "Data");
-        registerDirIfExists(probe / "Theme" / "Data" / "Theme");
-        registerDirIfExists(probe / "Theme" / "Data" / "Theme" / "Fonts");
-        registerDirIfExists(probe / "Samples" / "Theme" / "Data");
-        registerDirIfExists(probe / "Samples" / "Theme" / "Data" / "Theme");
-        registerDirIfExists(probe / "Samples" / "Theme" / "Data" / "Theme" / "Fonts");
-        const fs::path parent = probe.parent_path();
-        if (parent == probe) {
-            break;
-        }
-        probe = parent;
+    std::vector<std::string> dirs;
+    app::DiscoverSampleAssetDirectories(sampleRoot, dirs);
+    for (const auto& dir : dirs) {
+        RegisterAssetDirectoryInternal(dir);
     }
 }
 
-void AeroAppHost::SetDevCompileResultOpaque(std::shared_ptr<void> result) noexcept {
-    devCompileResultOpaque_ = std::move(result);
+void AeroAppHost::SetDevCompileResultOpaque(void* result, DevOpaqueDeleterFn deleter) noexcept {
+    if (devCompileResultPtr_ && devCompileResultDeleter_) {
+        devCompileResultDeleter_(devCompileResultPtr_);
+    }
+    devCompileResultPtr_ = result;
+    devCompileResultDeleter_ = deleter;
 }
 
 const void* AeroAppHost::DevCompileResultOpaque() const noexcept {
-    return devCompileResultOpaque_.get();
+    return devCompileResultPtr_;
 }
 
 void AeroAppHost::SetLastErrorMessage(std::string message) {
@@ -762,6 +194,7 @@ void AeroAppHost::SetLastErrorMessage(std::string message) {
 
 AeroAppHost::~AeroAppHost() {
     Shutdown();
+    SetDevCompileResultOpaque(nullptr, nullptr);
 }
 
 void AeroAppHost::WireKernelBridges() {
@@ -1003,56 +436,31 @@ void AeroAppHost::ResetLoadedProgramState() noexcept {
 
 void AeroAppHost::ResolveDispatchSymbols() {
     symbols_ = CachedDispatchSymbols{};
-    if (programImage_) {
-        const auto find = [&](std::string_view suffix) -> SymbolId {
-            return FindBytecodeFunctionSymbol(*programImage_, suffix);
-        };
-        symbols_.dispatchPointer = find("InputDispatcher::__AeroDispatchPointer");
-        symbols_.dispatchKey = find("InputDispatcher::__AeroDispatchKey");
-        symbols_.dispatchText = find("InputDispatcher::__AeroDispatchText");
-        symbols_.dispatchFocus = find("InputDispatcher::__AeroDispatchFocus");
-        symbols_.dispatchCustomMeasure = find("InputDispatcher::__AeroDispatchCustomMeasure");
-        symbols_.dispatchDraw = find("InputDispatcher::__AeroDispatchDraw");
-        symbols_.bindingFlush = find("BindingEngine::Flush");
-        symbols_.bindingFlushPostLayout = find("BindingEngine::FlushPostLayout");
-        symbols_.bindingStepFrameTicks = find("BindingEngine::StepFrameTicks");
-        symbols_.windowShow = find("Window::Show");
-        symbols_.applyTemplate = find("FrameworkElement::ApplyTemplate");
-        symbols_.controlApplyTemplate = find("Control::ApplyTemplate");
-        symbols_.applyTemplateSubtree = find("UIElement::ApplyTemplateSubtree");
-        symbols_.ensureLoadedSubtree = find("UIElement::EnsureLoadedSubtree");
-        symbols_.popupSetOverlayHost = find("PopupService::SetOverlayHost");
-        symbols_.registerWorkbenchFactories =
-            FindBytecodeFunctionSymbol(*programImage_, "Aero.UI::__RegisterWorkbenchXamlFactories");
-        if (symbols_.registerWorkbenchFactories == 0u) {
-            symbols_.registerWorkbenchFactories = find("__RegisterWorkbenchXamlFactories");
-        }
-        symbols_.registerCompiledXamlCatalog = find("__AeroCompiledXamlCatalogInit::RegisterAll");
-    } else if (aotDescriptor_) {
-        const auto find = [&](std::string_view suffix) -> SymbolId {
-            return FindAotFunctionSymbol(*aotDescriptor_, suffix);
-        };
-        symbols_.dispatchPointer = find("InputDispatcher::__AeroDispatchPointer");
-        symbols_.dispatchKey = find("InputDispatcher::__AeroDispatchKey");
-        symbols_.dispatchText = find("InputDispatcher::__AeroDispatchText");
-        symbols_.dispatchFocus = find("InputDispatcher::__AeroDispatchFocus");
-        symbols_.dispatchCustomMeasure = find("InputDispatcher::__AeroDispatchCustomMeasure");
-        symbols_.dispatchDraw = find("InputDispatcher::__AeroDispatchDraw");
-        symbols_.bindingFlush = find("BindingEngine::Flush");
-        symbols_.bindingFlushPostLayout = find("BindingEngine::FlushPostLayout");
-        symbols_.bindingStepFrameTicks = find("BindingEngine::StepFrameTicks");
-        symbols_.windowShow = find("Window::Show");
-        symbols_.applyTemplate = find("FrameworkElement::ApplyTemplate");
-        symbols_.controlApplyTemplate = find("Control::ApplyTemplate");
-        symbols_.applyTemplateSubtree = find("UIElement::ApplyTemplateSubtree");
-        symbols_.ensureLoadedSubtree = find("UIElement::EnsureLoadedSubtree");
-        symbols_.popupSetOverlayHost = find("PopupService::SetOverlayHost");
-        symbols_.registerWorkbenchFactories = find("Aero.UI::__RegisterWorkbenchXamlFactories");
-        if (symbols_.registerWorkbenchFactories == 0u) {
-            symbols_.registerWorkbenchFactories = find("__RegisterWorkbenchXamlFactories");
-        }
-        symbols_.registerCompiledXamlCatalog = find("__AeroCompiledXamlCatalogInit::RegisterAll");
+    const ScriptBackendView backend = MakeBackendView(
+        domains_, programImage_.get(), interpreter_.get(), aotDescriptor_, aotContext_.get());
+    const auto find = [&](std::string_view suffix) -> SymbolId {
+        return FindBackendFunctionSymbol(backend, suffix);
+    };
+    symbols_.dispatchPointer = find("InputDispatcher::__AeroDispatchPointer");
+    symbols_.dispatchKey = find("InputDispatcher::__AeroDispatchKey");
+    symbols_.dispatchText = find("InputDispatcher::__AeroDispatchText");
+    symbols_.dispatchFocus = find("InputDispatcher::__AeroDispatchFocus");
+    symbols_.dispatchCustomMeasure = find("InputDispatcher::__AeroDispatchCustomMeasure");
+    symbols_.dispatchDraw = find("InputDispatcher::__AeroDispatchDraw");
+    symbols_.bindingFlush = find("BindingEngine::Flush");
+    symbols_.bindingFlushPostLayout = find("BindingEngine::FlushPostLayout");
+    symbols_.bindingStepFrameTicks = find("BindingEngine::StepFrameTicks");
+    symbols_.windowShow = find("Window::Show");
+    symbols_.applyTemplate = find("FrameworkElement::ApplyTemplate");
+    symbols_.controlApplyTemplate = find("Control::ApplyTemplate");
+    symbols_.applyTemplateSubtree = find("UIElement::ApplyTemplateSubtree");
+    symbols_.ensureLoadedSubtree = find("UIElement::EnsureLoadedSubtree");
+    symbols_.popupSetOverlayHost = find("PopupService::SetOverlayHost");
+    symbols_.registerWorkbenchFactories = find("Aero.UI::__RegisterWorkbenchXamlFactories");
+    if (symbols_.registerWorkbenchFactories == 0u) {
+        symbols_.registerWorkbenchFactories = find("__RegisterWorkbenchXamlFactories");
     }
+    symbols_.registerCompiledXamlCatalog = find("__AeroCompiledXamlCatalogInit::RegisterAll");
 }
 
 bool AeroAppHost::LoadProgramImage(
@@ -1210,11 +618,11 @@ bool AeroAppHost::LoadProgramImageInternal(
             }
             std::string name;
             if (n->hasScriptOwner && n->scriptOwner.valid()) {
+                const ScriptBackendView backend = MakeBackendView(
+                    domains_, programImage_.get(), interpreter_.get(), aotDescriptor_, aotContext_.get());
                 UnifiedValue nv{};
-                if (ReadMemberFromHeap(
-                        domains_, programImage_.get(), interpreter_.get(), aotDescriptor_, aotContext_.get(),
-                        n->scriptOwner, "Name", nv)) {
-                    (void)ReadScriptStringValue(domains_, nv, name);
+                if (ReadSingleMember(backend, n->scriptOwner, "Name", nv)) {
+                    (void)TryExtractStringValue(backend, nv, name);
                 }
             }
             std::fprintf(
@@ -1590,59 +998,12 @@ bool AeroAppHost::InstantiateAndMountEntry(std::string_view entryHint) {
     auto instantiateBytecodeType = [&](const rs_sem::TypeSymbol& rawTs) -> bool {
         const rs_sem::TypeSymbol* resolved = programImage_->resolveType(rawTs.id);
         const rs_sem::TypeSymbol& ts = resolved ? *resolved : rawTs;
-        auto findFieldTypeId = [&](std::string_view typeSpec) noexcept -> SymbolId {
-            if (typeSpec.empty()) {
-                return 0u;
-            }
-            for (const auto& m : programImage_->modules()) {
-                for (const auto& t : m.types) {
-                    if (NameMatchesTypeSpec(t.moduleName, t.name, typeSpec)) {
-                        return t.id;
-                    }
-                }
-            }
-            return 0u;
-        };
-
-        std::vector<UnifiedValue> fields;
-        std::vector<std::size_t> refFields;
-        fields.reserve(ts.fields.size());
-        for (std::size_t fi = 0u; fi < ts.fields.size(); ++fi) {
-            const auto& f = ts.fields[fi];
-            const SymbolId fTypeId = findFieldTypeId(f.typeName);
-            fields.push_back(DefaultFieldValue(f.type, fTypeId));
-            if (f.type == rs_sem::PrimitiveType::String ||
-                f.type == rs_sem::PrimitiveType::Object ||
-                f.type == rs_sem::PrimitiveType::Array ||
-                (f.type == rs_sem::PrimitiveType::Struct &&
-                 !rs_rt::makeDefaultInlineStructValue(fTypeId).has_value())) {
-                refFields.push_back(fi);
-            }
-        }
-        RuntimeError allocErr{};
-        const auto alloc = domains_.uiHeap().allocateObject(
-            ts.id, std::move(fields), std::move(refFields), &allocErr);
-        if (!alloc) {
-            lastError_ = "allocateObject failed: " + allocErr.message;
+        ObjectRef allocObj{};
+        if (!AllocateBytecodeObjectWithDefaults(*programImage_, domains_.uiHeap(), ts, allocObj, &lastError_)) {
             return false;
         }
-        PersistentRoot pin = domains_.uiHeap().retain(*alloc);
-        SymbolId ctorId = 0u;
-        for (const auto& c : ts.constructors) {
-            if (!c.staticMethod && c.parameters.empty()) {
-                ctorId = c.id;
-                break;
-            }
-        }
-        if (ctorId == 0u) {
-            const std::string qName = ts.moduleName.empty()
-                ? ts.name
-                : (ts.moduleName + "." + ts.name);
-            ctorId = FindBytecodeFunctionSymbol(*programImage_, qName + "::.ctor");
-            if (ctorId == 0u) {
-                ctorId = FindBytecodeFunctionSymbol(*programImage_, ts.name + "..ctor");
-            }
-        }
+        PersistentRoot pin = domains_.uiHeap().retain(allocObj);
+        const SymbolId ctorId = FindBytecodeDefaultConstructor(*programImage_, ts);
         if (trace) {
             std::fprintf(stderr, "[AERO_TRACE] instantiateBytecodeType '%s.%s' id=%llu fields=%zu ctorId=%llu\n",
                 ts.moduleName.c_str(), ts.name.c_str(),
@@ -1656,7 +1017,7 @@ bool AeroAppHost::InstantiateAndMountEntry(std::string_view entryHint) {
             ctorOpts.limits.instructionBudget = 128'000'000u;
             ctorOpts.limits.gcWorkBudget = 0u;
             const auto exec = domains_.invokeMethod(
-                DomainKind::UiPresentation, interpreter_.get(), ctorId, {UnifiedValue{*alloc}}, ctorOpts);
+                DomainKind::UiPresentation, interpreter_.get(), ctorId, {UnifiedValue{allocObj}}, ctorOpts);
             if (!exec.succeeded) {
                 std::string stackSummary;
                 for (std::size_t si = 0u; si < exec.error.stackTrace.size() && si < 6u; ++si) {
@@ -1677,7 +1038,7 @@ bool AeroAppHost::InstantiateAndMountEntry(std::string_view entryHint) {
                 return MountScriptRootObject(builtObj);
             }
         }
-        return MountScriptRootObject(*alloc);
+        return MountScriptRootObject(allocObj);
     };
 
     auto instantiateAotType = [&](const rs_aot::TypeDescriptor& td) -> bool {
@@ -1702,86 +1063,71 @@ bool AeroAppHost::InstantiateAndMountEntry(std::string_view entryHint) {
     };
 
     auto initializeAppResourcesIfPresent = [&]() {
-        if (!programImage_) {
-            return;
-        }
-        for (const auto& mod : programImage_->modules()) {
-            if (IsStdlibModuleName(mod.name)) {
-                continue;
+        if (programImage_) {
+            for (const auto& mod : programImage_->modules()) {
+                if (IsStdlibModuleName(mod.name)) {
+                    continue;
+                }
+                for (const auto& ts : mod.types) {
+                    if (ts.kind != rs_sem::TypeKind::Class || ts.abstractType || ts.staticType ||
+                        IsStdlibModuleName(ts.moduleName)) {
+                        continue;
+                    }
+                    if (!ts.moduleName.empty() && ts.moduleName != mod.name) {
+                        continue;
+                    }
+                    if (!IsBytecodeTypeDerivedFrom(*programImage_, &ts, "Application")) {
+                        continue;
+                    }
+                    if ((!entryHint.empty() && NameMatchesTypeSpec(ts.moduleName, ts.name, entryHint)) ||
+                        (!preferredEntryClass_.empty() && NameMatchesTypeSpec(ts.moduleName, ts.name, preferredEntryClass_))) {
+                        continue;
+                    }
+                    const rs_sem::TypeSymbol* resolved = programImage_->resolveType(ts.id);
+                    const rs_sem::TypeSymbol& fullTs = resolved ? *resolved : ts;
+                    ObjectRef allocObj{};
+                    if (!AllocateBytecodeObjectWithDefaults(*programImage_, domains_.uiHeap(), fullTs, allocObj)) {
+                        continue;
+                    }
+                    PersistentRoot pin = domains_.uiHeap().retain(allocObj);
+                    if (const SymbolId ctorId = FindBytecodeDefaultConstructor(*programImage_, fullTs); ctorId != 0u) {
+                        const UnifiedValue ctorArgs[1]{UnifiedValue{allocObj}};
+                        (void)InvokeSymbol(ctorId, rs_rt::ValueSpan{ctorArgs, 1u}, nullptr, DomainKind::UiPresentation);
+                    }
+                    if (const SymbolId initSym = FindBytecodeClassMethod(*programImage_, fullTs.id, "InitializeComponent", 0u); initSym != 0u) {
+                        const UnifiedValue initArgs[1]{UnifiedValue{allocObj}};
+                        (void)InvokeSymbol(initSym, rs_rt::ValueSpan{initArgs, 1u}, nullptr, DomainKind::UiPresentation);
+                    }
+                }
             }
-            for (const auto& ts : mod.types) {
-                if (ts.kind != rs_sem::TypeKind::Class || ts.abstractType || ts.staticType ||
-                    IsStdlibModuleName(ts.moduleName)) {
+        } else if (aotDescriptor_ && aotContext_ && aotDescriptor_->types) {
+            for (std::uint32_t ti = 0u; ti < aotDescriptor_->typeCount; ++ti) {
+                const auto& td = aotDescriptor_->types[ti];
+                if (td.kind != rs_sem::TypeKind::Class || td.interfaceType || td.delegateType || !td.name) {
                     continue;
                 }
-                if (!ts.moduleName.empty() && ts.moduleName != mod.name) {
+                const std::string_view modName = td.moduleName ? std::string_view(td.moduleName) : std::string_view{};
+                if (IsStdlibModuleName(modName) || !IsAotTypeDerivedFrom(*aotDescriptor_, &td, "Application")) {
                     continue;
                 }
-                if (!IsBytecodeTypeDerivedFrom(*programImage_, &ts, "Application")) {
+                if ((!entryHint.empty() && NameMatchesTypeSpec(modName, td.name, entryHint)) ||
+                    (!preferredEntryClass_.empty() && NameMatchesTypeSpec(modName, td.name, preferredEntryClass_))) {
                     continue;
                 }
-                const std::string qName = ts.moduleName.empty()
-                    ? ts.name
-                    : (ts.moduleName + "." + ts.name);
-                if ((!entryHint.empty() && NameMatchesTypeSpec(ts.moduleName, ts.name, entryHint)) ||
-                    (!preferredEntryClass_.empty() && NameMatchesTypeSpec(ts.moduleName, ts.name, preferredEntryClass_))) {
+                UnifiedValue allocVal{};
+                if (!aotContext_->newObject(td.id, allocVal)) {
                     continue;
                 }
-                const rs_sem::TypeSymbol* resolved = programImage_->resolveType(ts.id);
-                const rs_sem::TypeSymbol& fullTs = resolved ? *resolved : ts;
-                std::vector<UnifiedValue> fields;
-                std::vector<std::size_t> refFields;
-                fields.reserve(fullTs.fields.size());
-                for (std::size_t fi = 0u; fi < fullTs.fields.size(); ++fi) {
-                    const auto& f = fullTs.fields[fi];
-                    SymbolId fTypeId = 0u;
-                    if (!f.typeName.empty()) {
-                        for (const auto& m : programImage_->modules()) {
-                            for (const auto& t : m.types) {
-                                if (NameMatchesTypeSpec(t.moduleName, t.name, f.typeName)) {
-                                    fTypeId = t.id;
-                                    break;
-                                }
-                            }
-                            if (fTypeId != 0u) {
-                                break;
-                            }
-                        }
+                if (const auto* objRef = std::get_if<ObjectRef>(&allocVal); objRef && objRef->valid()) {
+                    PersistentRoot pin = domains_.uiHeap().retain(*objRef);
+                    if (const SymbolId ctorId = FindAotClassMethod(*aotDescriptor_, td.id, ".ctor", 1u); ctorId != 0u) {
+                        UnifiedValue unused{};
+                        (void)aotContext_->invoke(ctorId, &allocVal, 1u, unused);
                     }
-                    fields.push_back(DefaultFieldValue(f.type, fTypeId));
-                    if (f.type == rs_sem::PrimitiveType::String ||
-                        f.type == rs_sem::PrimitiveType::Object ||
-                        f.type == rs_sem::PrimitiveType::Array ||
-                        (f.type == rs_sem::PrimitiveType::Struct &&
-                         !rs_rt::makeDefaultInlineStructValue(fTypeId).has_value())) {
-                        refFields.push_back(fi);
+                    if (const SymbolId initId = FindAotClassMethod(*aotDescriptor_, td.id, "InitializeComponent", 1u); initId != 0u) {
+                        UnifiedValue unused{};
+                        (void)aotContext_->invoke(initId, &allocVal, 1u, unused);
                     }
-                }
-                RuntimeError allocErr{};
-                const auto alloc = domains_.uiHeap().allocateObject(
-                    fullTs.id, std::move(fields), std::move(refFields), &allocErr);
-                if (!alloc) {
-                    continue;
-                }
-                PersistentRoot pin = domains_.uiHeap().retain(*alloc);
-                SymbolId ctorId = 0u;
-                for (const auto& c : fullTs.constructors) {
-                    if (!c.staticMethod && c.parameters.empty()) {
-                        ctorId = c.id;
-                        break;
-                    }
-                }
-                if (ctorId == 0u) {
-                    ctorId = FindBytecodeFunctionSymbol(*programImage_, qName + "::.ctor");
-                }
-                if (ctorId != 0u) {
-                    const UnifiedValue ctorArgs[1]{UnifiedValue{*alloc}};
-                    (void)InvokeSymbol(ctorId, rs_rt::ValueSpan{ctorArgs, 1u}, nullptr, DomainKind::UiPresentation);
-                }
-                const SymbolId initSym = FindBytecodeClassMethod(*programImage_, fullTs.id, "InitializeComponent", 0u);
-                if (initSym != 0u) {
-                    const UnifiedValue initArgs[1]{UnifiedValue{*alloc}};
-                    (void)InvokeSymbol(initSym, rs_rt::ValueSpan{initArgs, 1u}, nullptr, DomainKind::UiPresentation);
                 }
             }
         }
@@ -1936,56 +1282,28 @@ bool AeroAppHost::MountScriptRootObject(ObjectRef candidate) {
         return false;
     }
 
+    const ScriptBackendView backend = MakeBackendView(
+        domains_, programImage_.get(), interpreter_.get(), aotDescriptor_, aotContext_.get());
     const SymbolId candTypeId = domains_.uiHeap().objectTypeIdFast(candidate);
-    const bool isApplication = candTypeId != 0u &&
-        ((programImage_ && [&]() {
-              const rs_sem::TypeSymbol* rt = programImage_->resolveType(candTypeId);
-              return rt && IsBytecodeTypeDerivedFrom(*programImage_, rt, "Application");
-          }()) ||
-         (aotDescriptor_ && [&]() {
-              const rs_aot::TypeDescriptor* rt = FindAotTypeById(*aotDescriptor_, candTypeId);
-              return rt && IsAotTypeDerivedFrom(*aotDescriptor_, rt, "Application");
-          }()));
+    const bool isApplication = IsTypeDerivedFrom(backend, candTypeId, "Application");
 
     if (isApplication) {
-        const SymbolId initSym = programImage_
-            ? FindBytecodeClassMethod(*programImage_, candTypeId, "InitializeComponent", 0u)
-            : (aotDescriptor_ ? FindAotClassMethod(*aotDescriptor_, candTypeId, "InitializeComponent", 1u) : 0u);
-        if (initSym != 0u) {
+        if (const SymbolId initSym = FindBackendClassMethod(backend, candTypeId, "InitializeComponent", 0u);
+            initSym != 0u) {
             const UnifiedValue initArgs[1]{UnifiedValue{candidate}};
             (void)InvokeSymbol(initSym, rs_rt::ValueSpan{initArgs, 1u}, nullptr, DomainKind::UiPresentation);
         }
         UnifiedValue checkWinVal{};
-        const bool hasMainWin = ReadMemberFromHeap(
-                domains_,
-                programImage_.get(),
-                interpreter_.get(),
-                aotDescriptor_,
-                aotContext_.get(),
-                candidate,
-                "MainWindow",
-                checkWinVal) &&
+        const bool hasMainWin = ReadSingleMember(backend, candidate, "MainWindow", checkWinVal) &&
             std::holds_alternative<ObjectRef>(checkWinVal) &&
             std::get<ObjectRef>(checkWinVal).valid();
         if (!hasMainWin) {
-            SymbolId runSym = programImage_
-                ? FindBytecodeClassMethod(*programImage_, candTypeId, "Run", 1u)
-                : (aotDescriptor_ ? FindAotClassMethod(*aotDescriptor_, candTypeId, "Run", 2u) : 0u);
-            if (runSym != 0u) {
+            if (const SymbolId runSym1 = FindBackendClassMethod(backend, candTypeId, "Run", 1u); runSym1 != 0u) {
                 const UnifiedValue runArgs[2]{UnifiedValue{candidate}, UnifiedValue{rs_rt::NullObject{}}};
-                (void)InvokeSymbol(
-                    runSym,
-                    rs_rt::ValueSpan{runArgs, 2u},
-                    nullptr,
-                    DomainKind::UiPresentation);
-            } else {
-                runSym = programImage_
-                    ? FindBytecodeClassMethod(*programImage_, candTypeId, "Run", 0u)
-                    : (aotDescriptor_ ? FindAotClassMethod(*aotDescriptor_, candTypeId, "Run", 1u) : 0u);
-                if (runSym != 0u) {
-                    const UnifiedValue runArgs[1]{UnifiedValue{candidate}};
-                    (void)InvokeSymbol(runSym, rs_rt::ValueSpan{runArgs, 1u}, nullptr, DomainKind::UiPresentation);
-                }
+                (void)InvokeSymbol(runSym1, rs_rt::ValueSpan{runArgs, 2u}, nullptr, DomainKind::UiPresentation);
+            } else if (const SymbolId runSym0 = FindBackendClassMethod(backend, candTypeId, "Run", 0u); runSym0 != 0u) {
+                const UnifiedValue runArgs[1]{UnifiedValue{candidate}};
+                (void)InvokeSymbol(runSym0, rs_rt::ValueSpan{runArgs, 1u}, nullptr, DomainKind::UiPresentation);
             }
         }
     }
@@ -1994,15 +1312,7 @@ bool AeroAppHost::MountScriptRootObject(ObjectRef candidate) {
     // Unwrap Application -> MainWindow if caller returned an Application instance
     {
         UnifiedValue mainWinVal{};
-        if (ReadMemberFromHeap(
-                domains_,
-                programImage_.get(),
-                interpreter_.get(),
-                aotDescriptor_,
-                aotContext_.get(),
-                candidate,
-                "MainWindow",
-                mainWinVal)) {
+        if (ReadSingleMember(backend, candidate, "MainWindow", mainWinVal)) {
             if (const auto* winRef = std::get_if<ObjectRef>(&mainWinVal); winRef && winRef->valid()) {
                 uiRoot = *winRef;
             }
@@ -2027,26 +1337,12 @@ bool AeroAppHost::MountScriptRootObject(ObjectRef candidate) {
     SymbolId deferredShowSym = 0u;
     SymbolId deferredLoadSym = 0u;
     if (typeId != 0u) {
-        if (programImage_) {
-            deferredShowSym = FindBytecodeClassMethod(*programImage_, typeId, "Show", 0u);
-            symbols_.stepGame = FindBytecodeClassMethod(*programImage_, typeId, "StepGame", 1u);
-            symbols_.rootSyncHudFromSim = FindBytecodeClassMethod(*programImage_, typeId, "SyncHudFromSim", 0u);
-            if (deferredShowSym == 0u && symbols_.windowShow != 0u) {
-                const rs_sem::TypeSymbol* rt = programImage_->resolveType(typeId);
-                if (rt && IsBytecodeTypeDerivedFrom(*programImage_, rt, "Window")) {
-                    deferredShowSym = symbols_.windowShow;
-                }
-            }
-        } else if (aotDescriptor_) {
-            deferredShowSym = FindAotClassMethod(*aotDescriptor_, typeId, "Show", 1u);
-            symbols_.stepGame = FindAotClassMethod(*aotDescriptor_, typeId, "StepGame", 2u);
-            symbols_.rootSyncHudFromSim = FindAotClassMethod(*aotDescriptor_, typeId, "SyncHudFromSim", 1u);
-            if (deferredShowSym == 0u && symbols_.windowShow != 0u) {
-                const rs_aot::TypeDescriptor* rt = FindAotTypeById(*aotDescriptor_, typeId);
-                if (rt && IsAotTypeDerivedFrom(*aotDescriptor_, rt, "Window")) {
-                    deferredShowSym = symbols_.windowShow;
-                }
-            }
+        deferredShowSym = FindBackendClassMethod(backend, typeId, "Show", 0u);
+        symbols_.stepGame = FindBackendClassMethod(backend, typeId, "StepGame", 1u);
+        symbols_.rootSyncHudFromSim = FindBackendClassMethod(backend, typeId, "SyncHudFromSim", 0u);
+        if (deferredShowSym == 0u && symbols_.windowShow != 0u &&
+            IsTypeDerivedFrom(backend, typeId, "Window")) {
+            deferredShowSym = symbols_.windowShow;
         }
 
         logTrace("MountScriptRootObject: invoking SetOverlayHost/ApplyTemplateSubtree");
@@ -2055,34 +1351,17 @@ bool AeroAppHost::MountScriptRootObject(ObjectRef candidate) {
             (void)InvokeSymbol(
                 symbols_.popupSetOverlayHost, rs_rt::ValueSpan{overlayArgs, 1u}, nullptr, DomainKind::UiPresentation);
         }
-        SymbolId tplSym = 0u;
-        SymbolId loadSym = 0u;
-        if (programImage_) {
-            tplSym = symbols_.applyTemplateSubtree != 0u
-                ? symbols_.applyTemplateSubtree
-                : FindBytecodeClassMethod(*programImage_, typeId, "ApplyTemplate", 0u);
-            if (tplSym == 0u) {
-                tplSym = symbols_.controlApplyTemplate != 0u
-                    ? symbols_.controlApplyTemplate
-                    : symbols_.applyTemplate;
-            }
-            loadSym = FindBytecodeClassMethod(*programImage_, typeId, "EnsureLoadedSubtree", 0u);
-            if (loadSym == 0u) {
-                loadSym = symbols_.ensureLoadedSubtree;
-            }
-        } else if (aotDescriptor_) {
-            tplSym = symbols_.applyTemplateSubtree != 0u
-                ? symbols_.applyTemplateSubtree
-                : FindAotClassMethod(*aotDescriptor_, typeId, "ApplyTemplate", 1u);
-            if (tplSym == 0u) {
-                tplSym = symbols_.controlApplyTemplate != 0u
-                    ? symbols_.controlApplyTemplate
-                    : symbols_.applyTemplate;
-            }
-            loadSym = FindAotClassMethod(*aotDescriptor_, typeId, "EnsureLoadedSubtree", 1u);
-            if (loadSym == 0u) {
-                loadSym = symbols_.ensureLoadedSubtree;
-            }
+        SymbolId tplSym = symbols_.applyTemplateSubtree != 0u
+            ? symbols_.applyTemplateSubtree
+            : FindBackendClassMethod(backend, typeId, "ApplyTemplate", 0u);
+        if (tplSym == 0u) {
+            tplSym = symbols_.controlApplyTemplate != 0u
+                ? symbols_.controlApplyTemplate
+                : symbols_.applyTemplate;
+        }
+        SymbolId loadSym = FindBackendClassMethod(backend, typeId, "EnsureLoadedSubtree", 0u);
+        if (loadSym == 0u) {
+            loadSym = symbols_.ensureLoadedSubtree;
         }
         if (tplSym != 0u) {
             const UnifiedValue tplArgs[1]{UnifiedValue{rootObject_}};
@@ -2094,15 +1373,7 @@ bool AeroAppHost::MountScriptRootObject(ObjectRef candidate) {
     logTrace("MountScriptRootObject: reading __nativeHandle");
     // Bind native root handle to VisualWorld::SetRoot
     UnifiedValue handleVal{};
-    if (!ReadMemberFromHeap(
-            domains_,
-            programImage_.get(),
-            interpreter_.get(),
-            aotDescriptor_,
-            aotContext_.get(),
-            rootObject_,
-            "__nativeHandle",
-            handleVal)) {
+    if (!ReadSingleMember(backend, rootObject_, "__nativeHandle", handleVal)) {
         lastError_ = "Mounted root script object does not expose __nativeHandle";
         return false;
     }
@@ -2540,27 +1811,7 @@ void AeroAppHost::StepFrameInternal(float dtSeconds, bool forceRenderSync, bool 
     }
 
     // 2. Cross-domain [SimCommand] queue execution in SimDeterministic domain
-    auto flushPendingSim = [&]() -> bool {
-        if (domains_.pendingSimCommandCount() == 0u) {
-            return false;
-        }
-        domains_.setActiveDomain(DomainKind::SimDeterministic);
-        std::size_t ran = 0u;
-        if (programImage_) {
-            if (Interpreter* simInterp = EnsureSimInterpreter()) {
-                ran = domains_.flushSimCommands(*simInterp);
-            }
-        } else if (simAotContext_) {
-            ran = domains_.flushSimCommands(*simAotContext_);
-        }
-        domains_.setActiveDomain(DomainKind::UiPresentation);
-        if (ran > 0u) {
-            desktopHost_.NotifyDirtyObjects();
-            return true;
-        }
-        return false;
-    };
-    simUpdated |= flushPendingSim();
+    simUpdated |= FlushPendingSimCommands(true);
 
     // 3. Queued pointer / keyboard / text input dispatch
     std::size_t flushedInputCount = 0u;
@@ -2573,7 +1824,7 @@ void AeroAppHost::StepFrameInternal(float dtSeconds, bool forceRenderSync, bool 
     }
 
     // Flush any [SimCommand]s newly queued by UI input handlers in the same frame
-    simUpdated |= flushPendingSim();
+    simUpdated |= FlushPendingSimCommands(true);
 
     if (simUpdated && rootObject_.valid()) {
         if (symbols_.rootSyncHudFromSim != 0u) {
@@ -2641,7 +1892,7 @@ void AeroAppHost::StepFrameInternal(float dtSeconds, bool forceRenderSync, bool 
     }
 
     // 6. VisualAnimationEngine tick + async UI tasks
-    const std::size_t uiTasksStepped = domains_.stepAllUiTasks(interpreter_.get());
+    const std::size_t uiTasksStepped = domains_.stepAllUiTasks(interpreter_.get(), aotContext_.get());
     if (animEngine_.HasActiveAnimations()) {
         if (animEngine_.Tick(dt, world_)) {
             desktopHost_.NotifyDirtyLayout();
@@ -2767,42 +2018,7 @@ void AeroAppHost::StepFrameInternal(float dtSeconds, bool forceRenderSync, bool 
             forceRenderSync || viewportChanged,
             needSync ? UiPhase_RenderRecord : UiPhase_None);
     }
-    if (domains_.uiHeap().phase() == rs_rt::GcPhase::Idle &&
-        domains_.uiHeap().nurserySize() >= 4096u) {
-        rs_rt::ShadowStack emptyStack;
-        (void)domains_.uiHeap().collectYoung(emptyStack, 64u);
-        (void)world_.SweepDeadObjectBoxes();
-    }
-    const std::uint64_t destroyedNow = world_.DestroyedNodeCount();
-    const bool majorTeardown = (destroyedNow >= lastGcDestroyedNodes_) &&
-                               ((destroyedNow - lastGcDestroyedNodes_) >= 64u);
-    if (domains_.uiHeap().collectionRequested() ||
-        domains_.uiHeap().phase() != rs_rt::GcPhase::Idle ||
-        majorTeardown) {
-        const auto gcStats = domains_.uiHeap().collectIncrementalWithBudget(
-            rs_rt::RootSet{},
-            std::chrono::milliseconds(forceRenderSync ? 20 : (majorTeardown ? 16 : 6)),
-            32u,
-            majorTeardown);
-        if (gcStats.cycleCompleted) {
-            lastGcDestroyedNodes_ = world_.DestroyedNodeCount();
-            const std::size_t sweptBoxes = world_.SweepDeadObjectBoxes();
-            if (sweptBoxes > 0u && majorTeardown) {
-                (void)domains_.uiHeap().collectIncrementalWithBudget(
-                    rs_rt::RootSet{},
-                    std::chrono::milliseconds(8),
-                    32u,
-                    true);
-                (void)world_.SweepDeadObjectBoxes();
-            }
-            (void)domains_.uiHeap().trimExcessCapacity();
-#ifdef _WIN32
-            if (majorTeardown) {
-                (void)_heapmin();
-            }
-#endif
-        }
-    }
+    RunUiHeapGcMaintenance(forceRenderSync ? 20 : 6, true);
     if (programImage_ && programImage_->decodedLazyChunkCacheSize() > 0u) {
         const std::size_t compiledNow = programImage_->compiledLazyFunctionCount();
         if (compiledNow == lastLazyCompiledCount_) {
@@ -3193,16 +2409,7 @@ std::uint64_t AeroAppHost::RunWindowedLoop(std::uint64_t maxFrames) {
             lastFrameTick = afterPumpNow;
             hasLastFrameTick = true;
         }
-        if (domains_.pendingSimCommandCount() > 0u) {
-            domains_.setActiveDomain(DomainKind::SimDeterministic);
-            if (programImage_) {
-                if (Interpreter* simInterp = EnsureSimInterpreter()) {
-                    (void)domains_.flushSimCommands(*simInterp);
-                }
-            } else if (simAotContext_) {
-                (void)domains_.flushSimCommands(*simAotContext_);
-            }
-            domains_.setActiveDomain(DomainKind::UiPresentation);
+        if (FlushPendingSimCommands(false)) {
             followUpDirty = true;
         }
         if (world_.FlushTrackB() > 0u) {
@@ -3226,23 +2433,7 @@ std::uint64_t AeroAppHost::RunWindowedLoop(std::uint64_t maxFrames) {
         } else if (DispatchPendingCanvasDraws()) {
             StepFrameInternal(0.0f, true, true);
         } else if (!idleAllowed) {
-            if (domains_.uiHeap().phase() == rs_rt::GcPhase::Idle &&
-                domains_.uiHeap().nurserySize() >= 4096u) {
-                rs_rt::ShadowStack emptyStack;
-                (void)domains_.uiHeap().collectYoung(emptyStack, 64u);
-            }
-            if (domains_.uiHeap().collectionRequested() ||
-                domains_.uiHeap().phase() != rs_rt::GcPhase::Idle) {
-                const auto gcStats = domains_.uiHeap().collectIncrementalWithBudget(
-                    rs_rt::RootSet{},
-                    std::chrono::milliseconds(4),
-                    32u,
-                    false);
-                if (gcStats.cycleCompleted) {
-                    lastGcDestroyedNodes_ = world_.DestroyedNodeCount();
-                    (void)domains_.uiHeap().trimExcessCapacity();
-                }
-            }
+            RunUiHeapGcMaintenance(4, false);
         }
         if (!idleAllowed && maxFrames == 0u && !windowHost_.ShouldClose()) {
             const auto elapsed = std::chrono::steady_clock::now() - iterStart;
@@ -3253,6 +2444,75 @@ std::uint64_t AeroAppHost::RunWindowedLoop(std::uint64_t maxFrames) {
         ++frames;
     }
     return frames;
+}
+
+bool AeroAppHost::FlushPendingSimCommands(bool notifyDirtyObjects) {
+    if (domains_.pendingSimCommandCount() == 0u) {
+        return false;
+    }
+    domains_.setActiveDomain(DomainKind::SimDeterministic);
+    std::size_t ran = 0u;
+    if (programImage_) {
+        if (Interpreter* simInterp = EnsureSimInterpreter()) {
+            ran = domains_.flushSimCommands(*simInterp);
+        }
+    } else if (simAotContext_) {
+        ran = domains_.flushSimCommands(*simAotContext_);
+    }
+    domains_.setActiveDomain(DomainKind::UiPresentation);
+    if (notifyDirtyObjects) {
+        if (ran > 0u) {
+            desktopHost_.NotifyDirtyObjects();
+            return true;
+        }
+        return false;
+    }
+    return true;
+}
+
+void AeroAppHost::RunUiHeapGcMaintenance(std::int32_t idleBudgetMs, bool sweepDeadObjectBoxes) {
+    if (domains_.uiHeap().phase() == rs_rt::GcPhase::Idle &&
+        domains_.uiHeap().nurserySize() >= 4096u) {
+        rs_rt::ShadowStack emptyStack;
+        (void)domains_.uiHeap().collectYoung(emptyStack, 64u);
+        if (sweepDeadObjectBoxes) {
+            (void)world_.SweepDeadObjectBoxes();
+        }
+    }
+    const std::uint64_t destroyedNow = world_.DestroyedNodeCount();
+    const bool majorTeardown = sweepDeadObjectBoxes &&
+                               (destroyedNow >= lastGcDestroyedNodes_) &&
+                               ((destroyedNow - lastGcDestroyedNodes_) >= 64u);
+    if (domains_.uiHeap().collectionRequested() ||
+        domains_.uiHeap().phase() != rs_rt::GcPhase::Idle ||
+        majorTeardown) {
+        const std::int32_t effBudgetMs = (majorTeardown && idleBudgetMs < 16) ? 16 : idleBudgetMs;
+        const auto gcStats = domains_.uiHeap().collectIncrementalWithBudget(
+            rs_rt::RootSet{},
+            std::chrono::milliseconds(effBudgetMs),
+            32u,
+            majorTeardown);
+        if (gcStats.cycleCompleted) {
+            lastGcDestroyedNodes_ = world_.DestroyedNodeCount();
+            if (sweepDeadObjectBoxes) {
+                const std::size_t sweptBoxes = world_.SweepDeadObjectBoxes();
+                if (sweptBoxes > 0u && majorTeardown) {
+                    (void)domains_.uiHeap().collectIncrementalWithBudget(
+                        rs_rt::RootSet{},
+                        std::chrono::milliseconds(8),
+                        32u,
+                        true);
+                    (void)world_.SweepDeadObjectBoxes();
+                }
+            }
+            (void)domains_.uiHeap().trimExcessCapacity();
+#ifdef _WIN32
+            if (majorTeardown) {
+                (void)_heapmin();
+            }
+#endif
+        }
+    }
 }
 
 void AeroAppHost::Shutdown() noexcept {
@@ -3267,16 +2527,10 @@ ObjectRef AeroAppHost::RootDataContext() const noexcept {
     if (!rootObject_.valid()) {
         return ObjectRef{};
     }
+    const ScriptBackendView backend = MakeBackendView(
+        domains_, programImage_.get(), interpreter_.get(), aotDescriptor_, aotContext_.get());
     UnifiedValue dcVal{};
-    if (ReadMemberFromHeap(
-            domains_,
-            programImage_.get(),
-            interpreter_.get(),
-            aotDescriptor_,
-            aotContext_.get(),
-            rootObject_,
-            "DataContext",
-            dcVal)) {
+    if (ReadSingleMember(backend, rootObject_, "DataContext", dcVal)) {
         if (const auto* dcRef = std::get_if<ObjectRef>(&dcVal); dcRef && dcRef->valid()) {
             return *dcRef;
         }
@@ -3285,44 +2539,9 @@ ObjectRef AeroAppHost::RootDataContext() const noexcept {
 }
 
 bool AeroAppHost::ReadScriptMember(ObjectRef obj, std::string_view dotPath, UnifiedValue& outValue) const {
-    if (!obj.valid() || dotPath.empty()) {
-        return false;
-    }
-    ObjectRef cur = obj;
-    std::string_view rem = dotPath;
-    for (;;) {
-        const std::size_t dot = rem.find('.');
-        if (dot == std::string_view::npos) {
-            return ReadMemberFromHeap(
-                domains_,
-                programImage_.get(),
-                interpreter_.get(),
-                aotDescriptor_,
-                aotContext_.get(),
-                cur,
-                rem,
-                outValue);
-        }
-        const std::string_view seg = rem.substr(0u, dot);
-        UnifiedValue hopVal{};
-        if (!ReadMemberFromHeap(
-                domains_,
-                programImage_.get(),
-                interpreter_.get(),
-                aotDescriptor_,
-                aotContext_.get(),
-                cur,
-                seg,
-                hopVal)) {
-            return false;
-        }
-        const auto* nextObj = std::get_if<ObjectRef>(&hopVal);
-        if (!nextObj || !nextObj->valid()) {
-            return false;
-        }
-        cur = *nextObj;
-        rem.remove_prefix(dot + 1u);
-    }
+    const ScriptBackendView backend = MakeBackendView(
+        domains_, programImage_.get(), interpreter_.get(), aotDescriptor_, aotContext_.get());
+    return ReadDotPathValue(backend, obj, dotPath, outValue);
 }
 
 bool AeroAppHost::InvokeScriptFunction(
@@ -3330,12 +2549,9 @@ bool AeroAppHost::InvokeScriptFunction(
     const std::vector<UnifiedValue>& args,
     UnifiedValue* outResult,
     DomainKind domain) {
-    SymbolId fnId = 0u;
-    if (programImage_) {
-        fnId = FindBytecodeFunctionSymbol(*programImage_, qualifiedOrShortName);
-    } else if (aotDescriptor_) {
-        fnId = FindAotFunctionSymbol(*aotDescriptor_, qualifiedOrShortName);
-    }
+    const ScriptBackendView backend = MakeBackendView(
+        domains_, programImage_.get(), interpreter_.get(), aotDescriptor_, aotContext_.get());
+    const SymbolId fnId = FindBackendFunctionSymbol(backend, qualifiedOrShortName);
     if (fnId == 0u) {
         return false;
     }
@@ -3370,13 +2586,9 @@ bool AeroAppHost::InvokeScriptMethod(
     if (typeId == 0u) {
         return false;
     }
-    SymbolId fnId = 0u;
-    if (programImage_) {
-        fnId = FindBytecodeClassMethod(*programImage_, typeId, methodName, args.size());
-    } else if (aotDescriptor_) {
-        fnId = FindAotClassMethod(
-            *aotDescriptor_, typeId, methodName, static_cast<std::uint32_t>(args.size() + 1u));
-    }
+    const ScriptBackendView backend = MakeBackendView(
+        domains_, programImage_.get(), interpreter_.get(), aotDescriptor_, aotContext_.get());
+    const SymbolId fnId = FindBackendClassMethod(backend, typeId, methodName, args.size());
     if (fnId == 0u) {
         return false;
     }
@@ -3409,31 +2621,24 @@ VisualNodeId AeroAppHost::FindVisualByOwnerName(std::string_view elementName) co
     if (elementName.empty()) {
         return VisualNodeId{};
     }
+    const ScriptBackendView backend = MakeBackendView(
+        domains_, programImage_.get(), interpreter_.get(), aotDescriptor_, aotContext_.get());
+
     auto matchesName = [&](const VisualNode* node) -> bool {
         if (!node || !node->hasScriptOwner || !node->scriptOwner.valid()) {
             return false;
         }
         UnifiedValue nameVal{};
-        if (!ReadMemberFromHeap(
-                domains_,
-                programImage_.get(),
-                interpreter_.get(),
-                aotDescriptor_,
-                aotContext_.get(),
-                node->scriptOwner,
-                "Name",
-                nameVal)) {
+        if (!ReadSingleMember(backend, node->scriptOwner, "Name", nameVal)) {
             return false;
         }
         std::string nameStr;
-        return ReadScriptStringValue(domains_, nameVal, nameStr) && nameStr == elementName;
+        return TryExtractStringValue(backend, nameVal, nameStr) && nameStr == elementName;
     };
 
-    // Walk the live visual tree first so detached/disposed template ghosts never shadow active nodes.
     const VisualNodeId rootId = world_.Root();
     if (rootId.IsValid()) {
-        std::vector<VisualNodeId> queue;
-        queue.push_back(rootId);
+        std::vector<VisualNodeId> queue{rootId};
         for (std::size_t qi = 0u; qi < queue.size(); ++qi) {
             const VisualNode* node = world_.GetNode(queue[qi]);
             if (!node) {
@@ -3456,15 +2661,7 @@ VisualNodeId AeroAppHost::FindVisualByOwnerName(std::string_view elementName) co
         }
         UnifiedValue disposedVal{};
         bool isDisposed = false;
-        if (ReadMemberFromHeap(
-                domains_,
-                programImage_.get(),
-                interpreter_.get(),
-                aotDescriptor_,
-                aotContext_.get(),
-                node->scriptOwner,
-                "_isDisposedTree",
-                disposedVal) &&
+        if (ReadSingleMember(backend, node->scriptOwner, "_isDisposedTree", disposedVal) &&
             disposedVal.tryGetBool(isDisposed) && isDisposed) {
             continue;
         }

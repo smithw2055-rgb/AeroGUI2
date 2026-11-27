@@ -331,74 +331,33 @@ namespace {
         return nullptr;
     }
 
-    std::shared_ptr<rs_comp::PrecompiledFrontendPack> decodedPack;
-    if (decodeFrontendPack) {
-        const std::uint64_t actualFrontendChecksum = ComputeStdlibDllChecksum64(
-            hdr->frontendPackBytes, static_cast<std::size_t>(hdr->frontendPackSize));
-        if (actualFrontendChecksum != hdr->frontendPackChecksum) {
-            if (outError) {
-                *outError = "Stdlib DLL frontend pack checksum mismatch in '" + resolved.generic_string() + "'";
-            }
-            return nullptr;
-        }
-
-        decodedPack = std::make_shared<rs_comp::PrecompiledFrontendPack>();
-        std::string packErr;
-        if (!rs_comp::decodePrecompiledFrontendPack(
-                hdr->frontendPackBytes,
-                static_cast<std::size_t>(hdr->frontendPackSize),
-                *decodedPack,
-                &packErr,
-                /*copyBlob=*/false,
-                /*skipChecksum=*/true)) {
-            if (outError) {
-                *outError = "Failed to decode PrecompiledFrontendPack from stdlib DLL: " + packErr;
-            }
-            return nullptr;
-        }
-    }
-
-    std::shared_ptr<rs_bc::LazyBytecodeBundle> lazyBundle;
-    if (decodeLazyBundle) {
-        lazyBundle = std::make_shared<rs_bc::LazyBytecodeBundle>();
-        rs_diag::DiagnosticBag bundleDiag;
-        if (!rs_bc::decodeLazyBytecodeBundleHeader(
-                hdr->lazyBytecodeBytes,
-                static_cast<std::size_t>(hdr->lazyBytecodeSize),
-                *lazyBundle,
-                /*copyBlob=*/false,
-                bundleDiag,
-                /*skipChecksum=*/false) ||
-            bundleDiag.hasErrors()) {
-            if (outError) {
-                std::ostringstream oss;
-                oss << "Failed to decode LazyBytecodeBundle header from stdlib DLL:";
-                for (const auto& d : bundleDiag.items()) {
-                    oss << "\n  " << d.message;
-                }
-                *outError = oss.str();
-            }
-            return nullptr;
-        }
-    }
-
-    const auto t1 = std::chrono::steady_clock::now();
     auto loaded = std::make_shared<LoadedStdlibDll>();
     loaded->resolvedPath = resolved.lexically_normal().generic_string();
     loaded->header = hdr;
-    loaded->frontendPack = std::move(decodedPack);
-    loaded->lazyBundle = std::move(lazyBundle);
+    if (decodeFrontendPack && !DecodeStdlibDllFrontendPack(*loaded, outError)) {
+        return nullptr;
+    }
+    if (decodeLazyBundle && !DecodeStdlibDllLazyBundle(*loaded, outError)) {
+        return nullptr;
+    }
+
+    const auto t1 = std::chrono::steady_clock::now();
     loaded->loadAndDecodeMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
     return loaded;
 #endif
 }
-} // namespace
 
-std::shared_ptr<const LoadedStdlibDll> LoadStdlibDll(
+[[nodiscard]] std::shared_ptr<LoadedStdlibDll> LoadStdlibDllImpl(
     std::string_view explicitPath,
-    std::string* outError) {
+    std::string* outError,
+    bool cacheEntry,
+    bool decodeFrontendPack,
+    bool decodeLazyBundle) {
 #ifdef __EMSCRIPTEN__
     (void)explicitPath;
+    (void)cacheEntry;
+    (void)decodeFrontendPack;
+    (void)decodeLazyBundle;
     if (outError) {
         *outError = "aerogui_stdlib dynamic loading is not supported on Emscripten";
     }
@@ -423,115 +382,45 @@ std::shared_ptr<const LoadedStdlibDll> LoadStdlibDll(
     const std::string key = CanonicalCacheKey(resolved);
     auto& state = GetStdlibDllCacheState();
     std::lock_guard<std::mutex> lock(state.mutex);
-    if (const auto it = state.entries.find(key); it != state.entries.end()) {
-        return it->second;
+    if (cacheEntry) {
+        if (const auto it = state.entries.find(key); it != state.entries.end()) {
+            return std::const_pointer_cast<LoadedStdlibDll>(it->second);
+        }
     }
 
-    auto loaded = LoadAndDecodeStdlibDllLocked(resolved, key, state, outError);
-    if (loaded) {
+    auto loaded = LoadAndDecodeStdlibDllLocked(
+        resolved, key, state, outError, decodeFrontendPack, decodeLazyBundle);
+    if (cacheEntry && loaded) {
         state.entries.emplace(key, loaded);
     }
     return loaded;
 #endif
 }
 
+} // namespace
+
+std::shared_ptr<const LoadedStdlibDll> LoadStdlibDll(
+    std::string_view explicitPath,
+    std::string* outError) {
+    return LoadStdlibDllImpl(explicitPath, outError, /*cacheEntry=*/true, /*decodeFrontendPack=*/true, /*decodeLazyBundle=*/true);
+}
+
 std::shared_ptr<LoadedStdlibDll> LoadStdlibDllOneShot(
     std::string_view explicitPath,
     std::string* outError) {
-#ifdef __EMSCRIPTEN__
-    (void)explicitPath;
-    if (outError) {
-        *outError = "aerogui_stdlib dynamic loading is not supported on Emscripten";
-    }
-    return nullptr;
-#else
-    const std::filesystem::path resolved = ResolveStdlibDllPath(explicitPath);
-    if (resolved.empty()) {
-        if (outError) {
-            *outError = std::string("Unable to locate ") + kStdlibDllFilename +
-                        (explicitPath.empty() ? std::string{} : (" (requested: " + std::string(explicitPath) + ")"));
-        }
-        return nullptr;
-    }
-    std::error_code existEc;
-    if (!std::filesystem::is_regular_file(resolved, existEc)) {
-        if (outError) {
-            *outError = "Stdlib DLL not found: " + resolved.generic_string();
-        }
-        return nullptr;
-    }
-
-    const std::string key = CanonicalCacheKey(resolved);
-    auto& state = GetStdlibDllCacheState();
-    std::lock_guard<std::mutex> lock(state.mutex);
-    return LoadAndDecodeStdlibDllLocked(resolved, key, state, outError, true);
-#endif
+    return LoadStdlibDllImpl(explicitPath, outError, /*cacheEntry=*/false, /*decodeFrontendPack=*/true, /*decodeLazyBundle=*/true);
 }
 
 std::shared_ptr<LoadedStdlibDll> LoadStdlibDllLazyOnly(
     std::string_view explicitPath,
     std::string* outError) {
-#ifdef __EMSCRIPTEN__
-    (void)explicitPath;
-    if (outError) {
-        *outError = "aerogui_stdlib dynamic loading is not supported on Emscripten";
-    }
-    return nullptr;
-#else
-    const std::filesystem::path resolved = ResolveStdlibDllPath(explicitPath);
-    if (resolved.empty()) {
-        if (outError) {
-            *outError = std::string("Unable to locate ") + kStdlibDllFilename +
-                        (explicitPath.empty() ? std::string{} : (" (requested: " + std::string(explicitPath) + ")"));
-        }
-        return nullptr;
-    }
-    std::error_code existEc;
-    if (!std::filesystem::is_regular_file(resolved, existEc)) {
-        if (outError) {
-            *outError = "Stdlib DLL not found: " + resolved.generic_string();
-        }
-        return nullptr;
-    }
-
-    const std::string key = CanonicalCacheKey(resolved);
-    auto& state = GetStdlibDllCacheState();
-    std::lock_guard<std::mutex> lock(state.mutex);
-    return LoadAndDecodeStdlibDllLocked(resolved, key, state, outError, false, true);
-#endif
+    return LoadStdlibDllImpl(explicitPath, outError, /*cacheEntry=*/false, /*decodeFrontendPack=*/false, /*decodeLazyBundle=*/true);
 }
 
 std::shared_ptr<LoadedStdlibDll> LoadStdlibDllFrontendOnly(
     std::string_view explicitPath,
     std::string* outError) {
-#ifdef __EMSCRIPTEN__
-    (void)explicitPath;
-    if (outError) {
-        *outError = "aerogui_stdlib dynamic loading is not supported on Emscripten";
-    }
-    return nullptr;
-#else
-    const std::filesystem::path resolved = ResolveStdlibDllPath(explicitPath);
-    if (resolved.empty()) {
-        if (outError) {
-            *outError = std::string("Unable to locate ") + kStdlibDllFilename +
-                        (explicitPath.empty() ? std::string{} : (" (requested: " + std::string(explicitPath) + ")"));
-        }
-        return nullptr;
-    }
-    std::error_code existEc;
-    if (!std::filesystem::is_regular_file(resolved, existEc)) {
-        if (outError) {
-            *outError = "Stdlib DLL not found: " + resolved.generic_string();
-        }
-        return nullptr;
-    }
-
-    const std::string key = CanonicalCacheKey(resolved);
-    auto& state = GetStdlibDllCacheState();
-    std::lock_guard<std::mutex> lock(state.mutex);
-    return LoadAndDecodeStdlibDllLocked(resolved, key, state, outError, true, false);
-#endif
+    return LoadStdlibDllImpl(explicitPath, outError, /*cacheEntry=*/false, /*decodeFrontendPack=*/true, /*decodeLazyBundle=*/false);
 }
 
 bool DecodeStdlibDllFrontendPack(

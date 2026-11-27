@@ -12,17 +12,6 @@ namespace aero {
 bool RegisterVisualHostBindings(
     BindingRegistry& bindings,
     VisualWorld& world,
-    VisualAnimationEngine& animEngine,
-    VisualInputRouter& inputRouter,
-    ExecutionDomainContext& domains,
-    const ProgramImage* programImage = nullptr,
-    const Interpreter* interpreter = nullptr,
-    rs_aot::ExecutionContext* aotContext = nullptr,
-    UIHostPlatformHooks* platformHooks = nullptr);
-
-bool RegisterVisualHostBindings(
-    BindingRegistry& bindings,
-    VisualWorld& world,
     DrawingCommandBuffer& drawBuffer,
     VisualAnimationEngine& animEngine,
     VisualInputRouter& inputRouter,

@@ -1,23 +1,13 @@
-#include "aero/app/AeroAppHost.hpp"
+#define AERO_TEST_WITH_APP_HOST 1
+#include "common/AeroTestHarness.hpp"
 #include "aero/compiler/AeroCompilerV3.hpp"
 #include "aero/compiler/StdlibDllAbi.h"
 #include "aero/compiler/StdlibDllLoader.hpp"
 #include "realscript/Version.h"
 
-#include <algorithm>
 #include <array>
 #include <chrono>
-#include <cstdint>
-#include <cstdlib>
-#include <filesystem>
-#include <fstream>
 #include <iomanip>
-#include <iostream>
-#include <sstream>
-#include <string>
-#include <string_view>
-#include <unordered_set>
-#include <vector>
 
 #ifdef _WIN32
 #  ifndef WIN32_LEAN_AND_MEAN
@@ -40,56 +30,21 @@ int gFailureCount = 0;
 
 void Require(bool cond, std::string_view msg) {
     if (!cond) {
-        std::cerr << "[FAIL] " << msg << "\n";
-        ++gFailureCount;
+        aero::test::ReportFailure(gFailureCount, msg);
     }
 }
 
-[[nodiscard]] std::string ReadFileText(const fs::path& path) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in.is_open()) {
-        return {};
-    }
-    std::ostringstream ss;
-    ss << in.rdbuf();
-    return ss.str();
-}
-
-[[nodiscard]] std::uint32_t QuantizedClearColorRgba(const aero::Color& c) noexcept {
-    auto clampU8 = [](float x) noexcept -> std::uint8_t {
-        if (x <= 0.0f) return 0u;
-        if (x >= 1.0f) return 255u;
-        return static_cast<std::uint8_t>(x * 255.0f + 0.5f);
-    };
-    const std::uint32_t r = clampU8(c.r);
-    const std::uint32_t g = clampU8(c.g);
-    const std::uint32_t b = clampU8(c.b);
-    const std::uint32_t a = clampU8(c.a);
-    return (r << 24u) | (g << 16u) | (b << 8u) | a;
-}
+using aero::test::ReadFileText;
+using aero::test::QuantizedClearColorRgba;
 
 [[nodiscard]] std::size_t CountDistinctColors(
     const std::vector<std::uint8_t>& rgba,
     std::uint32_t clearRgba,
     std::size_t& outNonClear) {
-    std::unordered_set<std::uint32_t> uniq;
-    outNonClear = 0u;
-    const std::size_t pxCount = rgba.size() / 4u;
-    for (std::size_t i = 0u; i < pxCount; ++i) {
-        const std::uint32_t c =
-            (static_cast<std::uint32_t>(rgba[i * 4u + 0u]) << 24u) |
-            (static_cast<std::uint32_t>(rgba[i * 4u + 1u]) << 16u) |
-            (static_cast<std::uint32_t>(rgba[i * 4u + 2u]) << 8u) |
-            static_cast<std::uint32_t>(rgba[i * 4u + 3u]);
-        uniq.insert(c);
-        if (c != clearRgba) {
-            ++outNonClear;
-        }
-        if (uniq.size() >= 64u && outNonClear > 0u) {
-            // keep scanning nonClear? only need sample metrics quickly
-        }
-    }
-    return uniq.size();
+    const aero::test::ImageMetrics m = aero::test::ComputeExactImageMetrics(rgba, clearRgba);
+    outNonClear = static_cast<std::size_t>(
+        std::llround((m.nonBlankPercent * 0.01) * static_cast<double>(rgba.size() / 4u)));
+    return m.distinctColors;
 }
 
 [[nodiscard]] bool BuildSampleForDll(
@@ -422,7 +377,8 @@ void TestIsolatedTempDirLaunchesWithoutStdlibDir() {
 
     // Ensure no ancestor of tempRoot contains stdlib/Aero.UI/Core.rs
     for (fs::path probe = tempRoot; !probe.empty();) {
-        Require(!fs::exists(probe / "stdlib" / "Aero.UI" / "Core.rs", ec),
+        Require(!fs::exists(probe / "stdlib" / "Aero.UI" / "Core.rs", ec) &&
+                !fs::exists(probe / "stdlib" / "Aero.UI.Core" / "Core.rs", ec),
             "Isolated temp root must not have an ancestor stdlib/ dir: " + probe.generic_string());
         const fs::path parent = probe.parent_path();
         if (parent == probe) break;
@@ -563,13 +519,13 @@ void TestStdlibDllUserArbcDiskCache() {
     Require(coldRes.succeeded && coldRes.programImage != nullptr && coldRes.usedStdlibDll,
         "DLL cold compile with allowDiskCache=true failed");
 
-    std::size_t arbcFiles = 0u;
+    std::size_t aprgFiles = 0u;
     for (const auto& entry : fs::recursive_directory_iterator(cacheDir, ec)) {
-        if (entry.is_regular_file(ec) && entry.path().extension() == ".arbc") {
-            ++arbcFiles;
+        if (entry.is_regular_file(ec) && entry.path().extension() == ".aprg") {
+            ++aprgFiles;
         }
     }
-    Require(arbcFiles >= 1u, "Expected at least 1 .arbc user cache file written in DLL mode");
+    Require(aprgFiles >= 1u, "Expected at least 1 .aprg user cache file written in DLL mode");
 
     const auto tWarm0 = std::chrono::steady_clock::now();
     const aero::AeroV3CompileResult warmRes = compiler.Compile(ci);

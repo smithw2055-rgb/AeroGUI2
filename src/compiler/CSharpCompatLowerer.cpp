@@ -414,14 +414,70 @@ struct CompatToken final {
             ((c == '@' && next == '$') && i + 2 < n && src[i + 2] == '"')) {
             const std::size_t start = i;
             bool verbatim = false;
+            bool interpolated = false;
             while (i < n && (src[i] == '@' || src[i] == '$')) {
                 if (src[i] == '@') verbatim = true;
+                if (src[i] == '$') interpolated = true;
                 ++i;
             }
             if (i < n && src[i] == '"') {
                 ++i;
             }
+            int holeBraceDepth = 0;
             while (i < n) {
+                if (interpolated && holeBraceDepth > 0) {
+                    if (src[i] == '@' && i + 1 < n && src[i + 1] == '"') {
+                        i += 2;
+                        while (i < n) {
+                            if (src[i] == '"') {
+                                if (i + 1 < n && src[i + 1] == '"') {
+                                    i += 2;
+                                    continue;
+                                }
+                                ++i;
+                                break;
+                            }
+                            ++i;
+                        }
+                        continue;
+                    }
+                    if (src[i] == '"' || src[i] == '\'') {
+                        const char q = src[i++];
+                        while (i < n) {
+                            if (src[i] == '\\' && i + 1 < n) {
+                                i += 2;
+                                continue;
+                            }
+                            if (src[i] == q) {
+                                ++i;
+                                break;
+                            }
+                            ++i;
+                        }
+                        continue;
+                    }
+                    if (src[i] == '{') {
+                        ++holeBraceDepth;
+                        ++i;
+                        continue;
+                    }
+                    if (src[i] == '}') {
+                        --holeBraceDepth;
+                        ++i;
+                        continue;
+                    }
+                    ++i;
+                    continue;
+                }
+                if (interpolated && src[i] == '{') {
+                    if (i + 1 < n && src[i + 1] == '{') {
+                        i += 2;
+                        continue;
+                    }
+                    ++holeBraceDepth;
+                    ++i;
+                    continue;
+                }
                 if (verbatim) {
                     if (src[i] == '"') {
                         if (i + 1 < n && src[i + 1] == '"') {
@@ -831,6 +887,7 @@ std::string LowerCSharpCompatSyntax(
         if (tok == "nameof" && i + 1 < n && tokens[i + 1].text == "(") {
             std::size_t j = i + 2;
             int parens = 1;
+            int angles = 0;
             std::string lastIdent;
             while (j < n && parens > 0) {
                 if (tokens[j].text == "(") {
@@ -840,7 +897,11 @@ std::string LowerCSharpCompatSyntax(
                     if (parens == 0) {
                         break;
                     }
-                } else if (tokens[j].kind == TokKind::Identifier) {
+                } else if (parens == 1 && tokens[j].text == "<") {
+                    ++angles;
+                } else if (parens == 1 && tokens[j].text == ">" && angles > 0) {
+                    --angles;
+                } else if (parens == 1 && angles == 0 && tokens[j].kind == TokKind::Identifier) {
                     lastIdent = tokens[j].text;
                 }
                 ++j;
@@ -858,6 +919,7 @@ std::string LowerCSharpCompatSyntax(
 
         // 9. Rewrite `string.Empty` / `String.Empty` -> `""`
         if ((tok == "string" || tok == "String") &&
+            !(i > 0 && tokens[i - 1].text == ".") &&
             i + 2 < n && tokens[i + 1].text == "." && tokens[i + 2].text == "Empty") {
             tokens[i].kind = TokKind::String;
             tokens[i].text = "\"\"";

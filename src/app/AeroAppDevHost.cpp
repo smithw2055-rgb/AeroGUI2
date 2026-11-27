@@ -23,6 +23,7 @@
 #include <malloc.h>
 #endif
 
+#include "aero/app/AppBootstrap.hpp"
 #include "aero/compiler/StdlibModulePack.hpp"
 #include "aero/core/StringUtils.hpp"
 
@@ -30,20 +31,7 @@ namespace aero {
 namespace {
 
 [[nodiscard]] bool ReadFileUtf8Text(const std::filesystem::path& path, std::string& outText) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in.is_open()) {
-        return false;
-    }
-    std::ostringstream ss;
-    ss << in.rdbuf();
-    outText = ss.str();
-    if (outText.size() >= 3u &&
-        static_cast<unsigned char>(outText[0]) == 0xEFu &&
-        static_cast<unsigned char>(outText[1]) == 0xBBu &&
-        static_cast<unsigned char>(outText[2]) == 0xBFu) {
-        outText.erase(0u, 3u);
-    }
-    return true;
+    return app::ReadUtf8TextFile(path, outText);
 }
 
 [[nodiscard]] std::string ToLowerAscii(std::string_view s) {
@@ -301,131 +289,91 @@ bool DiscoverSampleProject(
         }
     }
 
-    std::unordered_set<std::string> seenResourcePaths;
-    for (const auto& p : outCompileInput.resourceSearchPaths) {
-        seenResourcePaths.insert(p);
-    }
-    std::unordered_set<std::string> seenAssetDirs;
-    for (const auto& p : outHostConfig.assetSearchDirs) {
-        seenAssetDirs.insert(p);
-    }
-    auto registerDirIfExists = [&](const fs::path& dir) {
-        std::error_code dirEc;
-        if (!fs::is_directory(dir, dirEc)) {
-            return;
-        }
-        const std::string norm = NormalizePathGenericUpperDrive(dir);
+    std::vector<std::string> discoveredDirs;
+    app::DiscoverSampleAssetDirectories(sampleRoot, discoveredDirs);
+    std::unordered_set<std::string> seenResourcePaths(
+        outCompileInput.resourceSearchPaths.begin(), outCompileInput.resourceSearchPaths.end());
+    std::unordered_set<std::string> seenAssetDirs(
+        outHostConfig.assetSearchDirs.begin(), outHostConfig.assetSearchDirs.end());
+    for (const auto& norm : discoveredDirs) {
         if (seenResourcePaths.insert(norm).second) {
             outCompileInput.resourceSearchPaths.push_back(norm);
         }
         if (seenAssetDirs.insert(norm).second) {
             outHostConfig.assetSearchDirs.push_back(norm);
         }
-    };
-
-    const fs::path dataDir = sampleRoot / "Data";
-    const fs::path baseDirs[] = {sampleRoot, dataDir};
-    const char* kSubDirs[] = {
-        "",
-        "Images",
-        "Images/Items",
-        "Fonts",
-        "Sounds",
-        "Samples",
-        "Samples/Images",
-        "Samples/Fonts",
-        "Theme",
-        "Theme/Fonts",
-    };
-    for (const fs::path& base : baseDirs) {
-        for (const char* sub : kSubDirs) {
-            registerDirIfExists(sub[0] == '\0' ? base : (base / sub));
-        }
-    }
-
-    // Walk ancestors so packaged /Noesis.GUI.Extensions;component/Theme/*.xaml resolves
-    std::error_code probeEc;
-    fs::path probe = sampleRoot.is_absolute() ? sampleRoot : fs::absolute(sampleRoot, probeEc);
-    if (probeEc || probe.empty()) {
-        probe = sampleRoot;
-    }
-    for (int up = 0; up < 5 && !probe.empty(); ++up) {
-        registerDirIfExists(probe / "Theme" / "Data");
-        registerDirIfExists(probe / "Theme" / "Data" / "Theme");
-        registerDirIfExists(probe / "Theme" / "Data" / "Theme" / "Fonts");
-        registerDirIfExists(probe / "Samples" / "Theme" / "Data");
-        registerDirIfExists(probe / "Samples" / "Theme" / "Data" / "Theme");
-        registerDirIfExists(probe / "Samples" / "Theme" / "Data" / "Theme" / "Fonts");
-        const fs::path parent = probe.parent_path();
-        if (parent == probe) {
-            break;
-        }
-        probe = parent;
     }
 
     return !outCompileInput.xamlContent.empty() || !outCompileInput.scriptSources.empty();
 }
 
-bool AeroAppHost::CompileAndLoad(
+namespace {
+
+void DeleteCompileResultOpaque(void* ptr) noexcept {
+    delete static_cast<AeroV3CompileResult*>(ptr);
+}
+
+} // namespace
+
+bool CompileAndLoadIntoAppHost(
+    AeroAppHost& host,
     const AeroV3CompileInput& input,
     std::string* outError) {
     AeroV3CompileInput effective = input;
     effective.skipRawBytecodeOutput = true;
     effective.retainBytecodeModules = false;
     effective.emitAotCpp = false;
-    if (config_.optimizeBytecode && !effective.optimizeBytecode) {
+    if (host.Config().optimizeBytecode && !effective.optimizeBytecode) {
         effective.optimizeBytecode = true;
     }
     if (!effective.resourceSearchRoot.empty()) {
-        RegisterAssetDirectory(effective.resourceSearchRoot);
+        host.RegisterAssetDirectory(effective.resourceSearchRoot);
     }
     for (const auto& dir : effective.resourceSearchPaths) {
-        RegisterAssetDirectory(dir);
+        host.RegisterAssetDirectory(dir);
     }
-    std::shared_ptr<AeroV3CompileResult> compiled;
-    {
-        const AeroCompilerV3 compiler;
-        compiled = std::make_shared<AeroV3CompileResult>(compiler.Compile(effective));
-    }
+    auto compiled = std::make_unique<AeroV3CompileResult>(AeroCompilerV3{}.Compile(effective));
     if (!compiled->succeeded || !compiled->programImage) {
-        devCompileResultOpaque_ = compiled;
         std::string msg = "AeroCompilerV3 compilation failed";
         for (const auto& d : compiled->diagnostics) {
             msg.append("\n  ");
             msg.append(d);
         }
-        SetLastErrorMessage(msg);
+        host.SetDevCompileResultOpaque(compiled.release(), &DeleteCompileResultOpaque);
+        host.SetLastErrorMessage(msg);
         if (outError) {
             *outError = std::move(msg);
         }
         return false;
     }
 
-    if (!IsInitialized() && !InitializeRuntime()) {
-        devCompileResultOpaque_ = std::move(compiled);
+    if (!host.IsInitialized() && !host.InitializeRuntime()) {
+        host.SetDevCompileResultOpaque(compiled.release(), &DeleteCompileResultOpaque);
         if (outError) {
-            *outError = LastError();
+            *outError = host.LastError();
         }
         return false;
     }
-    devCompileResultOpaque_ = compiled;
 
-    std::string entryHint = config_.entryFunctionName;
-    if (entryHint.empty() && !config_.entryClassName.empty()) {
-        entryHint = config_.entryClassName;
+    AeroV3CompileResult* rawCompiled = compiled.release();
+    host.SetDevCompileResultOpaque(rawCompiled, &DeleteCompileResultOpaque);
+
+    std::string entryHint = host.Config().entryFunctionName;
+    if (entryHint.empty() && !host.Config().entryClassName.empty()) {
+        entryHint = host.Config().entryClassName;
     }
-    if (!LoadProgramImageWithPreferredEntry(
-            compiled->programImage,
+    if (!host.LoadProgramImageWithPreferredEntry(
+            rawCompiled->programImage,
             entryHint,
-            compiled->rootClassName)) {
+            rawCompiled->rootClassName)) {
         if (outError) {
-            *outError = LastError();
+            *outError = host.LastError();
         }
         return false;
     }
-    std::vector<rs_bc::Module>().swap(compiled->bytecodeModules);
-    std::vector<std::uint8_t>().swap(compiled->programImageBytes);
-    std::string().swap(compiled->generatedPartialRsCode);
+    std::vector<rs_bc::Module>().swap(rawCompiled->bytecodeModules);
+    std::vector<std::uint8_t>().swap(rawCompiled->programImageBytes);
+    std::string().swap(rawCompiled->generatedPartialRsCode);
 #ifdef _WIN32
     (void)_heapmin();
     (void)HeapCompact(GetProcessHeap(), 0u);
@@ -433,8 +381,8 @@ bool AeroAppHost::CompileAndLoad(
     return true;
 }
 
-const AeroV3CompileResult* AeroAppHost::LastCompileResult() const noexcept {
-    return static_cast<const AeroV3CompileResult*>(DevCompileResultOpaque());
+const AeroV3CompileResult* GetAppHostLastCompileResult(const AeroAppHost& host) noexcept {
+    return static_cast<const AeroV3CompileResult*>(host.DevCompileResultOpaque());
 }
 
 void DiscoverCatalogXamlSources(

@@ -13,7 +13,7 @@
 
 #include "aero/asset/GradientBrush.hpp"
 #include "aero/asset/MtsdfPathBaker.hpp"
-#include "aero/core/UnifiedValue.hpp"
+#include "aero/drawing/Geometry.hpp"
 #include "aero/render/FontAtlas.hpp"
 
 namespace aero {
@@ -89,13 +89,14 @@ struct CommandPageHeader {
     float clipW = 16384.0f;
     float clipH = 16384.0f;
     std::uint32_t flags = 0;
-    // reserved[0] stores bound textureId (0 = default font/UI Skyline atlas, >0 = standalone texture handle)
-    std::uint32_t reserved[3]{0, 0, 0};
+    std::uint32_t textureId = 0u; // 0 = default font/UI Skyline atlas, >0 = standalone texture handle
+    std::uint32_t blendMode = 0u;
+    std::uint32_t reserved = 0u;
 
-    [[nodiscard]] constexpr std::uint32_t TextureId() const noexcept { return reserved[0]; }
-    constexpr void SetTextureId(std::uint32_t texId) noexcept { reserved[0] = texId; }
-    [[nodiscard]] constexpr std::uint32_t BlendMode() const noexcept { return reserved[1]; }
-    constexpr void SetBlendMode(std::uint32_t bm) noexcept { reserved[1] = bm; }
+    [[nodiscard]] constexpr std::uint32_t TextureId() const noexcept { return textureId; }
+    constexpr void SetTextureId(std::uint32_t texId) noexcept { textureId = texId; }
+    [[nodiscard]] constexpr std::uint32_t BlendMode() const noexcept { return blendMode; }
+    constexpr void SetBlendMode(std::uint32_t bm) noexcept { blendMode = bm; }
 };
 
 static_assert(sizeof(CommandPageHeader) == 64, "CommandPageHeader must be exactly 64 bytes.");

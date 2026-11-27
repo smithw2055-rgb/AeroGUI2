@@ -218,8 +218,13 @@ public:
         realscript::runtime::NativeHandle boundControl = {},
         UiTaskId awaitPrerequisite = 0);
 
-    bool stepUiTask(UiTaskId taskId, const realscript::runtime::Interpreter* uiInterpreter = nullptr);
-    std::size_t stepAllUiTasks(const realscript::runtime::Interpreter* uiInterpreter = nullptr);
+    bool stepUiTask(
+        UiTaskId taskId,
+        const realscript::runtime::Interpreter* uiInterpreter = nullptr,
+        realscript::aot::ExecutionContext* uiAotContext = nullptr);
+    std::size_t stepAllUiTasks(
+        const realscript::runtime::Interpreter* uiInterpreter = nullptr,
+        realscript::aot::ExecutionContext* uiAotContext = nullptr);
     bool cancelUiTask(UiTaskId taskId) noexcept;
     std::size_t cancelUiTasksForControl(realscript::runtime::NativeHandle boundControl) noexcept;
     [[nodiscard]] UiTaskStatus uiTaskStatus(UiTaskId taskId) const noexcept;
@@ -477,7 +482,12 @@ private:
     mutable std::atomic<bool> hasSimCommands_{false};
     mutable std::atomic<bool> hasSimStateTypes_{false};
     mutable std::atomic<bool> hasObservableTypes_{false};
-    std::unordered_map<std::uint64_t, std::int32_t> objectTokensByRefKey_;
+    struct SubscribedTokenEntry {
+        std::int32_t token = 0;
+        realscript::runtime::ObjectRef ref{};
+        bool isSimHeap = false;
+    };
+    std::unordered_map<std::uint64_t, SubscribedTokenEntry> objectTokensByRefKey_;
     std::int32_t nextObjectToken_ = 1;
     std::vector<std::int32_t> dirtyObservableTokens_;
     std::unordered_set<std::int32_t> dirtyObservableTokenSet_;

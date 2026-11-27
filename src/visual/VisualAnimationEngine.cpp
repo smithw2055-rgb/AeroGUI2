@@ -4,7 +4,7 @@
 #include <cmath>
 
 #include "aero/asset/GradientBrush.hpp"
-#include "aero/core/UIResourceStore.hpp"
+#include "aero/render/UIResourceStore.hpp"
 
 namespace aero {
 
@@ -347,81 +347,44 @@ bool ApplyScalarProp(VisualWorld& world, VisualNodeId id, VisualAnimProp prop, f
     auto scalarSame = [](float a, float b) noexcept {
         return (std::isnan(a) && std::isnan(b)) || std::fabs(a - b) <= 1e-5f;
     };
+    auto assignScalar = [&](float& slot, float next) noexcept -> bool {
+        if (scalarSame(slot, next)) return false;
+        slot = next;
+        return true;
+    };
+    auto assign3D = [&](float VisualTransform3D::* field) noexcept -> bool {
+        if (node->Transform3D().enabled && scalarSame(node->Transform3D().*field, value)) {
+            return false;
+        }
+        auto& t3d = node->EnsureSpatial3D().transform3D;
+        t3d.*field = value;
+        t3d.enabled = true;
+        return true;
+    };
     switch (prop) {
-    case VisualAnimProp::Opacity: {
-        const float next = std::clamp(value, 0.0f, 1.0f);
-        if (scalarSame(node->layout.opacity, next)) return false;
-        node->layout.opacity = next;
+    case VisualAnimProp::Opacity:
+        if (!assignScalar(node->layout.opacity, std::clamp(value, 0.0f, 1.0f))) return false;
         break;
-    }
     case VisualAnimProp::Width:
-        if (scalarSame(node->layout.width, value)) return false;
-        node->layout.width = value;
+    case VisualAnimProp::Height: {
+        float& dim = (prop == VisualAnimProp::Width) ? node->layout.width : node->layout.height;
+        if (!assignScalar(dim, value)) return false;
         world.MarkDirty(id, VisualDirty_Layout);
         return true;
-    case VisualAnimProp::Height:
-        if (scalarSame(node->layout.height, value)) return false;
-        node->layout.height = value;
-        world.MarkDirty(id, VisualDirty_Layout);
-        return true;
-    case VisualAnimProp::TranslateX:
-        if (scalarSame(node->transform2D.tx, value)) return false;
-        node->transform2D.tx = value;
-        break;
-    case VisualAnimProp::TranslateY:
-        if (scalarSame(node->transform2D.ty, value)) return false;
-        node->transform2D.ty = value;
-        break;
-    case VisualAnimProp::ScaleX:
-        if (scalarSame(node->transform2D.sx, value)) return false;
-        node->transform2D.sx = value;
-        break;
-    case VisualAnimProp::ScaleY:
-        if (scalarSame(node->transform2D.sy, value)) return false;
-        node->transform2D.sy = value;
-        break;
-    case VisualAnimProp::RotateDeg:
-        if (scalarSame(node->transform2D.rotDeg, value)) return false;
-        node->transform2D.rotDeg = value;
-        break;
-    case VisualAnimProp::SkewX:
-        if (scalarSame(node->transform2D.skewX, value)) return false;
-        node->transform2D.skewX = value;
-        break;
-    case VisualAnimProp::SkewY:
-        if (scalarSame(node->transform2D.skewY, value)) return false;
-        node->transform2D.skewY = value;
-        break;
-    case VisualAnimProp::Rot3DX:
-        if (node->Transform3D().enabled && scalarSame(node->Transform3D().rx, value)) return false;
-        node->EnsureSpatial3D().transform3D.rx = value;
-        node->EnsureSpatial3D().transform3D.enabled = true;
-        break;
-    case VisualAnimProp::Rot3DY:
-        if (node->Transform3D().enabled && scalarSame(node->Transform3D().ry, value)) return false;
-        node->EnsureSpatial3D().transform3D.ry = value;
-        node->EnsureSpatial3D().transform3D.enabled = true;
-        break;
-    case VisualAnimProp::Rot3DZ:
-        if (node->Transform3D().enabled && scalarSame(node->Transform3D().rz, value)) return false;
-        node->EnsureSpatial3D().transform3D.rz = value;
-        node->EnsureSpatial3D().transform3D.enabled = true;
-        break;
-    case VisualAnimProp::Trans3DX:
-        if (node->Transform3D().enabled && scalarSame(node->Transform3D().tx, value)) return false;
-        node->EnsureSpatial3D().transform3D.tx = value;
-        node->EnsureSpatial3D().transform3D.enabled = true;
-        break;
-    case VisualAnimProp::Trans3DY:
-        if (node->Transform3D().enabled && scalarSame(node->Transform3D().ty, value)) return false;
-        node->EnsureSpatial3D().transform3D.ty = value;
-        node->EnsureSpatial3D().transform3D.enabled = true;
-        break;
-    case VisualAnimProp::Trans3DZ:
-        if (node->Transform3D().enabled && scalarSame(node->Transform3D().tz, value)) return false;
-        node->EnsureSpatial3D().transform3D.tz = value;
-        node->EnsureSpatial3D().transform3D.enabled = true;
-        break;
+    }
+    case VisualAnimProp::TranslateX: if (!assignScalar(node->transform2D.tx, value)) return false; break;
+    case VisualAnimProp::TranslateY: if (!assignScalar(node->transform2D.ty, value)) return false; break;
+    case VisualAnimProp::ScaleX:     if (!assignScalar(node->transform2D.sx, value)) return false; break;
+    case VisualAnimProp::ScaleY:     if (!assignScalar(node->transform2D.sy, value)) return false; break;
+    case VisualAnimProp::RotateDeg:  if (!assignScalar(node->transform2D.rotDeg, value)) return false; break;
+    case VisualAnimProp::SkewX:      if (!assignScalar(node->transform2D.skewX, value)) return false; break;
+    case VisualAnimProp::SkewY:      if (!assignScalar(node->transform2D.skewY, value)) return false; break;
+    case VisualAnimProp::Rot3DX:     if (!assign3D(&VisualTransform3D::rx)) return false; break;
+    case VisualAnimProp::Rot3DY:     if (!assign3D(&VisualTransform3D::ry)) return false; break;
+    case VisualAnimProp::Rot3DZ:     if (!assign3D(&VisualTransform3D::rz)) return false; break;
+    case VisualAnimProp::Trans3DX:   if (!assign3D(&VisualTransform3D::tx)) return false; break;
+    case VisualAnimProp::Trans3DY:   if (!assign3D(&VisualTransform3D::ty)) return false; break;
+    case VisualAnimProp::Trans3DZ:   if (!assign3D(&VisualTransform3D::tz)) return false; break;
     case VisualAnimProp::CornerRadius:
         if (scalarSame(node->box.cornerRadius.topLeft, value) &&
             scalarSame(node->box.cornerRadius.topRight, value) &&

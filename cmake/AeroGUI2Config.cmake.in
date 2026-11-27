@@ -12,7 +12,7 @@ if(NOT TARGET RealScript::SlimRuntime)
     find_dependency(RealScript CONFIG)
 endif()
 
-if(NOT TARGET AeroGUI::Runtime)
+if(NOT TARGET AeroGUI::Foundation)
     include("${CMAKE_CURRENT_LIST_DIR}/AeroGUI2Targets.cmake")
 endif()
 

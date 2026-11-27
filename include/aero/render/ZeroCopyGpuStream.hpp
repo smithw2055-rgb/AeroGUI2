@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "aero/render/PagedRenderTree.hpp"
+#include "aero/render/SoftwareRasterizer.hpp"
 
 namespace aero {
 
@@ -51,13 +52,6 @@ struct ZeroCopySubmissionStats {
     bool grayscaleSdfTextActive = false;
 };
 
-struct SoftwareDirtyRectStats {
-    std::uint32_t totalTiles = 0u;
-    std::uint32_t dirtyTiles = 0u;
-    std::uint32_t mergedStrips = 0u;
-    bool fellBackToFullFrame = false;
-};
-
 class ZeroCopyGpuStream {
 public:
     explicit ZeroCopyGpuStream(
@@ -97,14 +91,14 @@ public:
     [[nodiscard]] std::size_t RingCapacityBytes() const noexcept { return ringCapacityBytes_; }
     [[nodiscard]] std::size_t ClipWRingCapacityBytes() const noexcept { return clipWRingCapacityBytes_; }
 
-    // Headless software UberShader rasterizer matching GPU UberShader SDF (sdRoundedBox / sdRoundedBox4 /
-    // hollow BorderBrush ring) / MTSDF / Scissor math for deterministic CI Golden Image pixel verification.
     static void RasterizeTreeToRgba8(
         const PagedRenderTree& tree,
         std::uint32_t viewportWidth,
         std::uint32_t viewportHeight,
         std::vector<std::uint8_t>& outRgba8,
-        Color clearColor = Color{0.06f, 0.08f, 0.11f, 1.0f});
+        Color clearColor = Color{0.06f, 0.08f, 0.11f, 1.0f}) {
+        SoftwareRasterizer::RasterizeTreeToRgba8(tree, viewportWidth, viewportHeight, outRgba8, clearColor);
+    }
 
     static void RasterizeTreeDirtyRectsToRgba8(
         const PagedRenderTree& tree,
@@ -113,11 +107,15 @@ public:
         const std::vector<Rect>& dirtyRects,
         std::vector<std::uint8_t>& ioRgba8,
         Color clearColor = Color{0.06f, 0.08f, 0.11f, 1.0f},
-        SoftwareDirtyRectStats* outStats = nullptr);
+        SoftwareDirtyRectStats* outStats = nullptr) {
+        SoftwareRasterizer::RasterizeTreeDirtyRectsToRgba8(
+            tree, viewportWidth, viewportHeight, dirtyRects, ioRgba8, clearColor, outStats);
+    }
 
-    static void ReleaseTransientPools() noexcept;
+    static void ReleaseTransientPools() noexcept {
+        SoftwareRasterizer::ReleaseTransientPools();
+    }
 
-    // Rasterize a Blur / Pixelate node span into a tight premultiplied RGBA8 patch for GPU composition.
     static bool RasterizeBlurSpanPatchPremulRgba8(
         const PagedRenderTree& tree,
         const BlurLayerSpan& span,
@@ -128,9 +126,12 @@ public:
         int& outPatchY,
         int& outPatchW,
         int& outPatchH,
-        std::vector<std::uint8_t>& outPremulRgba8);
+        std::vector<std::uint8_t>& outPremulRgba8) {
+        return SoftwareRasterizer::RasterizeBlurSpanPatchPremulRgba8(
+            tree, span, ioBlurCursor, viewportWidth, viewportHeight,
+            outPatchX, outPatchY, outPatchW, outPatchH, outPremulRgba8);
+    }
 
-    // Blur a top-down RGBA8 backdrop readback sub-rect and mask it into a tight premultiplied RGBA8 patch.
     static bool ComputeBackdropBlurPatchPremulRgba8(
         const BlurLayerSpan& span,
         std::uint32_t viewportWidth,
@@ -145,7 +146,12 @@ public:
         int& outPatchW,
         int& outPatchH,
         std::vector<std::uint8_t>& outPremulRgba8,
-        const UIResourceStore* optResourceStore = nullptr);
+        const UIResourceStore* optResourceStore = nullptr) {
+        return SoftwareRasterizer::ComputeBackdropBlurPatchPremulRgba8(
+            span, viewportWidth, viewportHeight, readX, readY, readW, readH,
+            topDownReadbackRgba8, outPatchX, outPatchY, outPatchW, outPatchH,
+            outPremulRgba8, optResourceStore);
+    }
 
     // Built-in unified UberShader sources (Desktop GL 3.3, WebGL2 #version 300 es, WebGPU WGSL)
     [[nodiscard]] static std::string_view UberVertexShaderSource(ShaderBackend backend) noexcept;

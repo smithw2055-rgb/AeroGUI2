@@ -10,7 +10,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "aero/core/UnifiedValue.hpp"
+#include "aero/drawing/Geometry.hpp"
 #include "aero/render/SkylinePacker.hpp"
 
 namespace aero {
@@ -290,6 +290,30 @@ struct TextLayoutResult {
     std::vector<TextLineMetrics> lines;
     std::vector<PositionedGlyph> glyphs;
 };
+
+[[nodiscard]] inline float ComputeAlignedLineOffsetX(
+    TextAlignment align,
+    bool effectiveRtl,
+    float boxWidth,
+    float lineWidth,
+    bool endedByNewline = true) noexcept {
+    TextAlignment effAlign = align;
+    if (effectiveRtl) {
+        if (effAlign == TextAlignment::Left) {
+            effAlign = TextAlignment::Right;
+        } else if (effAlign == TextAlignment::Right) {
+            effAlign = TextAlignment::Left;
+        }
+    }
+    if (effAlign == TextAlignment::Center) {
+        return std::max(0.0f, (boxWidth - lineWidth) * 0.5f);
+    }
+    if (effAlign == TextAlignment::Right ||
+        (effAlign == TextAlignment::Justify && effectiveRtl && endedByNewline)) {
+        return std::max(0.0f, boxWidth - lineWidth);
+    }
+    return 0.0f;
+}
 
 struct RichTextRunInput {
     std::string_view text;

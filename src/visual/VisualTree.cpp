@@ -8,7 +8,7 @@
 #include <realscript/semantic/Semantic.h>
 
 #include "aero/asset/GradientBrush.hpp"
-#include "aero/core/UIResourceStore.hpp"
+#include "aero/render/UIResourceStore.hpp"
 #include "aero/render/FontAtlas.hpp"
 #include "aero/render/RiveRenderer.hpp"
 #include "aero/visual/VisualAnimationEngine.hpp"
@@ -1509,13 +1509,13 @@ bool VisualWorld::AddTextSpan(
     return true;
 }
 
-const TextLayoutResult* VisualWorld::GetOrComputeTextLayout(
+const TextLayoutResult* VisualWorld::ResolveOrComputeNodeTextLayout(
     const VisualNode& node,
     float maxWidth,
     float maxHeight,
-    TextLayoutResult* optScratchFallback) const {
+    UIResourceStore* store,
+    TextLayoutResult* optScratchFallback) {
     const VisualTextData& txt = node.Text();
-    UIResourceStore* store = const_cast<VisualWorld*>(this)->ResourceStore();
     if (!store) {
         if (!optScratchFallback) {
             return nullptr;
@@ -1596,6 +1596,19 @@ const TextLayoutResult* VisualWorld::GetOrComputeTextLayout(
         return optScratchFallback;
     }
     return nullptr;
+}
+
+const TextLayoutResult* VisualWorld::GetOrComputeTextLayout(
+    const VisualNode& node,
+    float maxWidth,
+    float maxHeight,
+    TextLayoutResult* optScratchFallback) const {
+    return ResolveOrComputeNodeTextLayout(
+        node,
+        maxWidth,
+        maxHeight,
+        const_cast<VisualWorld*>(this)->ResourceStore(),
+        optScratchFallback);
 }
 
 TextLayoutResult VisualWorld::LayoutTextNode(const VisualNode& node, float maxWidth) const {
@@ -1710,12 +1723,12 @@ std::int32_t VisualWorld::HitTestTextCodePoint(VisualNodeId id, float localX, fl
         }
     }
 
-    float alignDx = 0.0f;
-    if (txt.align == TextAlignment::Center) {
-        alignDx = std::max(0.0f, (boxW - chosenLine->width) * 0.5f);
-    } else if (txt.align == TextAlignment::Right) {
-        alignDx = std::max(0.0f, boxW - chosenLine->width);
-    }
+    const float alignDx = ComputeAlignedLineOffsetX(
+        txt.align,
+        node->layout.effectiveRtl,
+        boxW,
+        chosenLine->width,
+        chosenLine->endedByNewline);
 
     const std::size_t lineBegin = std::min(chosenLine->firstGlyphIndex, layout.glyphs.size());
     const std::size_t lineEnd = std::min(lineBegin + chosenLine->glyphCount, layout.glyphs.size());

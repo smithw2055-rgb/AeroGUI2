@@ -6,7 +6,8 @@
 #include <unordered_set>
 #include <vector>
 
-#include "aero/app/AeroAppHost.hpp"
+#define AERO_TEST_WITH_APP_HOST 1
+#include "common/AeroTestHarness.hpp"
 #include "aero/compiler/AeroCompilerV3.hpp"
 #include "aero/compiler/XamlDom.hpp"
 #include "aero/render/ImageAtlas.hpp"
@@ -16,14 +17,12 @@ namespace {
 
 int gFailures = 0;
 
-void CheckImpl(bool cond, const char* expr, const char* file, int line) {
-    if (!cond) {
-        std::fprintf(stderr, "[FAIL] %s:%d: %s\n", file, line, expr);
-        ++gFailures;
-    }
-}
-
-#define CHECK(expr) CheckImpl((expr), #expr, __FILE__, __LINE__)
+#define CHECK(expr)                                                         \
+    do {                                                                    \
+        if (!(expr)) {                                                      \
+            aero::test::ReportFailure(gFailures, #expr, __FILE__, __LINE__); \
+        }                                                                   \
+    } while (false)
 
 void TestExternalGpuTextureSlotAndViewportSurface() {
     aero::ImageAtlas atlas;
@@ -1664,9 +1663,9 @@ public partial class DockingV2Harness : Window {
     CHECK(host.InvokeScriptMethod(wsObj, "UnregisterPane", {aero::UnifiedValue{aero::StringValue{std::string_view{"fresh_center"}}}}, &res));
     CHECK(ReadRsBool(res));
     CHECK(host.InvokeScriptMethod(rootObj, "SetupLeftCenterRightBottomOrder", {}, &res));
-    CHECK(host.InvokeScriptMethod(wsObj, "set_LeftSplitRatio", {aero::MakeFloat(0.28f)}, &res));
-    CHECK(host.InvokeScriptMethod(wsObj, "set_RightSplitRatio", {aero::MakeFloat(0.81f)}, &res));
-    CHECK(host.InvokeScriptMethod(wsObj, "set_BottomSplitRatio", {aero::MakeFloat(0.64f)}, &res));
+    CHECK(host.InvokeScriptMethod(wsObj, "set_LeftSplitRatio", {aero::UnifiedValue{aero::FloatValue{0.28f}}}, &res));
+    CHECK(host.InvokeScriptMethod(wsObj, "set_RightSplitRatio", {aero::UnifiedValue{aero::FloatValue{0.81f}}}, &res));
+    CHECK(host.InvokeScriptMethod(wsObj, "set_BottomSplitRatio", {aero::UnifiedValue{aero::FloatValue{0.64f}}}, &res));
     host.StepFrame(0.016f, true);
 
     CHECK(host.ReadScriptMember(wsObj, "LeftSplitRatio", dragVal));
