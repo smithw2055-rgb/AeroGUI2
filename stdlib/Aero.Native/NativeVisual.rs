@@ -37,6 +37,8 @@ int __rs_native_Visual_SetClipToBounds(handle node, bool clip) { return 0; }
 public void Visual_SetClipToBounds(handle node, bool clip) { __rs_native_Visual_SetClipToBounds(node, clip); return; }
 int __rs_native_Visual_SetInteractiveFlags(handle node, bool enabled, bool hitTest, bool focusable) { return 0; }
 public void Visual_SetInteractiveFlags(handle node, bool enabled, bool hitTest, bool focusable) { __rs_native_Visual_SetInteractiveFlags(node, enabled, hitTest, focusable); return; }
+int __rs_native_Visual_SetHitTestBorderOnly(handle node, bool borderOnly) { return 0; }
+public void Visual_SetHitTestBorderOnly(handle node, bool borderOnly) { __rs_native_Visual_SetHitTestBorderOnly(node, borderOnly); return; }
 int __rs_native_Visual_SetLayoutMode(handle node, int mode, float p0, float p1, int i0, int i1) { return 0; }
 public void Visual_SetLayoutMode(handle node, int mode, float p0, float p1, int i0, int i1) { __rs_native_Visual_SetLayoutMode(node, mode, p0, p1, i0, i1); return; }
 int __rs_native_Visual_GridClearDefs(handle node) { return 0; }
@@ -65,6 +67,17 @@ int __rs_native_Visual_SetBoxBrushOpacity(handle node, float bgOpacity) { return
 public void Visual_SetBoxBrushOpacity(handle node, float bgOpacity) { __rs_native_Visual_SetBoxBrushOpacity(node, bgOpacity); return; }
 int __rs_native_Visual_SetBoxShadow(handle node, bool isBoxShadow) { return 0; }
 public void Visual_SetBoxShadow(handle node, bool isBoxShadow) { __rs_native_Visual_SetBoxShadow(node, isBoxShadow); return; }
+int __rs_native_Visual_SetBoxColors(handle node, uint bgRgba, uint borderRgba) { return 0; }
+public void Visual_SetBoxColors(handle node, uint bgRgba, uint borderRgba) { __rs_native_Visual_SetBoxColors(node, bgRgba, borderRgba); return; }
+int __rs_native_Visual_SetBorderThickness(handle node, float l, float t, float r, float b) { return 0; }
+public void Visual_SetBorderThickness(handle node, float l, float t, float r, float b) { __rs_native_Visual_SetBorderThickness(node, l, t, r, b); return; }
+int __rs_native_Visual_SetCornerRadius(handle node, float tl, float tr, float br, float bl) { return 0; }
+public void Visual_SetCornerRadius(handle node, float tl, float tr, float br, float bl) { __rs_native_Visual_SetCornerRadius(node, tl, tr, br, bl); return; }
+int __rs_native_Visual_SetTransformOrigin(handle node, float ox, float oy) { return 0; }
+public void Visual_SetTransformOrigin(handle node, float ox, float oy) { __rs_native_Visual_SetTransformOrigin(node, ox, oy); return; }
+int __rs_native_Visual_SetNodeVisualFlags(handle node, bool suppressPadding, bool suppressBoxVisual, bool includeBorderInPadding) { return 0; }
+public void Visual_SetNodeVisualFlags(handle node, bool suppressPadding, bool suppressBoxVisual, bool includeBorderInPadding) { __rs_native_Visual_SetNodeVisualFlags(node, suppressPadding, suppressBoxVisual, includeBorderInPadding); return; }
+public float Visual_GetNodeFloat(handle node, int propCode) { return 0.0f; }
 public int Visual_RegisterLinearGradient(float x0, float y0, float x1, float y1, int spread, int mapping, string stopsSpec) { return 0; }
 public int Visual_RegisterMutableLinearGradient(int reuseId, float x0, float y0, float x1, float y1, int spread, int mapping, string stopsSpec) { return 0; }
 int __rs_native_Visual_ReleaseMutableGradient(int gradId) { return 0; }
@@ -107,6 +120,14 @@ public float Visual_MeasureText(string text, string fontFamily, float fontSize, 
 public int Visual_HitTestTextCp(handle node, float localX, float localY) { return 0; }
 int __rs_native_Visual_SetImage(handle node, string uri, int stretch, int stretchDir, uint tintRgba) { return 0; }
 public void Visual_SetImage(handle node, string uri, int stretch, int stretchDir, uint tintRgba) { __rs_native_Visual_SetImage(node, uri, stretch, stretchDir, tintRgba); return; }
+int __rs_native_Visual_SetPlasmaImage(handle node, float sx, float sy, float timeSec, float seed, uint colorRgba, float vw, float vh, int stretch, int stretchDir, uint tintRgba) { return 0; }
+public void Visual_SetPlasmaImage(handle node, float sx, float sy, float timeSec, float seed, uint colorRgba, float vw, float vh, int stretch, int stretchDir, uint tintRgba) { __rs_native_Visual_SetPlasmaImage(node, sx, sy, timeSec, seed, colorRgba, vw, vh, stretch, stretchDir, tintRgba); return; }
+int __rs_native_Visual_SetRiveParams(handle node, string assetPath, int instanceId, float tLoopSec, float tStateSec, float reqW, float reqH, int stretch, uint tintRgba) { return 0; }
+public void Visual_SetRiveParams(handle node, string assetPath, int instanceId, float tLoopSec, float tStateSec, float reqW, float reqH, int stretch, uint tintRgba) { __rs_native_Visual_SetRiveParams(node, assetPath, instanceId, tLoopSec, tStateSec, reqW, reqH, stretch, tintRgba); return; }
+int __rs_native_Visual_ClearRiveInputs(handle node) { return 0; }
+public void Visual_ClearRiveInputs(handle node) { __rs_native_Visual_ClearRiveInputs(node); return; }
+int __rs_native_Visual_SetRiveInput(handle node, string inputName, float value) { return 0; }
+public void Visual_SetRiveInput(handle node, string inputName, float value) { __rs_native_Visual_SetRiveInput(node, inputName, value); return; }
 int __rs_native_Visual_SetImageViewbox(handle node, float vx, float vy, float vw, float vh) { return 0; }
 public void Visual_SetImageViewbox(handle node, float vx, float vy, float vw, float vh) { __rs_native_Visual_SetImageViewbox(node, vx, vy, vw, vh); return; }
 int __rs_native_Visual_SetImageViewport(handle node, float vpx, float vpy, float vpw, float vph, bool hasExplicit, bool isAbsolute) { return 0; }
@@ -236,6 +257,11 @@ public bool Reflect_ListRemoveAt(object list, int index) { return false; }
 public bool Reflect_InvokeCommand(object target, string propPath, string param) { return false; }
 public int Reflect_GetDirtyMask(object target) { return 0; }
 public int Reflect_GetGlobalObservableEpoch() { return 1; }
+public int Reflect_GetObjectToken(object target) { return 0; }
+public int Reflect_BeginConsumeDirtyTokens() { return -1; }
+public int Reflect_GetConsumedDirtyToken(int idx) { return 0; }
+public int Visual_BeginConsumeDirtyPropNodes() { return -1; }
+public object Visual_GetConsumedDirtyPropOwner(int idx) { return null; }
 public uint Color_ParseRgba(string hexOrNamed) { return 0u; }
 public string Host_ReadTextAsset(string uri) { return ""; }
 public int Utf8_CodePointCount(string text) { return 0; }

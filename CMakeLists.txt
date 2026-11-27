@@ -236,26 +236,42 @@ if(AERO_BUILD_COMPILER_TOOLS AND TARGET RealScript::Frontend)
 endif()
 
 # ============================================================================
-# 6. App Host & Viewer Tool
+# 6. App Runtime (Pure Slim /GR-, zero compiler) & Dev Host (+ Viewer Tool)
 # ============================================================================
-add_library(aerogui_app STATIC
+add_library(aerogui_app_runtime STATIC
     src/app/AeroAppHost.cpp
 )
-add_library(AeroGUI::App ALIAS aerogui_app)
-target_link_libraries(aerogui_app
+add_library(AeroGUI::AppRuntime ALIAS aerogui_app_runtime)
+target_link_libraries(aerogui_app_runtime
     PUBLIC
         aerogui_host
 )
+if(TARGET RealScript::StencilJit AND NOT EMSCRIPTEN)
+    target_link_libraries(aerogui_app_runtime PRIVATE RealScript::StencilJit)
+    target_compile_definitions(aerogui_app_runtime PRIVATE AERO_HAS_STENCIL_JIT=1)
+endif()
+aero_apply_no_rtti_options(aerogui_app_runtime)
+
 if(AERO_BUILD_COMPILER_TOOLS AND TARGET aerogui_compiler)
-    target_link_libraries(aerogui_app PUBLIC aerogui_compiler)
-    target_compile_definitions(aerogui_app PUBLIC AERO_HAS_COMPILER_V3=1)
-    if(TARGET RealScript::StencilJit AND NOT EMSCRIPTEN)
-        target_link_libraries(aerogui_app PRIVATE RealScript::StencilJit)
-        target_compile_definitions(aerogui_app PRIVATE AERO_HAS_STENCIL_JIT=1)
-    endif()
-    aero_apply_default_rtti_options(aerogui_app)
+    add_library(aerogui_app_dev_host STATIC
+        src/app/AeroAppDevHost.cpp
+    )
+    add_library(AeroGUI::AppDevHost ALIAS aerogui_app_dev_host)
+    target_link_libraries(aerogui_app_dev_host
+        PUBLIC
+            aerogui_app_runtime
+            aerogui_compiler
+    )
+    target_compile_definitions(aerogui_app_dev_host PUBLIC AERO_HAS_COMPILER_V3=1)
+    aero_apply_default_rtti_options(aerogui_app_dev_host)
+endif()
+
+add_library(aerogui_app INTERFACE)
+add_library(AeroGUI::App ALIAS aerogui_app)
+if(TARGET aerogui_app_dev_host)
+    target_link_libraries(aerogui_app INTERFACE aerogui_app_dev_host)
 else()
-    aero_apply_no_rtti_options(aerogui_app)
+    target_link_libraries(aerogui_app INTERFACE aerogui_app_runtime)
 endif()
 
 add_library(aerocore INTERFACE)
@@ -357,12 +373,15 @@ if(AERO_BUILD_TESTS)
     if(AERO_BUILD_COMPILER_TOOLS AND TARGET aero-compiler AND
        EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/v3_slim_no_rtti_and_aot_tests.cpp")
         add_executable(v3_slim_no_rtti_and_aot_tests tests/v3_slim_no_rtti_and_aot_tests.cpp)
-        target_link_libraries(v3_slim_no_rtti_and_aot_tests PRIVATE aerogui_host)
+        target_link_libraries(v3_slim_no_rtti_and_aot_tests PRIVATE aerogui_app_runtime)
         add_dependencies(v3_slim_no_rtti_and_aot_tests aero-compiler)
+        get_filename_component(_aero_rs_include_dir "${REALSCRIPT_BUILD_DIR}/../include" ABSOLUTE)
         target_compile_definitions(v3_slim_no_rtti_and_aot_tests PRIVATE
             AERO_COMPILER_EXE="$<TARGET_FILE:aero-compiler>"
             AERO_STDLIB_DIR="${CMAKE_CURRENT_SOURCE_DIR}/stdlib"
+            AERO_SAMPLES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/Samples"
             AERO_TEST_TEMP_DIR="${CMAKE_CURRENT_BINARY_DIR}/test_out"
+            AERO_REALSCRIPT_INCLUDE_DIR="${_aero_rs_include_dir}"
         )
         aero_apply_no_rtti_options(v3_slim_no_rtti_and_aot_tests)
         add_test(NAME v3_slim_no_rtti_and_aot_tests COMMAND v3_slim_no_rtti_and_aot_tests)
@@ -438,9 +457,13 @@ set(_aero_export_targets
     aerogui_visual
     aerogui_host
     aerogui_runtime
+    aerogui_app_runtime
     aerogui_app
     aerocore
 )
+if(TARGET aerogui_app_dev_host)
+    list(APPEND _aero_export_targets aerogui_app_dev_host)
+endif()
 if(TARGET aerogui_compiler)
     list(APPEND _aero_export_targets aerogui_compiler aero-compiler)
     set(AERO_HAS_COMPILER_TOOLS_CMAKE TRUE)

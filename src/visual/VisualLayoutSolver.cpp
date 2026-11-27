@@ -10,6 +10,7 @@
 #include "aero/asset/MtsdfPathBaker.hpp"
 #include "aero/core/UIResourceStore.hpp"
 #include "aero/render/ImageAtlas.hpp"
+#include "aero/render/RiveRenderer.hpp"
 
 namespace aero {
 
@@ -254,14 +255,39 @@ void ComputeViewboxScale(
             return world.MeasureTextNode(node, maxW);
         }
         case VisualKind::Image: {
-            if (node.Image().uri.empty()) {
+            const VisualImageData& imgData = node.Image();
+            if (!imgData.HasNonVisualBrushSource()) {
                 return Size{0.0f, 0.0f};
             }
             UIResourceStore* store = world.ResourceStore();
             if (!store) {
                 return Size{0.0f, 0.0f};
             }
-            const ImageAtlasEntry* entry = store->Images().LoadOrGet(node.Image().uri);
+            const ImageAtlasEntry* entry = nullptr;
+            if (imgData.plasma.active) {
+                PlasmaRenderParams p{};
+                p.sx = imgData.plasma.sx;
+                p.sy = imgData.plasma.sy;
+                p.timeSec = imgData.plasma.timeSec;
+                p.seed = imgData.plasma.seed;
+                p.vw = imgData.plasma.vw;
+                p.vh = imgData.plasma.vh;
+                p.colorRgba = imgData.plasma.colorRgba;
+                entry = store->Images().LoadOrGetPlasma(p);
+            } else if (imgData.rive.active) {
+                RiveRenderRequest req{};
+                req.assetPath = imgData.rive.assetPath;
+                req.instanceId = imgData.rive.instanceId;
+                req.tLoopSec = imgData.rive.tLoopSec;
+                req.tStateSec = imgData.rive.tStateSec;
+                req.reqW = imgData.rive.reqW;
+                req.reqH = imgData.rive.reqH;
+                req.inputs = imgData.rive.inputs.data();
+                req.inputCount = imgData.rive.inputs.size();
+                entry = store->Images().LoadOrGetRive(req, imgData.rive.inputsRevision);
+            } else {
+                entry = store->Images().LoadOrGet(imgData.uri);
+            }
             if (!entry || entry->width == 0u || entry->height == 0u) {
                 return Size{0.0f, 0.0f};
             }
@@ -1728,8 +1754,9 @@ Size MeasureNode(VisualWorld& world, VisualNodeId id, Size availSize) {
     const float marginV =
         (std::isfinite(node->layout.margin.top) ? node->layout.margin.top : 0.0f) +
         (std::isfinite(node->layout.margin.bottom) ? node->layout.margin.bottom : 0.0f);
-    const float padH = std::max(0.0f, node->layout.padding.left) + std::max(0.0f, node->layout.padding.right);
-    const float padV = std::max(0.0f, node->layout.padding.top) + std::max(0.0f, node->layout.padding.bottom);
+    const Thickness effPad = node->EffectivePadding();
+    const float padH = std::max(0.0f, effPad.left) + std::max(0.0f, effPad.right);
+    const float padV = std::max(0.0f, effPad.top) + std::max(0.0f, effPad.bottom);
 
     const bool hasLayoutTx = !node->layout.layoutTransform2D.IsIdentity();
     float localAvailOuterW = availSize.width;
@@ -1845,6 +1872,7 @@ void ArrangeNode(
             std::fabs(prevW - node->layout.layoutRect.width) > 1e-4f ||
             std::fabs(prevH - node->layout.layoutRect.height) > 1e-4f) {
             world.BumpLayoutSizeEpoch();
+            world.MarkBindingPropDirty(id);
         }
         if (rectChanged) {
             node->dirtyFlags = static_cast<std::uint8_t>(node->dirtyFlags | VisualDirty_Transform | VisualDirty_Visual);
@@ -1890,6 +1918,7 @@ void ArrangeNode(
             std::fabs(prevW - node->layout.layoutRect.width) > 1e-4f ||
             std::fabs(prevH - node->layout.layoutRect.height) > 1e-4f) {
             world.BumpLayoutSizeEpoch();
+            world.MarkBindingPropDirty(id);
         }
         if (rectChanged) {
             node->dirtyFlags = static_cast<std::uint8_t>(node->dirtyFlags | VisualDirty_Transform | VisualDirty_Visual);
@@ -2022,12 +2051,14 @@ void ArrangeNode(
         std::fabs(prevW - node->layout.layoutRect.width) > 1e-4f ||
         std::fabs(prevH - node->layout.layoutRect.height) > 1e-4f) {
         world.BumpLayoutSizeEpoch();
+        world.MarkBindingPropDirty(id);
     }
 
-    const float pL = std::max(0.0f, node->layout.padding.left);
-    const float pT = std::max(0.0f, node->layout.padding.top);
-    const float pR = std::max(0.0f, node->layout.padding.right);
-    const float pB = std::max(0.0f, node->layout.padding.bottom);
+    const Thickness effPad = node->EffectivePadding();
+    const float pL = std::max(0.0f, effPad.left);
+    const float pT = std::max(0.0f, effPad.top);
+    const float pR = std::max(0.0f, effPad.right);
+    const float pB = std::max(0.0f, effPad.bottom);
     const Rect innerRect{
         posX + pL,
         posY + pT,

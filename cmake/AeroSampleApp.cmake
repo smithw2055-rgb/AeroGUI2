@@ -1,9 +1,13 @@
 set(_AERO_SAMPLE_APP_CMAKE_DIR "${CMAKE_CURRENT_LIST_DIR}")
 
 function(aero_add_sample_app TARGET_NAME)
-    set(oneValueArgs SAMPLE_DIR TITLE WIDTH HEIGHT OUTPUT_DIR)
+    set(oneValueArgs SAMPLE_DIR TITLE WIDTH HEIGHT OUTPUT_DIR PROFILE)
     set(multiValueArgs EXTRA_ASSET_DIRS)
     cmake_parse_arguments(AERO_SAMPLE "" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
+
+    if(NOT AERO_SAMPLE_PROFILE)
+        set(AERO_SAMPLE_PROFILE "DEV_LIVE")
+    endif()
 
     if(NOT AERO_SAMPLE_SAMPLE_DIR)
         message(FATAL_ERROR "aero_add_sample_app(${TARGET_NAME}): SAMPLE_DIR is required")
@@ -30,14 +34,23 @@ function(aero_add_sample_app TARGET_NAME)
     endif()
 
     add_executable(${TARGET_NAME} "${_aero_launcher_src}")
-    target_link_libraries(${TARGET_NAME} PRIVATE AeroGUI::App)
+    if(AERO_SAMPLE_PROFILE STREQUAL "RELEASE_SLIM_JIT" AND TARGET aero-compiler AND TARGET AeroGUI::AppRuntime)
+        target_link_libraries(${TARGET_NAME} PRIVATE AeroGUI::AppRuntime)
+        if(MSVC)
+            target_compile_options(${TARGET_NAME} PRIVATE /utf-8 /GR-)
+        else()
+            target_compile_options(${TARGET_NAME} PRIVATE -fno-rtti)
+        endif()
+    else()
+        target_link_libraries(${TARGET_NAME} PRIVATE AeroGUI::App)
+        if(MSVC)
+            target_compile_options(${TARGET_NAME} PRIVATE /utf-8)
+        endif()
+    endif()
     if(WIN32)
         target_link_libraries(${TARGET_NAME} PRIVATE psapi)
     endif()
     target_compile_features(${TARGET_NAME} PRIVATE cxx_std_17)
-    if(MSVC)
-        target_compile_options(${TARGET_NAME} PRIVATE /utf-8)
-    endif()
     target_compile_definitions(${TARGET_NAME} PRIVATE
         AERO_SAMPLE_APP_TITLE="${AERO_SAMPLE_TITLE}"
         AERO_SAMPLE_APP_WIDTH=${AERO_SAMPLE_WIDTH}u
@@ -51,7 +64,38 @@ function(aero_add_sample_app TARGET_NAME)
         RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${AERO_SAMPLE_OUTPUT_DIR}/MinSizeRel"
     )
 
-    if(TARGET AeroGUI::Stdlib)
+    if(AERO_SAMPLE_PROFILE STREQUAL "RELEASE_SLIM_JIT" AND TARGET aero-compiler AND TARGET AeroGUI::AppRuntime)
+        set(_aero_arbc_name "${TARGET_NAME}.arbc")
+        set(_aero_arbc_path "${CMAKE_CURRENT_BINARY_DIR}/generated/${_aero_arbc_name}")
+        target_compile_definitions(${TARGET_NAME} PRIVATE
+            AERO_SAMPLE_PRECOMPILED_ARBC="${_aero_arbc_name}"
+        )
+        file(GLOB_RECURSE _aero_sample_sources CONFIGURE_DEPENDS
+            "${AERO_SAMPLE_SAMPLE_DIR}/*.xaml"
+            "${AERO_SAMPLE_SAMPLE_DIR}/*.rs"
+            "${AERO_SAMPLE_SAMPLE_DIR}/*.cs"
+        )
+        add_custom_command(
+            OUTPUT "${_aero_arbc_path}"
+            COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
+            COMMAND $<TARGET_FILE:aero-compiler>
+                --sample-dir "${AERO_SAMPLE_SAMPLE_DIR}"
+                --compiled-xaml-catalog
+                --O2
+                --out-arbc "${_aero_arbc_path}"
+            DEPENDS aero-compiler ${_aero_sample_sources}
+            COMMENT "Compiling slim bytecode bundle (${_aero_arbc_name}) for ${TARGET_NAME}"
+            VERBATIM
+        )
+        add_custom_target(${TARGET_NAME}_arbc DEPENDS "${_aero_arbc_path}")
+        add_dependencies(${TARGET_NAME} ${TARGET_NAME}_arbc)
+        add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${_aero_arbc_path}"
+                "$<TARGET_FILE_DIR:${TARGET_NAME}>/${_aero_arbc_name}"
+            COMMENT "Staging ${_aero_arbc_name} next to ${TARGET_NAME}"
+        )
+    elseif(TARGET AeroGUI::Stdlib)
         add_dependencies(${TARGET_NAME} AeroGUI::Stdlib)
         add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different

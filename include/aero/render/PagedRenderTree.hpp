@@ -634,6 +634,7 @@ public:
     [[nodiscard]] const CommandPage& GetPage(std::size_t pageIndex) const noexcept {
         return pages_[pageIndex];
     }
+    [[nodiscard]] bool ComputePageScreenBoundsConst(std::size_t pageIdx, Rect& outBounds) const noexcept;
     [[nodiscard]] const float* PageVertexClipW(std::size_t pageIndex) const noexcept;
     [[nodiscard]] bool HasAnyPerspective3D() const noexcept { return hasAnyPerspective3D_; }
 

@@ -17,6 +17,8 @@ struct ExternalXamlDep final {
 struct XamlEmitOptions final {
     std::string xamlPath = "MainView.xaml";
     std::string defaultModuleName;
+    std::string classNameOverride;
+    bool forceStandaloneClass = false;
     ExternalXamlResolverFn externalXamlResolver{};
     std::string resourceSearchRoot;
     std::vector<std::string> resourceSearchPaths;

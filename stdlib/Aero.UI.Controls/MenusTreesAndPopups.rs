@@ -22,7 +22,17 @@ public static class PopupService {
         }
     }
 
+    private static bool _windowHooksInstalled = false;
+
+    public static void EnsureWindowHooksInstalled() {
+        if (_windowHooksInstalled) { return; }
+        _windowHooksInstalled = true;
+        Window._overlayHostHook = (UIElement h) => { PopupService.SetOverlayHost(h); };
+        Window._closeAllPopupsHook = () => { PopupService.CloseAll(); };
+    }
+
     public static void SetOverlayHost(UIElement host) {
+        EnsureWindowHooksInstalled();
         _overlayHost = host;
     }
 
@@ -215,6 +225,7 @@ public class Popup : FrameworkElement {
     public event EventHandler Closed;
 
     public Popup() : base(VisualKind.Box) {
+        PopupService.EnsureWindowHooksInstalled();
         ZIndex = 10000;
         Visibility = Visibility.Collapsed;
         HorizontalAlignment = HorizontalAlignment.Left;
@@ -584,7 +595,7 @@ public static class ToolTipService {
         if (_installed) { return; }
         _installed = true;
         UIElement._toolTipEventHook = (UIElement el, string prop, DependencyObject val) => {
-            if (el != null && val != null) { el.EnableToolTipHover(); }
+            if (el != null && val != null) { el.EnableToolTipHoverImpl(); }
         };
     }
 
@@ -659,7 +670,7 @@ public partial class UIElement {
         }
     }
 
-    public void EnableToolTipHover() {
+    internal void EnableToolTipHoverImpl() {
         ToolTipService.EnsureInstalled();
         if (_toolTipHooked) { return; }
         _toolTipHooked = true;
@@ -1563,37 +1574,6 @@ public class ToolBar : HeaderedItemsControl {
 // 3. TreeView & TreeViewItem
 // ============================================================================
 
-internal class ArrayCollectionSlot : CollectionSlotBase {
-    public ArrayCollectionBox Target;
-    public ArrayCollectionSlot(ArrayCollectionBox target) : base() { Target = target; }
-    public override bool Matches(object col) {
-        var o = col as ArrayCollectionBox;
-        return o == Target;
-    }
-}
-
-internal class ArrayCollectionBox : DependencyObject, ICollectionNotifier {
-    private DependencyObject[] _items;
-    private CollectionSlotBase _notifierSlot;
-    public ArrayCollectionBox() { _items = new DependencyObject[0]; }
-    public ArrayCollectionBox(DependencyObject[] items) {
-        _items = items == null ? new DependencyObject[0] : items;
-    }
-    public override object UnboxObject() { return this; }
-    public CollectionSlotBase EnsureNotifierSlot() {
-        if (_notifierSlot == null) {
-            _notifierSlot = CollectionChangeHub.FindOrRegister(new ArrayCollectionSlot(this), this);
-        }
-        return _notifierSlot;
-    }
-    public void AddBox(DependencyObject b) { _items.Push(b); }
-    public int ItemCount() { return _items.Length; }
-    public DependencyObject BoxItemAt(int index) {
-        if (index < 0 || index >= _items.Length) { return null; }
-        return _items[index];
-    }
-}
-
 public class TreeViewItem : HeaderedItemsControl {
     internal override int FastPropEpochCategory() { return 9; }
     private bool _isExpanded = false;
@@ -2070,176 +2050,4 @@ public class TreeView : ItemsControl {
     }
 }
 
-// ============================================================================
-// 4. UserControl, Page, Window & Application
-// ============================================================================
 
-[Observable]
-public class UserControl : ContentControl {
-    public UserControl() : base() {
-        IsTabStop = false;
-        HorizontalContentAlignment = HorizontalAlignment.Stretch;
-        VerticalContentAlignment = VerticalAlignment.Stretch;
-    }
-    public override string GetTypeName() { return "UserControl"; }
-    public override bool IsNamescopeBoundary() { return true; }
-    internal override int FastPropEpochCategory() { return 0; }
-    protected override void OnBoxAppearanceChanged() {
-        base.OnBoxAppearanceChanged();
-        UpdateInheritedForegroundForBackground(Background);
-    }
-}
-
-[Observable]
-public class Page : ContentControl {
-    public string Title { get; set; } = "";
-    public string WindowTitle { get; set; } = "";
-    public Page() : base() {
-        IsTabStop = false;
-        HorizontalContentAlignment = HorizontalAlignment.Stretch;
-        VerticalContentAlignment = VerticalAlignment.Stretch;
-    }
-    public override string GetTypeName() { return "Page"; }
-    public override bool IsNamescopeBoundary() { return true; }
-    internal override int FastPropEpochCategory() { return 0; }
-    protected override void OnBoxAppearanceChanged() {
-        base.OnBoxAppearanceChanged();
-        UpdateInheritedForegroundForBackground(Background);
-    }
-}
-
-[Observable]
-public class Window : ContentControl {
-    public string Title { get; set; } = "Aero Window";
-    public string Icon { get; set; } = "";
-    public string WindowState { get; set; } = "Normal";
-    private bool _isActive = false;
-
-    public event CancelEventHandler Closing;
-    public event EventHandler Closed;
-    public event EventHandler Activated;
-
-    public bool IsActive { get { return _isActive; } }
-    internal override int FastPropEpochCategory() { return 0; }
-
-    public Window() : base() {
-        ThemeManager.EnsureInitialized();
-        Background = new SolidColorBrush("#FF12151C");
-        HorizontalContentAlignment = HorizontalAlignment.Stretch;
-        VerticalContentAlignment = VerticalAlignment.Stretch;
-        PopupService.SetOverlayHost(this);
-    }
-
-    public override string GetTypeName() { return "Window"; }
-    public override bool IsNamescopeBoundary() { return true; }
-    protected override void OnBoxAppearanceChanged() {
-        base.OnBoxAppearanceChanged();
-        UpdateInheritedForegroundForBackground(Background);
-    }
-
-    public void Show() {
-        _isActive = true;
-        PopupService.SetOverlayHost(this);
-        Visibility = Visibility.Visible;
-        if (!IsTemplateApplied()) { ApplyTemplate(); }
-        EnsureLoadedSubtree();
-        Activated(this, EventArgs.Empty());
-    }
-
-    public void Activate() {
-        _isActive = true;
-        Activated(this, EventArgs.Empty());
-    }
-
-    public void Close() {
-        var ce = new CancelEventArgs(false);
-        Closing(this, ce);
-        if (ce.Cancel) { return; }
-        _isActive = false;
-        PopupService.CloseAll();
-        Closed(this, EventArgs.Empty());
-        if (ParseUtil.IsValidHandle(__nativeHandle)) {
-            Host_CloseWindow();
-        }
-    }
-
-    protected override UIElement CreateDefaultTemplate() {
-        _presenter = new ContentPresenter();
-        _presenter.Name = "PART_ContentPresenter";
-        _presenter.ContentTemplate = ContentTemplate;
-        _presenter.SetContentBox(ContentBox);
-        return _presenter;
-    }
-
-    public override void OnHostViewportResized(float width, float height) {
-        if (width > 1.0f && height > 1.0f) {
-            if (!ParseUtil.IsNaN(Width)) { Width = ParseUtil.NaN(); }
-            if (!ParseUtil.IsNaN(Height)) { Height = ParseUtil.NaN(); }
-        }
-    }
-
-    public override bool SetPropertyValue(string propName, DependencyObject value) {
-        if (propName == "Title") { Title = DependencyObject.UnboxString(value, ""); return true; }
-        return base.SetPropertyValue(propName, value);
-    }
-}
-
-public class Application : DependencyObject {
-    private static Application _current;
-    private ResourceDictionary _resources;
-
-    public Window MainWindow { get; set; }
-    public event StartupEventHandler Startup;
-    public event EventHandler Exit;
-
-    public Application() {
-        _current = this;
-        _resources = ResourceDictionary.GlobalApplicationResources();
-        ThemeManager.EnsureInitialized();
-    }
-
-    public static Application Current() {
-        if (_current == null) { _current = new Application(); }
-        return _current;
-    }
-
-    public ResourceDictionary Resources {
-        get { return _resources; }
-        set {
-            _resources = value;
-            ResourceDictionary.BumpGlobalMutationEpoch();
-            if (value != null) { ResourceDictionary.GlobalApplicationResources().Merge(value); }
-        }
-    }
-
-    public object FindResource(string key) {
-        if (_resources != null) {
-            object localVal = _resources.Get(key);
-            if (localVal != null) { return localVal; }
-        }
-        return ResourceDictionary.GlobalApplicationResources().Get(key);
-    }
-
-    public object TryFindResource(string key) {
-        return FindResource(key);
-    }
-
-    public DependencyObject FindResourceBox(string key) {
-        if (_resources != null) {
-            DependencyObject localBox = _resources.GetBox(key);
-            if (localBox != null) { return localBox; }
-        }
-        return ResourceDictionary.GlobalApplicationResources().GetBox(key);
-    }
-
-    public void Run(Window window = null) {
-        Startup(this, new StartupEventArgs(new string[0]));
-        if (window != null) { MainWindow = window; }
-        if (MainWindow != null) { MainWindow.Show(); }
-    }
-
-    public void Shutdown(int exitCode = 0) {
-        Exit(this, EventArgs.Empty());
-        Host_CloseWindow();
-    }
-}

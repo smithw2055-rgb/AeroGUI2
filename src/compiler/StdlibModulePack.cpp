@@ -17,9 +17,12 @@ namespace {
         return false;
     }
     const auto nativeVisual = candidate / "Aero.Native" / "NativeVisual.rs";
-    const auto coreUi = candidate / "Aero.UI" / "Core.rs";
+    const auto splitCore = candidate / "Aero.UI.Core" / "Core.rs";
+    const auto legacyCore = candidate / "Aero.UI" / "Core.rs";
     return std::filesystem::is_regular_file(nativeVisual, ec) ||
-           std::filesystem::is_regular_file(coreUi, ec) ||
+           std::filesystem::is_regular_file(splitCore, ec) ||
+           std::filesystem::is_regular_file(legacyCore, ec) ||
+           std::filesystem::is_directory(candidate / "Aero.UI.Core", ec) ||
            std::filesystem::is_directory(candidate / "Aero.UI", ec);
 }
 
@@ -172,15 +175,173 @@ std::filesystem::path ResolveStdlibRootDirectory(std::string_view explicitDir) {
     return {};
 }
 
+std::uint32_t ResolveEffectiveStdlibPackageMask(std::uint32_t requestedMask) noexcept {
+    if (requestedMask == AeroStdlibPkg_Auto) {
+        return AeroStdlibPkg_All;
+    }
+    std::uint32_t mask = requestedMask | AeroStdlibPkg_Core;
+    if ((mask & AeroStdlibPkg_RuntimeXaml) != 0u ||
+        (mask & AeroStdlibPkg_Workbench) != 0u) {
+        mask |= AeroStdlibPkg_Controls;
+    }
+    return mask & (AeroStdlibPkg_All | AeroStdlibPkg_GameHud);
+}
+
+std::uint32_t InferRequiredStdlibPackages(const AeroV3CompileInput& input) noexcept {
+    std::uint32_t mask = AeroStdlibPkg_Core;
+    if ((input.stdlibPackages & AeroStdlibPkg_GameHud) != 0u) {
+        mask |= AeroStdlibPkg_GameHud;
+    }
+
+    auto scanText = [&](std::string_view text) noexcept {
+        if (text.empty()) {
+            return;
+        }
+        auto hasAny = [&](std::initializer_list<std::string_view> tokens) noexcept -> bool {
+            for (const std::string_view tok : tokens) {
+                if (text.find(tok) != std::string_view::npos) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        if (hasAny({
+                "XamlReader",
+                "LoadUri(",
+                "LoadResourceDictionary(",
+                "Data/Samples/",
+                "NoesisTheme.Brushes",
+                "__RegisterWorkbenchXamlFactories",
+                "__AeroCompiledXamlCatalogInit",
+            })) {
+            mask |= AeroStdlibPkg_RuntimeXaml | AeroStdlibPkg_Controls;
+        }
+        if (hasAny({
+                "PropertyGrid",
+                "ColorPicker",
+                "NumericScrubber",
+                "Vector2Field",
+                "Vector3Field",
+                "ViewportSurface",
+                "DockPane",
+                "DockTabGroup",
+                "DockSplitNode",
+                "DockingWorkspace",
+                "CodeEditorView",
+                "NodeGraphCanvas",
+                "DataGrid",
+                "InspectorPanel",
+                "CodeEditor",
+                "Viewport3D",
+                "TimelineEditor",
+                "NodeGraphEditor",
+                "CurveEditor",
+                "AssetBrowser",
+                "DockLayout",
+                "TreeListView",
+            })) {
+            mask |= AeroStdlibPkg_Workbench | AeroStdlibPkg_Controls;
+        }
+        if (hasAny({
+                "Button",
+                "ToggleButton",
+                "CheckBox",
+                "RadioButton",
+                "Slider",
+                "ProgressBar",
+                "ScrollBar",
+                "ScrollViewer",
+                "ListBox",
+                "ListView",
+                "ComboBox",
+                "TabControl",
+                "TabItem",
+                "Menu",
+                "MenuItem",
+                "ContextMenu",
+                "TreeView",
+                "Popup",
+                "ToolTip",
+                "TextBox",
+                "PasswordBox",
+                "RichTextBox",
+                "StatusBar",
+                "Expander",
+                "GroupBox",
+                "Calendar",
+                "DatePicker",
+                "WrapPanel",
+                "UniformGrid",
+                "Virtualizing",
+                "DragDrop",
+                "RoutedCommand",
+                "NavigationService",
+                "ItemsControl",
+                "Selector",
+                "AeroFluent",
+                "MutedLabel(",
+                "Heading(",
+                "MathConverter",
+                "BehaviorEventTrigger",
+                "BehaviorDataTrigger",
+                "KeyTrigger",
+                "StoryboardCompletedTrigger",
+                "PropertyChangedTrigger",
+                "Interaction.",
+                "FluidMove",
+                "RiveControl",
+                "RiveInput",
+                "DataGrid",
+                "DateTimeControl",
+            })) {
+            mask |= AeroStdlibPkg_Controls;
+        }
+    };
+
+    if (!input.catalogXamlSources.empty()) {
+        mask |= AeroStdlibPkg_Controls | AeroStdlibPkg_RuntimeXaml;
+    }
+    scanText(input.xamlContent);
+    for (const auto& sf : input.additionalXamlSources) {
+        scanText(sf.content);
+    }
+    for (const auto& sf : input.scriptSources) {
+        scanText(sf.content);
+    }
+    return ResolveEffectiveStdlibPackageMask(mask);
+}
+
 std::vector<SourceFile> LoadStdlibModulePack(std::string_view stdlibRootDir) {
+    return LoadStdlibModulePack(stdlibRootDir, AeroStdlibPkg_All);
+}
+
+std::vector<SourceFile> LoadStdlibModulePack(
+    std::string_view stdlibRootDir,
+    std::uint32_t packageMask) {
     const std::filesystem::path resolvedRoot = ResolveStdlibRootDirectory(stdlibRootDir);
     if (resolvedRoot.empty()) {
         return {};
     }
 
+    const std::uint32_t effectiveMask = ResolveEffectiveStdlibPackageMask(packageMask);
     std::vector<SourceFile> sources;
     AppendModuleDirectorySources(resolvedRoot / "Aero.Native", "NativeVisual.rs", sources);
-    AppendModuleDirectorySources(resolvedRoot / "Aero.UI", "Core.rs", sources);
+
+    std::error_code ec;
+    if (std::filesystem::is_directory(resolvedRoot / "Aero.UI.Core", ec)) {
+        AppendModuleDirectorySources(resolvedRoot / "Aero.UI.Core", "Core.rs", sources);
+        if ((effectiveMask & AeroStdlibPkg_Controls) != 0u) {
+            AppendModuleDirectorySources(resolvedRoot / "Aero.UI.Controls", {}, sources);
+        }
+        if ((effectiveMask & AeroStdlibPkg_RuntimeXaml) != 0u) {
+            AppendModuleDirectorySources(resolvedRoot / "Aero.UI.RuntimeXaml", {}, sources);
+        }
+        if ((effectiveMask & AeroStdlibPkg_Workbench) != 0u) {
+            AppendModuleDirectorySources(resolvedRoot / "Aero.UI.Workbench", {}, sources);
+        }
+    } else {
+        AppendModuleDirectorySources(resolvedRoot / "Aero.UI", "Core.rs", sources);
+    }
     return sources;
 }
 
@@ -227,6 +388,167 @@ std::unordered_set<std::string> CollectDeclaredModuleNames(
         }
     }
     return modules;
+}
+
+void CollectCatalogXamlEntries(
+    const std::filesystem::path& sampleDir,
+    std::vector<CatalogXamlEntry>& outCatalogEntries) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    if (sampleDir.empty() || !fs::exists(sampleDir, ec) || !fs::is_directory(sampleDir, ec)) {
+        return;
+    }
+
+    const fs::path sampleRoot = sampleDir.lexically_normal();
+    auto toLower = [](std::string_view s) {
+        std::string out(s);
+        for (char& ch : out) {
+            if (ch >= 'A' && ch <= 'Z') {
+                ch = static_cast<char>(ch - 'A' + 'a');
+            }
+        }
+        return out;
+    };
+
+    std::unordered_set<std::string> seenNormUris;
+    for (const auto& existing : outCatalogEntries) {
+        if (!existing.uri.empty()) {
+            seenNormUris.insert(toLower(existing.uri));
+        }
+    }
+
+    struct CandidateFile final {
+        std::string uri;
+        std::vector<std::string> aliasUris;
+        std::string normPath;
+        bool isResourceDictionary = false;
+        fs::path absPath;
+    };
+    std::vector<CandidateFile> candidates;
+    bool sampleHasDataSamples = false;
+
+    for (const auto& entry : fs::recursive_directory_iterator(sampleRoot, ec)) {
+        if (ec || !entry.is_regular_file(ec)) {
+            continue;
+        }
+        const fs::path p = entry.path().lexically_normal();
+        const std::string ext = p.extension().string();
+        if (!aero::str::EqualsIgnoreCase(ext, ".xaml")) {
+            continue;
+        }
+        const std::string fname = p.filename().string();
+        const std::string relGeneric = p.lexically_relative(sampleRoot).generic_string();
+        const std::string lowerRel = toLower(relGeneric);
+        const std::string lowerName = toLower(fname);
+
+        if (aero::str::StartsWith(lowerRel, "data/samples/") ||
+            aero::str::StartsWith(lowerRel, "samples/")) {
+            sampleHasDataSamples = true;
+            std::string relFromData = aero::str::StartsWith(lowerRel, "data/")
+                ? relGeneric
+                : ("Data/" + relGeneric);
+            CandidateFile cf;
+            cf.uri = relFromData;
+            cf.aliasUris = {"/" + relFromData, relGeneric, fname};
+            cf.normPath = p.generic_string();
+            cf.isResourceDictionary = false;
+            cf.absPath = p;
+            candidates.push_back(std::move(cf));
+        } else if (aero::str::StartsWith(lowerName, "noesistheme.brushes.") &&
+                   aero::str::EndsWith(lowerName, ".xaml")) {
+            CandidateFile cf;
+            cf.uri = "Theme/" + fname;
+            cf.aliasUris = {
+                "/Theme/" + fname,
+                "Data/Theme/" + fname,
+                "/Data/Theme/" + fname,
+                "/Noesis.GUI.Extensions;component/Theme/" + fname,
+                fname,
+            };
+            cf.normPath = p.generic_string();
+            cf.isResourceDictionary = true;
+            cf.absPath = p;
+            candidates.push_back(std::move(cf));
+        } else if (aero::str::StartsWith(lowerName, "language-") &&
+                   aero::str::EndsWith(lowerName, ".xaml")) {
+            CandidateFile cf;
+            cf.uri = fname;
+            cf.aliasUris = {"Data/" + fname, "/" + fname, "/Data/" + fname};
+            cf.normPath = p.generic_string();
+            cf.isResourceDictionary = true;
+            cf.absPath = p;
+            candidates.push_back(std::move(cf));
+        }
+    }
+
+    if (sampleHasDataSamples) {
+        fs::path probe = sampleRoot.is_absolute() ? sampleRoot : fs::absolute(sampleRoot, ec);
+        if (ec || probe.empty()) {
+            probe = sampleRoot;
+        }
+        auto scanThemeDir = [&](const fs::path& dir) {
+            std::error_code dirEc;
+            if (!fs::is_directory(dir, dirEc)) {
+                return;
+            }
+            for (const auto& entry : fs::directory_iterator(dir, dirEc)) {
+                if (dirEc || !entry.is_regular_file(dirEc)) {
+                    continue;
+                }
+                const fs::path p = entry.path().lexically_normal();
+                const std::string fname = p.filename().string();
+                const std::string lowerName = toLower(fname);
+                if (aero::str::StartsWith(lowerName, "noesistheme.brushes.") &&
+                    aero::str::EndsWith(lowerName, ".xaml")) {
+                    CandidateFile cf;
+                    cf.uri = "Theme/" + fname;
+                    cf.aliasUris = {
+                        "/Theme/" + fname,
+                        "Data/Theme/" + fname,
+                        "/Data/Theme/" + fname,
+                        "/Noesis.GUI.Extensions;component/Theme/" + fname,
+                        fname,
+                    };
+                    cf.normPath = p.generic_string();
+                    cf.isResourceDictionary = true;
+                    cf.absPath = p;
+                    candidates.push_back(std::move(cf));
+                }
+            }
+        };
+        for (int up = 0; up < 5 && !probe.empty(); ++up) {
+            scanThemeDir(probe / "Theme" / "Data" / "Theme");
+            scanThemeDir(probe / "Samples" / "Theme" / "Data" / "Theme");
+            const fs::path parent = probe.parent_path();
+            if (parent == probe) {
+                break;
+            }
+            probe = parent;
+        }
+    }
+
+    std::sort(candidates.begin(), candidates.end(),
+        [](const CandidateFile& a, const CandidateFile& b) {
+            return a.uri < b.uri;
+        });
+
+    for (auto& cf : candidates) {
+        const std::string key = toLower(cf.uri);
+        if (!seenNormUris.insert(key).second) {
+            continue;
+        }
+        std::string content = ReadFileUtf8(cf.absPath);
+        if (content.empty()) {
+            continue;
+        }
+        CatalogXamlEntry item;
+        item.uri = std::move(cf.uri);
+        item.aliasUris = std::move(cf.aliasUris);
+        item.xamlPath = std::move(cf.normPath);
+        item.xamlContent = std::move(content);
+        item.isResourceDictionary = cf.isResourceDictionary;
+        outCatalogEntries.push_back(std::move(item));
+    }
 }
 
 void StripAeroNativeMirBodies(std::vector<rs_mir::Module>& modules) {

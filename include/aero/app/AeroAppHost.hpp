@@ -45,6 +45,7 @@ struct AeroAppHostConfig {
     float dpiScale = 0.0f;
     bool optimizeBytecode = false;
     bool enableStencilJit = false;
+    std::uint32_t stencilJitHotnessThreshold = 32u;
     std::string windowTitle = "AeroGUI 3.0";
     std::string entryClassName;
     std::string entryFunctionName;
@@ -58,6 +59,18 @@ struct PlayedSoundRecord {
     float volume = 1.0f;
 };
 
+struct AeroStencilJitStats {
+    bool active = false;
+    bool nativeBackendActive = false;
+    std::size_t trackedFunctions = 0;
+    std::size_t nativeFunctions = 0;
+    std::size_t threadedFunctions = 0;
+    std::size_t fallbackFunctions = 0;
+    std::size_t machineCodeBytes = 0;
+    std::uint64_t invokeHits = 0;
+    std::uint64_t fallbackHits = 0;
+};
+
 #ifdef AERO_HAS_COMPILER_V3
 /// Discovers a sample directory's entry XAML, bundled auxiliary XAMLs, script sources,
 /// and resource/asset search paths into compile and host configurations.
@@ -65,6 +78,12 @@ struct PlayedSoundRecord {
     const std::filesystem::path& sampleDir,
     AeroV3CompileInput& outCompileInput,
     AeroAppHostConfig& outHostConfig);
+
+/// Discovers catalog XAML files (Data/Samples/*.xaml, Theme/NoesisTheme.Brushes.*.xaml,
+/// Localization/Data/Language-*.xaml) for build-time CompiledXamlCatalog emission.
+void DiscoverCatalogXamlSources(
+    const std::filesystem::path& sampleDir,
+    std::vector<CatalogXamlEntry>& outCatalogEntries);
 #endif
 
 class AeroAppHost final {
@@ -82,10 +101,29 @@ public:
     [[nodiscard]] bool InitializeRuntime();
     [[nodiscard]] bool IsInitialized() const noexcept { return initialized_; }
 
-    // Execution backend 1: Bytecode ProgramImage
+    // Execution backend 1: Bytecode ProgramImage / precompiled .arbc bundle
     [[nodiscard]] bool LoadProgramImage(
         std::shared_ptr<const ProgramImage> image,
         std::string_view entryClassOrFn = {});
+    [[nodiscard]] bool LoadProgramImageWithPreferredEntry(
+        std::shared_ptr<const ProgramImage> image,
+        std::string_view entryClassOrFn,
+        std::string_view preferredEntryClass);
+    [[nodiscard]] bool LoadProgramImageBytes(
+        const std::uint8_t* data,
+        std::size_t size,
+        std::string_view entryClassOrFn = {},
+        std::string_view preferredEntryClass = {});
+    [[nodiscard]] bool LoadProgramImageFile(
+        const std::filesystem::path& filePath,
+        std::string_view entryClassOrFn = {},
+        std::string_view preferredEntryClass = {});
+
+    void RegisterAssetDirectory(std::string_view dir);
+    void DiscoverAssetDirectories(const std::filesystem::path& sampleRoot);
+    void SetDevCompileResultOpaque(std::shared_ptr<void> result) noexcept;
+    [[nodiscard]] const void* DevCompileResultOpaque() const noexcept;
+    void SetLastErrorMessage(std::string message);
 
 #ifdef AERO_HAS_COMPILER_V3
     [[nodiscard]] bool CompileAndLoad(
@@ -187,6 +225,7 @@ public:
     [[nodiscard]] std::shared_ptr<const ProgramImage> Program() const noexcept { return programImage_; }
     [[nodiscard]] Interpreter* ScriptInterpreter() noexcept { return interpreter_.get(); }
     [[nodiscard]] Interpreter* SimInterpreter();
+    [[nodiscard]] AeroStencilJitStats StencilJitStats() const noexcept;
     [[nodiscard]] rs_aot::ExecutionContext* AotContext() noexcept { return aotContext_.get(); }
     [[nodiscard]] rs_aot::ExecutionContext* SimAotContext() noexcept { return simAotContext_.get(); }
 
@@ -229,6 +268,8 @@ private:
         SymbolId applyTemplateSubtree = 0u;
         SymbolId ensureLoadedSubtree = 0u;
         SymbolId popupSetOverlayHost = 0u;
+        SymbolId registerWorkbenchFactories = 0u;
+        SymbolId registerCompiledXamlCatalog = 0u;
     };
 
     void RegisterAssetDirectoryInternal(std::string_view dir);
@@ -291,9 +332,8 @@ private:
     std::unique_ptr<rs_aot::ExecutionContext> aotContext_;
     std::unique_ptr<rs_aot::ExecutionContext> simAotContext_;
 
-#ifdef AERO_HAS_COMPILER_V3
-    std::unique_ptr<AeroV3CompileResult> lastCompileResult_;
-#endif
+    // Fixed ODR layout shared identically by AeroGUI::AppRuntime (/GR-) and AeroGUI::AppDevHost.
+    std::shared_ptr<void> devCompileResultOpaque_;
 
     CachedDispatchSymbols symbols_{};
     std::string preferredEntryClass_;
@@ -313,6 +353,8 @@ private:
     bool scriptWakeRequested_ = false;
     bool renderWakeRequested_ = false;
     mutable bool pendingScriptSync_ = true;
+    bool hasFlushedBindings_ = false;
+    std::uint64_t lastFlushedObservableEpoch_ = 0u;
     bool closeRequested_ = false;
     bool inStepFrame_ = false;
     bool initialized_ = false;

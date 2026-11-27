@@ -893,6 +893,8 @@ public static class XamlReader {
     public static UIElement LoadUri(string uri, ResourceDictionary fallbackResources = null) {
         if (uri == null || uri.Trim().Length == 0) { return null; }
         string normUri = uri.Trim();
+        UIElement compiledEl = CompiledXamlCatalog.TryLoadUri(normUri, fallbackResources);
+        if (compiledEl != null) { return compiledEl; }
         XamlXmlNode cachedRoot = TryGetCachedDoc(normUri);
         if (cachedRoot != null) {
             return ParseRootWithUri(cachedRoot, fallbackResources, normUri);
@@ -912,6 +914,8 @@ public static class XamlReader {
     public static ResourceDictionary LoadResourceDictionary(string uri) {
         if (uri == null || uri.Trim().Length == 0) { return null; }
         string normUri = uri.Trim();
+        ResourceDictionary compiledDict = CompiledXamlCatalog.TryLoadResourceDictionary(normUri);
+        if (compiledDict != null) { return compiledDict; }
         ResourceDictionary cached = TryGetCachedExtDict(normUri);
         if (cached != null) { return cached; }
         string text = Host_ReadTextAsset(normUri);
@@ -1673,6 +1677,8 @@ public static class XamlReader {
         m["WrapPanel"] = 7;
         m["ToolBarOverflowPanel"] = 8;
         m["UniformGrid"] = 9;
+        m["VirtualizingUniformGrid"] = 89;
+        m["VirtualizingWrapGrid"] = 90;
         m["Canvas"] = 10;
         m["Panel"] = 11;
         m["Border"] = 12;
@@ -1743,24 +1749,17 @@ public static class XamlReader {
         m["CustomDrawElement"] = 75;
         m["RiveControl"] = 76;
         m["RiveInput"] = 77;
-        m["NumericScrubber"] = 78;
-        m["Vector2Field"] = 79;
-        m["Vector3Field"] = 80;
-        m["ViewportSurface"] = 81;
-        m["DockPane"] = 82;
-        m["DockTabGroup"] = 83;
-        m["DockSplitNode"] = 84;
-        m["DockingWorkspace"] = 85;
-        m["CodeEditorView"] = 86;
-        m["PropertyGrid"] = 87;
-        m["NodeGraphCanvas"] = 88;
         _uiTagKindMap = m;
     }
 
     private static UIElement CreateUIElementByTag(string localName) {
         if (localName == null || localName.Length == 0) { return null; }
         EnsureUiTagKindMap();
-        if (!_uiTagKindMap.ContainsKey(localName)) { return null; }
+        if (!_uiTagKindMap.ContainsKey(localName)) {
+            DependencyObject dynObj = XamlElementFactoryRegistry.TryCreate(localName);
+            if (dynObj is UIElement) { return dynObj as UIElement; }
+            return null;
+        }
         int kind = _uiTagKindMap[localName];
         switch (kind) {
             case 1: return new Grid();
@@ -1772,6 +1771,8 @@ public static class XamlReader {
             case 7: return new WrapPanel();
             case 8: return new ToolBarOverflowPanel();
             case 9: return new UniformGrid();
+            case 89: return new VirtualizingUniformGrid();
+            case 90: return new VirtualizingWrapGrid();
             case 10: return new Canvas();
             case 11: return new Panel();
             case 12: return new Border();
@@ -1840,18 +1841,11 @@ public static class XamlReader {
             case 75: return new CustomDrawElement();
             case 76: return new RiveControl();
             case 77: return new RiveInput();
-            case 78: return new NumericScrubber();
-            case 79: return new Vector2Field();
-            case 80: return new Vector3Field();
-            case 81: return new ViewportSurface();
-            case 82: return new DockPane();
-            case 83: return new DockTabGroup();
-            case 84: return new DockSplitNode();
-            case 85: return new DockingWorkspace();
-            case 86: return new CodeEditorView();
-            case 87: return new PropertyGrid();
-            case 88: return new NodeGraphCanvas();
-            default: return null;
+            default: {
+                DependencyObject dynFallback = XamlElementFactoryRegistry.TryCreate(localName);
+                if (dynFallback is UIElement) { return dynFallback as UIElement; }
+                return null;
+            }
         }
     }
 

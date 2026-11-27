@@ -112,6 +112,22 @@ public:
         const realscript::runtime::ManagedHeap& heap,
         realscript::runtime::ObjectRef ref) noexcept;
 
+    using OwnerDirtyListenerFn = void(*)(
+        void* context,
+        realscript::runtime::ManagedHeap& heap,
+        realscript::runtime::ObjectRef ownerRef,
+        std::uint8_t bitIndex);
+
+    static void RegisterOwnerDirtyListener(
+        std::uint64_t heapId,
+        void* ownerKey,
+        OwnerDirtyListenerFn callback,
+        void* context);
+
+    static void UnregisterOwnerDirtyListener(
+        std::uint64_t heapId,
+        void* ownerKey) noexcept;
+
     [[nodiscard]] static std::uint64_t GlobalMutationEpoch() noexcept;
 };
 

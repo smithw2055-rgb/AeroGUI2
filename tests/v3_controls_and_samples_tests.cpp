@@ -942,6 +942,8 @@ public partial class MainWindow : Window {
     }
     const aero::VisualNode* pNode0 = host.World().GetNode(plasmaPathId);
     const std::string uri0 = pNode0 ? pNode0->Image().uri : std::string{};
+    const bool plasmaActive0 = pNode0 && pNode0->Image().plasma.active;
+    const float plasmaTime0 = pNode0 ? pNode0->Image().plasma.timeSec : 0.0f;
     const std::string data0 = pNode0 ? pNode0->Vector().pathOrParams : std::string{};
     const std::size_t activeBefore = host.AnimEngine().ActiveTrackCount();
     Require(pNode0 && pNode0->Image().tileWrap, "AOT Path ImageBrush TileMode=Tile should set tileWrap");
@@ -952,10 +954,19 @@ public partial class MainWindow : Window {
     const aero::VisualNode* pNodeMid = host.World().GetNode(plasmaPathId);
     const aero::VisualNode* bNodeMid = host.World().GetNode(innerBorderId);
     const std::string uriMid = pNodeMid ? pNodeMid->Image().uri : std::string{};
+    const bool plasmaActiveMid = pNodeMid && pNodeMid->Image().plasma.active;
+    const float plasmaTimeMid = pNodeMid ? pNodeMid->Image().plasma.timeSec : 0.0f;
     const std::string dataMid = pNodeMid ? pNodeMid->Vector().pathOrParams : std::string{};
-    Require(uriMid != uri0,
-        "Infinite Storyboard Fill.PlasmaTime did not tick: tracksBefore=" + std::to_string(activeBefore) +
-        " after=" + std::to_string(host.AnimEngine().ActiveTrackCount()) + " uri0=" + uri0 + " uriMid=" + uriMid);
+    if (plasmaActive0 || plasmaActiveMid) {
+        Require(plasmaActive0 && plasmaActiveMid && std::fabs(plasmaTimeMid - plasmaTime0) > 0.05f,
+            "Infinite Storyboard Fill.PlasmaTime did not tick: tracksBefore=" + std::to_string(activeBefore) +
+            " after=" + std::to_string(host.AnimEngine().ActiveTrackCount()) +
+            " t0=" + std::to_string(plasmaTime0) + " tMid=" + std::to_string(plasmaTimeMid));
+    } else {
+        Require(uriMid != uri0,
+            "Infinite Storyboard Fill.PlasmaTime did not tick: tracksBefore=" + std::to_string(activeBefore) +
+            " after=" + std::to_string(host.AnimEngine().ActiveTrackCount()) + " uri0=" + uri0 + " uriMid=" + uriMid);
+    }
     Require(dataMid != data0 && dataMid.find(".5.25") != std::string::npos,
         "Command-aware SVG Path animation failed: data0=" + data0 + " dataMid=" + dataMid);
     if (bNodeMid) {
@@ -1644,6 +1655,690 @@ public static Window CreateMainWindow() {
     Require(callStr("GetInnerText") == "Updated42", "InnerText did not catch up after PanelBox transitioned Collapsed -> Visible");
 }
 
+void TestPhase0MemoryAndBindingShortCircuit(aero::rs_comp::CompilerSession&) {
+    std::cout << "[v3_controls_and_samples_tests] TestPhase0MemoryAndBindingShortCircuit...\n";
+    const std::string xaml = R"XAML(
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="Phase0Reg.MainWindow"
+        Width="640" Height="480" Title="Phase0">
+    <StackPanel>
+        <TextBlock x:Name="TitleText" Text="{Binding Title}" />
+        <TextBlock x:Name="SrcText" Text="InitElem" />
+        <TextBlock x:Name="MirrorText" Text="{Binding Text, ElementName=SrcText}" />
+    </StackPanel>
+</Window>
+)XAML";
+
+    const std::string rs = R"RS(
+module Phase0Reg;
+import Aero.UI;
+
+[Observable]
+public class Phase0Vm {
+    public string Title { get; set; } = "InitTitle";
+    public int Count { get; set; } = 1;
+}
+
+public partial class MainWindow : Window {
+    public Phase0Vm Vm;
+    private BoxedFloat _heldBoxedFloat;
+    private Thickness _heldThickness;
+
+    public MainWindow() {
+        InitializeComponent();
+        Vm = new Phase0Vm();
+        DataContext = Vm;
+        _heldBoxedFloat = new BoxedFloat(42.5f);
+        _heldThickness = new Thickness(1.0f, 2.0f, 3.0f, 4.0f);
+    }
+
+    public void ResetFlushStats() { BindingEngine.DebugResetFlushStats(); }
+    public int GetShortCircuitCount() { return BindingEngine.DebugShortCircuitFlushCount(); }
+    public int GetEvaluatedCount() { return BindingEngine.DebugEvaluatedEntryCount(); }
+    public string GetTitleText() { return TitleText != null ? TitleText.Text : ""; }
+    public string GetMirrorText() { return MirrorText != null ? MirrorText.Text : ""; }
+
+    public void MutateTitle(string nextTitle) {
+        Vm.Title = nextTitle;
+    }
+
+    public void MutateSourceElement(string nextText) {
+        if (SrcText != null) {
+            SrcText.Text = nextText;
+        }
+    }
+}
+
+public static Window CreateMainWindow() {
+    return new MainWindow();
+}
+)RS";
+
+    aero::AeroV3CompileInput input;
+    input.stdlibRootDir = AERO_STDLIB_DIR;
+    input.includeStdlib = true;
+    input.treeShakeStdlib = false;
+    input.optimizeBytecode = false;
+    input.emitAotCpp = false;
+    input.xamlPath = "Phase0Reg/MainWindow.xaml";
+    input.xamlContent = xaml;
+    input.scriptSources.push_back(aero::SourceFile{"Phase0Reg/MainWindow.rs", rs});
+
+    aero::AeroAppHostConfig cfg;
+    cfg.viewportWidth = 640u;
+    cfg.viewportHeight = 480u;
+    cfg.headless = true;
+    cfg.preferSoftwareRasterizer = true;
+
+    aero::AeroAppHost host(cfg);
+    std::string err;
+    const bool loaded = host.CompileAndLoad(input, &err);
+    Require(loaded, "Phase0Reg CompileAndLoad failed: " + err);
+    if (!loaded || !host.RootVisualNode().IsValid()) {
+        return;
+    }
+
+    // Settle initial bindings (capture fast-clean snapshot + _pollOnlyEntries)
+    host.StepFrame(0.016f, true);
+    host.StepFrame(0.016f, true);
+    const aero::ObjectRef uiObj = host.RootScriptObject();
+    Require(uiObj.valid(), "Phase0Reg RootScriptObject invalid");
+
+    // Verify Phase 0.1 heap object layout size for BoxedFloat & Thickness
+    if (const auto prog = host.Program()) {
+        const auto snap = host.Domains().uiHeap().snapshot();
+        bool foundBoxedFloat = false;
+        bool foundThickness = false;
+        for (const auto& obj : snap.objects) {
+            const auto* ts = prog->resolveType(obj.typeId);
+            if (!ts) { continue; }
+            if (ts->name == "BoxedFloat") {
+                foundBoxedFloat = true;
+                Require(obj.sizeBytes <= 48u,
+                    "Expected BoxedFloat <= 48B after Phase 0.1 static exclusion, got " +
+                    std::to_string(obj.sizeBytes));
+            } else if (ts->name == "Thickness") {
+                foundThickness = true;
+                Require(obj.sizeBytes <= 96u,
+                    "Expected Thickness <= 96B after Phase 0.1 static exclusion, got " +
+                    std::to_string(obj.sizeBytes));
+            }
+        }
+        Require(foundBoxedFloat, "Expected live BoxedFloat object in UI heap snapshot");
+        Require(foundThickness, "Expected live Thickness object in UI heap snapshot");
+    }
+
+    auto callStr = [&](std::string_view fn) -> std::string {
+        aero::UnifiedValue rv{};
+        if (host.InvokeScriptMethod(uiObj, fn, {}, &rv, aero::DomainKind::UiPresentation)) {
+            if (const auto* sv = std::get_if<aero::rs_rt::StringValue>(&rv)) {
+                return sv->str();
+            }
+            if (const auto* ref = std::get_if<aero::rs_rt::ObjectRef>(&rv);
+                ref && ref->valid() && ref->kind == aero::rs_rt::ObjectKind::String) {
+                if (const auto opt = host.Domains().stringViewAcrossDomains(*ref)) {
+                    return std::string(opt->data(), opt->size());
+                }
+            }
+        }
+        return {};
+    };
+    auto callInt = [&](std::string_view fn) -> std::int64_t {
+        aero::UnifiedValue rv{};
+        std::int64_t out = -1;
+        if (host.InvokeScriptMethod(uiObj, fn, {}, &rv, aero::DomainKind::UiPresentation)) {
+            (void)rv.tryGetInt64(out);
+        }
+        return out;
+    };
+    auto callVoidStr = [&](std::string_view fn, const std::string& arg) {
+        aero::UnifiedValue rv{};
+        Require(host.InvokeScriptMethod(
+                    uiObj, fn, {aero::UnifiedValue{aero::StringValue{arg}}}, &rv, aero::DomainKind::UiPresentation),
+            "Phase0Reg method failed: " + std::string(fn));
+    };
+
+    Require(callStr("GetTitleText") == "InitTitle", "Phase0Reg initial TitleText mismatch");
+    Require(callStr("GetMirrorText") == "InitElem", "Phase0Reg initial MirrorText mismatch");
+
+    // 1) Phase 0.3A + 0.3B: idle StepFrame(0.016f, false) skips FlushBindings once pendingScriptSync_ clears
+    {
+        aero::UnifiedValue rv{};
+        Require(host.InvokeScriptMethod(uiObj, "ResetFlushStats", {}, &rv, aero::DomainKind::UiPresentation),
+            "Phase0Reg ResetFlushStats failed");
+    }
+    for (int f = 0; f < 6; ++f) {
+        host.StepFrame(0.016f, false);
+    }
+    const std::int64_t scIdle = callInt("GetShortCircuitCount");
+    const std::int64_t evalIdle = callInt("GetEvaluatedCount");
+    Require(scIdle == 1 && evalIdle == 0,
+        "Expected 1 short-circuited flush and 0 evaluated entries across 6 idle frames, got sc=" +
+        std::to_string(scIdle) + " eval=" + std::to_string(evalIdle));
+
+    // 2) Phase 0.3B: forced FlushBindings hits O(1) whole-flush short-circuit with 0 evaluated entries
+    {
+        aero::UnifiedValue rv{};
+        Require(host.InvokeScriptMethod(uiObj, "ResetFlushStats", {}, &rv, aero::DomainKind::UiPresentation),
+            "Phase0Reg ResetFlushStats (forced) failed");
+    }
+    for (int f = 0; f < 5; ++f) {
+        host.StepFrame(0.016f, true);
+    }
+    const std::int64_t scForced = callInt("GetShortCircuitCount");
+    const std::int64_t evalForced = callInt("GetEvaluatedCount");
+    Require(scForced == 5 && evalForced == 0,
+        "Expected 5 short-circuited flushes and 0 evaluated entries on forced frames, got sc=" +
+        std::to_string(scForced) + " eval=" + std::to_string(evalForced));
+
+    // 3) Observable VM mutation still propagates immediately
+    callVoidStr("MutateTitle", "UpdatedTitle");
+    host.StepFrame(0.016f, false);
+    Require(callStr("GetTitleText") == "UpdatedTitle", "Phase0Reg VM mutation failed to propagate");
+
+    // 4) ElementName source property mutation still propagates immediately
+    callVoidStr("MutateSourceElement", "UpdatedElem");
+    host.StepFrame(0.016f, true);
+    Require(callStr("GetMirrorText") == "UpdatedElem", "Phase0Reg ElementName mutation failed to propagate");
+}
+
+void TestPhase1PushBindingPropIdMathAndPlasma(aero::rs_comp::CompilerSession&) {
+    std::cout << "[v3_controls_and_samples_tests] TestPhase1PushBindingPropIdMathAndPlasma...\n";
+    const std::string xaml = R"XAML(
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:noesis="clr-namespace:NoesisGUIExtensions;assembly=Noesis.GUI.Extensions"
+        x:Class="Phase1Perf.MainWindow"
+        Width="640" Height="480" Title="Phase1">
+    <StackPanel x:Name="RootPanel">
+        <TextBlock x:Name="MathOutText" Text="0" />
+        <Border x:Name="PropBorder" Width="100" Height="40" Background="#FF000000" Opacity="1.0" />
+        <Border x:Name="PlasmaBorder" Width="120" Height="80">
+            <Border.Background>
+                <ImageBrush Stretch="Fill">
+                    <noesis:Brush.Shader>
+                        <noesis:PlasmaBrush ScaleX="48" ScaleY="48" Seed="15" Color="#FF00FF88" Time="0.2" />
+                    </noesis:Brush.Shader>
+                </ImageBrush>
+            </Border.Background>
+        </Border>
+    </StackPanel>
+</Window>
+)XAML";
+
+    const std::string rs = R"RS(
+module Phase1Perf;
+import Aero.UI;
+
+[Observable]
+public class Phase1ItemVm {
+    public string Label { get; set; } = "Init";
+}
+
+[Observable]
+public class Phase1MathVm {
+    public float Num { get; set; } = 5.0f;
+    public float Op { get; set; } = 0.75f;
+}
+
+public partial class MainWindow : Window {
+    public Phase1ItemVm[] Vms;
+    public TextBlock[] VmLabels;
+    public TextBlock[] SrcLabels;
+    public TextBlock[] MirrorLabels;
+    public Phase1MathVm MathVm;
+
+    public MainWindow() {
+        InitializeComponent();
+        MathVm = new Phase1MathVm();
+        DataContext = MathVm;
+        Vms = new Phase1ItemVm[50];
+        VmLabels = new TextBlock[50];
+        for (int i = 0; i < 50; i += 1) {
+            var vm = new Phase1ItemVm();
+            vm.Label = "VmInit_" + i;
+            Vms[i] = vm;
+            var tb = new TextBlock();
+            VmLabels[i] = tb;
+            RootPanel.AddChild(tb);
+            BindingEngine.BindPath(tb, "Text", vm, "Label");
+        }
+        SrcLabels = new TextBlock[20];
+        MirrorLabels = new TextBlock[20];
+        for (int j = 0; j < 20; j += 1) {
+            string sName = "SrcEl_" + j;
+            var src = new TextBlock();
+            src.Name = sName;
+            src.Text = "SrcInit_" + j;
+            SrcLabels[j] = src;
+            var mir = new TextBlock();
+            MirrorLabels[j] = mir;
+            RootPanel.AddChild(src);
+            RootPanel.AddChild(mir);
+            BindingEngine.BindElement(mir, "Text", sName, "Text");
+        }
+        BindingEngine.BindPathEx(MathOutText, "Text", MathVm, "Num", 0, new MathConverter(), "", "x * 2 + 10", "");
+        BindingEngine.BindPath(PropBorder, "Opacity", MathVm, "Op");
+    }
+
+    public void ResetFlushStats() { BindingEngine.DebugResetFlushStats(); }
+    public void ResetMathStats() { MathConverter.DebugResetCompileCount(); }
+    public int GetPushFlushCount() { return BindingEngine.DebugPushFlushCount(); }
+    public int GetEvaluatedCount() { return BindingEngine.DebugEvaluatedEntryCount(); }
+    public int GetMathCompileCount() { return MathConverter.DebugCompileCount(); }
+    public string GetVmText(int idx) { return VmLabels[idx].Text; }
+    public string GetMirrorText(int idx) { return MirrorLabels[idx].Text; }
+    public string GetMathText() { return MathOutText.Text; }
+    public float GetBorderOpacity() { return PropBorder.Opacity; }
+
+    public void MutateOneVm(int idx, string nextVal) {
+        Vms[idx].Label = nextVal;
+    }
+
+    public void MutateOneSrc(int idx, string nextVal) {
+        SrcLabels[idx].Text = nextVal;
+    }
+
+    public void SetMathNum(float v) {
+        MathVm.Num = v;
+    }
+
+    public void SetPlasmaTime(float t) {
+        if (PlasmaBorder != null) {
+            PlasmaBorder.SetPropertyValue("Background.PlasmaTime", DependencyObject.BoxFloat(t));
+        }
+    }
+
+    public string GetPlasmaLazyUri() {
+        return (PlasmaBorder != null && PlasmaBorder.Background is ImageBrush)
+            ? (PlasmaBorder.Background as ImageBrush).ImageSource
+            : "";
+    }
+
+    public int CheckPropIdAndBoxedColor() {
+        int idOp = AeroPropId.Resolve("Opacity");
+        int idBg = AeroPropId.Resolve("Background.Color");
+        if (idOp <= 0 || idBg <= 0) { return 1; }
+        uint col = ParseUtil.PackArgb(255u, 17u, 170u, 68u);
+        if (!PropBorder.TryWriteFloatById(idOp, 0.35f)) { return 2; }
+        if (!PropBorder.TryWriteColorById(idBg, col)) { return 3; }
+        DependencyObject opBox = PropBorder.GetPropertyById(idOp, "Opacity");
+        DependencyObject bgBox = PropBorder.GetPropertyById(idBg, "Background.Color");
+        if (!(bgBox is BoxedColor)) { return 4; }
+        if ((bgBox as BoxedColor).Value != col) { return 5; }
+        if (DependencyObject.UnboxFloat(opBox, -1.0f) < 0.34f || DependencyObject.UnboxFloat(opBox, -1.0f) > 0.36f) { return 6; }
+        return 0;
+    }
+}
+
+public static Window CreateMainWindow() {
+    return new MainWindow();
+}
+)RS";
+
+    aero::AeroV3CompileInput input;
+    input.stdlibRootDir = AERO_STDLIB_DIR;
+    input.includeStdlib = true;
+    input.treeShakeStdlib = false;
+    input.optimizeBytecode = false;
+    input.emitAotCpp = false;
+    input.xamlPath = "Phase1Perf/MainWindow.xaml";
+    input.xamlContent = xaml;
+    input.scriptSources.push_back(aero::SourceFile{"Phase1Perf/MainWindow.rs", rs});
+
+    aero::AeroAppHostConfig cfg;
+    cfg.viewportWidth = 640u;
+    cfg.viewportHeight = 480u;
+    cfg.headless = true;
+    cfg.preferSoftwareRasterizer = true;
+
+    aero::AeroAppHost host(cfg);
+    std::string err;
+    const bool loaded = host.CompileAndLoad(input, &err);
+    Require(loaded, "Phase1Perf CompileAndLoad failed: " + err);
+    if (!loaded || !host.RootVisualNode().IsValid()) {
+        return;
+    }
+
+    host.StepFrame(0.016f, true);
+    host.StepFrame(0.016f, true);
+    const aero::ObjectRef uiObj = host.RootScriptObject();
+    Require(uiObj.valid(), "Phase1Perf RootScriptObject invalid");
+
+    auto callStr = [&](std::string_view fn) -> std::string {
+        aero::UnifiedValue rv{};
+        if (host.InvokeScriptMethod(uiObj, fn, {}, &rv, aero::DomainKind::UiPresentation)) {
+            if (const auto* sv = std::get_if<aero::rs_rt::StringValue>(&rv)) {
+                return sv->str();
+            }
+            if (const auto* ref = std::get_if<aero::rs_rt::ObjectRef>(&rv);
+                ref && ref->valid() && ref->kind == aero::rs_rt::ObjectKind::String) {
+                if (const auto opt = host.Domains().stringViewAcrossDomains(*ref)) {
+                    return std::string(opt->data(), opt->size());
+                }
+            }
+        }
+        return {};
+    };
+    auto callInt = [&](std::string_view fn) -> std::int64_t {
+        aero::UnifiedValue rv{};
+        std::int64_t out = -1;
+        if (host.InvokeScriptMethod(uiObj, fn, {}, &rv, aero::DomainKind::UiPresentation)) {
+            (void)rv.tryGetInt64(out);
+        }
+        return out;
+    };
+    auto callIdxStr = [&](std::string_view fn, std::int64_t idx) -> std::string {
+        aero::UnifiedValue rv{};
+        if (host.InvokeScriptMethod(
+                uiObj, fn, {aero::UnifiedValue{idx}}, &rv, aero::DomainKind::UiPresentation)) {
+            if (const auto* sv = std::get_if<aero::rs_rt::StringValue>(&rv)) {
+                return sv->str();
+            }
+            if (const auto* ref = std::get_if<aero::rs_rt::ObjectRef>(&rv);
+                ref && ref->valid() && ref->kind == aero::rs_rt::ObjectKind::String) {
+                if (const auto opt = host.Domains().stringViewAcrossDomains(*ref)) {
+                    return std::string(opt->data(), opt->size());
+                }
+            }
+        }
+        return {};
+    };
+
+    Require(callIdxStr("GetVmText", 17) == "VmInit_17", "Phase1Perf initial VmText mismatch");
+    Require(callIdxStr("GetMirrorText", 9) == "SrcInit_9", "Phase1Perf initial MirrorText mismatch");
+    Require(callStr("GetMathText") == "20", "Phase1Perf initial MathConverter text mismatch, got " + callStr("GetMathText"));
+
+    // 1) Tier 2 VM Push Fast Path (mutate 1 out of 50 VM bindings + 20 ElementName bindings)
+    {
+        aero::UnifiedValue rv{};
+        Require(host.InvokeScriptMethod(uiObj, "ResetFlushStats", {}, &rv, aero::DomainKind::UiPresentation),
+            "ResetFlushStats failed");
+        Require(host.InvokeScriptMethod(
+                    uiObj, "MutateOneVm",
+                    {aero::UnifiedValue{std::int64_t{17}}, aero::UnifiedValue{aero::StringValue{std::string{"Pushed17"}}}},
+                    &rv, aero::DomainKind::UiPresentation),
+            "MutateOneVm failed");
+    }
+    host.StepFrame(0.016f, false);
+    Require(callIdxStr("GetVmText", 17) == "Pushed17", "Phase1Perf pushed VM text mismatch");
+    const std::int64_t pushVmCount = callInt("GetPushFlushCount");
+    const std::int64_t evalVmDelta = callInt("GetEvaluatedCount");
+    Require(pushVmCount >= 1 && evalVmDelta <= 8,
+        "Expected VM Tier 2 Push Fast Path (push>=1, eval<=8), got push=" +
+        std::to_string(pushVmCount) + " eval=" + std::to_string(evalVmDelta));
+
+    // 2) Tier 2 UI ElementName Push Fast Path (mutate 1 out of 20 ElementName sources)
+    {
+        aero::UnifiedValue rv{};
+        Require(host.InvokeScriptMethod(uiObj, "ResetFlushStats", {}, &rv, aero::DomainKind::UiPresentation),
+            "ResetFlushStats (UI) failed");
+        Require(host.InvokeScriptMethod(
+                    uiObj, "MutateOneSrc",
+                    {aero::UnifiedValue{std::int64_t{9}}, aero::UnifiedValue{aero::StringValue{std::string{"ElemPush9"}}}},
+                    &rv, aero::DomainKind::UiPresentation),
+            "MutateOneSrc failed");
+    }
+    host.StepFrame(0.016f, true);
+    Require(callIdxStr("GetMirrorText", 9) == "ElemPush9", "Phase1Perf pushed ElementName text mismatch");
+    const std::int64_t pushUiCount = callInt("GetPushFlushCount");
+    const std::int64_t evalUiDelta = callInt("GetEvaluatedCount");
+    Require(pushUiCount >= 1 && evalUiDelta <= 8,
+        "Expected UI Tier 2 Push Fast Path (push>=1, eval<=8), got push=" +
+        std::to_string(pushUiCount) + " eval=" + std::to_string(evalUiDelta));
+
+    // 3) MathConverter compiled RPN reuse (compile at most once across repeated value mutations)
+    {
+        aero::UnifiedValue rv{};
+        Require(host.InvokeScriptMethod(uiObj, "ResetMathStats", {}, &rv, aero::DomainKind::UiPresentation),
+            "ResetMathStats failed");
+    }
+    const float testInputs[] = {15.0f, 25.0f, -3.0f};
+    const char* expectedMath[] = {"40", "60", "4"};
+    for (int k = 0; k < 3; ++k) {
+        aero::UnifiedValue rv{};
+        Require(host.InvokeScriptMethod(
+                    uiObj, "SetMathNum", {aero::UnifiedValue{aero::FloatValue{testInputs[k]}}},
+                    &rv, aero::DomainKind::UiPresentation),
+            "SetMathNum failed");
+        host.StepFrame(0.016f, false);
+        Require(callStr("GetMathText") == expectedMath[k],
+            "Phase1Perf MathConverter output mismatch: expected " + std::string(expectedMath[k]) +
+            ", got " + callStr("GetMathText"));
+    }
+    Require(callInt("GetMathCompileCount") == 0,
+        "Expected 0 additional MathExprParser compiles via RPN cache, got " +
+        std::to_string(callInt("GetMathCompileCount")));
+
+    // 4) AeroPropId + BoxedColor parity
+    Require(callInt("CheckPropIdAndBoxedColor") == 0,
+        "Phase1Perf CheckPropIdAndBoxedColor failed with code " + std::to_string(callInt("CheckPropIdAndBoxedColor")));
+
+    // 5) PlasmaBrush numeric channel animation + lazy ImageSource
+    std::vector<std::uint8_t> plasmaFrame0;
+    Require(host.RenderHeadlessRgba(640u, 480u, plasmaFrame0), "Phase1Perf plasma frame0 render failed");
+    {
+        aero::UnifiedValue rv{};
+        Require(host.InvokeScriptMethod(
+                    uiObj, "SetPlasmaTime", {aero::UnifiedValue{aero::FloatValue{1.4f}}}, &rv, aero::DomainKind::UiPresentation),
+            "SetPlasmaTime failed");
+    }
+    host.StepFrame(0.016f, false);
+    std::vector<std::uint8_t> plasmaFrame1;
+    Require(host.RenderHeadlessRgba(640u, 480u, plasmaFrame1), "Phase1Perf plasma frame1 render failed");
+    Require(CountChangedPixels(plasmaFrame0, plasmaFrame1) > 40u,
+        "Phase1Perf numeric PlasmaBrush animation did not change rendered pixels");
+    const std::string lazyUri = callStr("GetPlasmaLazyUri");
+    Require(lazyUri.rfind("shader://plasma?", 0) == 0,
+        "Phase1Perf lazy PlasmaBrush ImageSource mismatch: " + lazyUri);
+}
+
+void TestPhase4VirtualizationAndCompiledCatalog(aero::rs_comp::CompilerSession& sharedSession) {
+    std::cout << "[Test] Phase 4 VirtualizingUniformGrid, VirtualizingWrapGrid, and CompiledXamlCatalog...\n";
+
+    // 1. 2D VirtualizingUniformGrid & VirtualizingWrapGrid container bounding
+    {
+        aero::AeroV3CompileInput ci;
+        ci.xamlPath = "Virt2DView.xaml";
+        ci.xamlContent = R"XML(
+<UserControl xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="Samples.Phase4Virt.Virt2DView"
+             Width="640" Height="220">
+    <StackPanel Orientation="Horizontal" Spacing="20">
+        <ListBox x:Name="GridList" Width="300" Height="200">
+            <ListBox.ItemsPanel>
+                <ItemsPanelTemplate>
+                    <VirtualizingUniformGrid Columns="3" Spacing="4" />
+                </ItemsPanelTemplate>
+            </ListBox.ItemsPanel>
+        </ListBox>
+        <ListBox x:Name="WrapList" Width="280" Height="180">
+            <ListBox.ItemsPanel>
+                <ItemsPanelTemplate>
+                    <VirtualizingWrapGrid Orientation="Horizontal" ItemWidth="84" ItemHeight="36" Spacing="6" />
+                </ItemsPanelTemplate>
+            </ListBox.ItemsPanel>
+        </ListBox>
+    </StackPanel>
+</UserControl>
+)XML";
+        ci.scriptSources.push_back(aero::SourceFile{"Virt2DView.rs", R"RS(
+module Samples.Phase4Virt;
+import Aero.UI;
+public partial class Virt2DView : UserControl {
+    public Virt2DView() {
+        this.InitializeComponent();
+        var itemsA = new ObservableList<string>();
+        for (int i = 0; i < 240; i += 1) {
+            itemsA.Add("Grid_" + i);
+        }
+        this.GridList.EstimatedItemHeight = 36.0f;
+        this.GridList.EstimatedItemWidth = 96.0f;
+        this.GridList.ItemsSource = itemsA;
+        this.GridList.UpdateVirtualizedViewport(0.0f, 200.0f, 300.0f);
+
+        var itemsB = new ObservableList<string>();
+        for (int i = 0; i < 180; i += 1) {
+            itemsB.Add("Wrap_" + i);
+        }
+        this.WrapList.EstimatedItemHeight = 36.0f;
+        this.WrapList.EstimatedItemWidth = 84.0f;
+        this.WrapList.ItemsSource = itemsB;
+        this.WrapList.UpdateVirtualizedViewport(0.0f, 180.0f, 280.0f);
+    }
+
+    public void ScrollDownBoth(float offsetY) {
+        this.GridList.UpdateVirtualizedViewport(offsetY, 200.0f, 300.0f);
+        this.WrapList.UpdateVirtualizedViewport(offsetY, 180.0f, 280.0f);
+    }
+
+    public int GridChildCount() {
+        var p = this.GridList.ItemsHostPanel;
+        return p != null ? p.Children().Length : -1;
+    }
+
+    public int WrapChildCount() {
+        var p = this.WrapList.ItemsHostPanel;
+        return p != null ? p.Children().Length : -1;
+    }
+
+    public int CheckGridVirtualMetrics() {
+        var p = this.GridList.ItemsHostPanel as VirtualizingUniformGrid;
+        if (p == null) { return 1; }
+        int cnt = p.Children().Length;
+        if (cnt <= 3 || cnt >= 70) { return 2; }
+        if (p.VirtualTopPadding() <= 0.0f) { return 3; }
+        if (p.VirtualBottomPadding() <= 0.0f) { return 4; }
+        return 0;
+    }
+
+    public int CheckWrapVirtualMetrics() {
+        var p = this.WrapList.ItemsHostPanel as VirtualizingWrapGrid;
+        if (p == null) { return 1; }
+        int cnt = p.Children().Length;
+        if (cnt <= 3 || cnt >= 70) { return 2; }
+        if (p.VirtualTopPadding() <= 0.0f) { return 3; }
+        if (p.VirtualBottomPadding() <= 0.0f) { return 4; }
+        return 0;
+    }
+}
+)RS"});
+        ci.stdlibRootDir = AERO_STDLIB_DIR;
+        ci.compilerSession = &sharedSession;
+        ci.allowDiskCache = false;
+        ci.allowStdlibCache = true;
+
+        aero::AeroAppHostConfig cfg;
+        cfg.headless = true;
+        cfg.viewportWidth = 640u;
+        cfg.viewportHeight = 220u;
+        aero::AeroAppHost host(cfg);
+        std::string err;
+        const bool virtLoaded = host.CompileAndLoad(ci, &err);
+        Require(virtLoaded, "Virt2DView CompileAndLoad failed: " + err);
+        auto root = host.RootScriptObject();
+        Require(root.valid(), "Virt2DView root invalid");
+
+        auto callInt = [&](std::string_view fn, float arg = -1.0f) -> int {
+            aero::UnifiedValue rv{};
+            if (arg >= 0.0f) {
+                Require(host.InvokeScriptMethod(root, fn, {aero::UnifiedValue{aero::FloatValue{arg}}},
+                    &rv, aero::DomainKind::UiPresentation), "Invoke failed");
+                return 0;
+            }
+            Require(host.InvokeScriptMethod(root, fn, {}, &rv, aero::DomainKind::UiPresentation),
+                "Invoke int failed");
+            std::int64_t iv = -999;
+            (void)rv.tryGetInt64(iv);
+            return static_cast<int>(iv);
+        };
+
+        const int gridInit = callInt("GridChildCount");
+        const int wrapInit = callInt("WrapChildCount");
+        Require(gridInit > 3 && gridInit < 70, "Expected bounded VirtualizingUniformGrid containers, got " + std::to_string(gridInit));
+        Require(wrapInit > 3 && wrapInit < 70, "Expected bounded VirtualizingWrapGrid containers, got " + std::to_string(wrapInit));
+
+        callInt("ScrollDownBoth", 900.0f);
+        host.StepFrame(0.016f, false);
+        Require(callInt("CheckGridVirtualMetrics") == 0, "CheckGridVirtualMetrics failed after scroll");
+        Require(callInt("CheckWrapVirtualMetrics") == 0, "CheckWrapVirtualMetrics failed after scroll");
+    }
+
+    // 2. Runtime CompiledXamlCatalog lookup (without any XAML disk file!)
+    {
+        aero::AeroV3CompileInput ci;
+        ci.xamlPath = "CatRuntimeMain.xaml";
+        ci.xamlContent = R"XML(
+<UserControl xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="Samples.CatRuntime.CatRuntimeMain"
+             Width="320" Height="160">
+    <Border x:Name="HostBorder" />
+</UserControl>
+)XML";
+        ci.scriptSources.push_back(aero::SourceFile{"CatRuntimeMain.rs", R"RS(
+module Samples.CatRuntime;
+import Aero.UI;
+public partial class CatRuntimeMain : UserControl {
+    public int VerifyRuntimeCatalog() {
+        if (CompiledXamlCatalog.ElementCount() < 1) { return 1; }
+        if (CompiledXamlCatalog.ResourceDictionaryCount() < 1) { return 2; }
+        ResourceDictionary rd = XamlReader.LoadResourceDictionary("Theme/CatRuntimeTheme.xaml");
+        if (rd == null) { return 3; }
+        if (!rd.Contains("CatKey") || rd.Get("CatKey") == null) { return 4; }
+        UIElement el = XamlReader.LoadUri("/Data/Samples/CatRuntimeCard.xaml", rd);
+        if (el == null) { return 5; }
+        if (this.HostBorder != null) { this.HostBorder.Child = el; }
+        return 0;
+    }
+}
+)RS"});
+        ci.catalogXamlSources.push_back(aero::CatalogXamlEntry{
+            "Data/Samples/CatRuntimeCard.xaml",
+            {"/Data/Samples/CatRuntimeCard.xaml"},
+            "Data/Samples/CatRuntimeCard.xaml",
+            R"XML(
+<Border xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Background="#FF224466">
+    <TextBlock Text="CatalogCardLoaded" Foreground="#FFFFFFFF" />
+</Border>
+)XML",
+            false});
+        ci.catalogXamlSources.push_back(aero::CatalogXamlEntry{
+            "Theme/CatRuntimeTheme.xaml",
+            {"/Theme/CatRuntimeTheme.xaml"},
+            "Theme/CatRuntimeTheme.xaml",
+            R"XML(
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <SolidColorBrush x:Key="CatKey" Color="#FF33CC77" />
+</ResourceDictionary>
+)XML",
+            true});
+        ci.stdlibRootDir = AERO_STDLIB_DIR;
+        ci.stdlibPackages = aero::AeroStdlibPkg_RuntimeXaml;
+        ci.allowDiskCache = false;
+        ci.allowStdlibCache = false;
+
+        aero::AeroAppHostConfig cfg;
+        cfg.headless = true;
+        cfg.viewportWidth = 320u;
+        cfg.viewportHeight = 160u;
+        aero::AeroAppHost host(cfg);
+        std::string err;
+        const bool catLoaded = host.CompileAndLoad(ci, &err);
+        Require(catLoaded, "CatRuntimeMain CompileAndLoad failed: " + err);
+        auto root = host.RootScriptObject();
+        aero::UnifiedValue rv{};
+        Require(host.InvokeScriptMethod(root, "VerifyRuntimeCatalog", {}, &rv, aero::DomainKind::UiPresentation),
+            "VerifyRuntimeCatalog call failed");
+        std::int64_t code = -1;
+        Require(rv.tryGetInt64(code) && code == 0,
+            "VerifyRuntimeCatalog failed with code " + std::to_string(code));
+    }
+}
+
 } // namespace
 
 int main() {
@@ -1657,6 +2352,9 @@ int main() {
     TestGalleryEngineRuntimeFixes(sharedSession);
     TestPhase1OptimizationRegressions(sharedSession);
     TestCollapsedSubtreeCatchupAndSelfDataContext(sharedSession);
+    TestPhase0MemoryAndBindingShortCircuit(sharedSession);
+    TestPhase1PushBindingPropIdMathAndPlasma(sharedSession);
+    TestPhase4VirtualizationAndCompiledCatalog(sharedSession);
 
     if (gFailureCount > 0) {
         std::cerr << gFailureCount << " v3_controls_and_samples_tests assertion(s) failed.\n";

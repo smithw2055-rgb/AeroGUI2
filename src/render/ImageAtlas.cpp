@@ -2434,66 +2434,13 @@ bool DecodeImageFromFile(
     std::string_view filePath,
     DecodedImage& outImage,
     std::string* outError) {
-    struct CachedDecodedEntry {
-        std::uintmax_t fileSize = 0u;
-        std::int64_t mtimeTick = 0;
-        DecodedImage image{};
-    };
-    static std::mutex sDecodeCacheMutex;
-    static std::unordered_map<std::string, CachedDecodedEntry> sDecodeCache;
-
-    std::error_code ec;
-    const std::filesystem::path fsPath(filePath);
-    std::filesystem::path normPath = std::filesystem::weakly_canonical(fsPath, ec);
-    if (ec) {
-        ec.clear();
-        normPath = fsPath.lexically_normal();
-    }
-    std::string keyStr = normPath.generic_string();
-#ifdef _WIN32
-    for (char& ch : keyStr) {
-        if (ch >= 'A' && ch <= 'Z') {
-            ch = static_cast<char>(ch - 'A' + 'a');
-        }
-    }
-#endif
-    const std::uintmax_t fSize = std::filesystem::file_size(fsPath, ec);
-    std::int64_t mtimeTick = 0;
-    if (!ec) {
-        const auto ftime = std::filesystem::last_write_time(fsPath, ec);
-        if (!ec) {
-            mtimeTick = static_cast<std::int64_t>(ftime.time_since_epoch().count());
-        }
-    }
-    if (!ec && fSize > 0u) {
-        std::lock_guard<std::mutex> lock(sDecodeCacheMutex);
-        const auto it = sDecodeCache.find(keyStr);
-        if (it != sDecodeCache.end() &&
-            it->second.fileSize == fSize &&
-            it->second.mtimeTick == mtimeTick &&
-            it->second.image.width > 0u) {
-            outImage = it->second.image;
-            return true;
-        }
-    }
-
     std::vector<std::uint8_t> bytes;
     if (!ReadAllFileBytes(std::string(filePath), bytes)) {
         outImage = DecodedImage{};
         SetError(outError, "Failed to open or read image file.");
         return false;
     }
-    if (!DecodeImageFromMemory(bytes.data(), bytes.size(), outImage, outError)) {
-        return false;
-    }
-    if (!ec && fSize > 0u && outImage.rgbaPixels.size() <= 32u * 1024u * 1024u) {
-        std::lock_guard<std::mutex> lock(sDecodeCacheMutex);
-        if (sDecodeCache.size() >= 64u) {
-            sDecodeCache.clear();
-        }
-        sDecodeCache[keyStr] = CachedDecodedEntry{fSize, mtimeTick, outImage};
-    }
-    return true;
+    return DecodeImageFromMemory(bytes.data(), bytes.size(), outImage, outError);
 }
 
 // ============================================================================
@@ -2748,8 +2695,9 @@ void ImageAtlas::ConfigureAtlas(
     } else if (textureSlots_.find(kSharedUiAtlasTextureId) == textureSlots_.end()) {
         sharedAtlasSize_ = clampedAtlas;
     }
-    maxPackableWidth_ = std::min(maxPackableWidth, sharedAtlasSize_ - 2u);
-    maxPackableHeight_ = std::min(maxPackableHeight, sharedAtlasSize_ - 2u);
+    const std::uint32_t maxPackLimit = std::max(sharedAtlasSize_, kDefaultMaxSharedAtlasSize) - 2u;
+    maxPackableWidth_ = std::min(maxPackableWidth, maxPackLimit);
+    maxPackableHeight_ = std::min(maxPackableHeight, maxPackLimit);
     revision_.fetch_add(1u, std::memory_order_release);
 }
 
@@ -2766,6 +2714,11 @@ std::uint32_t ImageAtlas::MaxPackableWidth() const noexcept {
 std::uint32_t ImageAtlas::MaxPackableHeight() const noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
     return maxPackableHeight_;
+}
+
+std::size_t ImageAtlas::SharedAtlasPageCount() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return sharedAtlasPages_.size();
 }
 
 void ImageAtlas::SetBaseDirectory(std::string_view baseDir) {
@@ -2819,23 +2772,31 @@ void ImageAtlas::EnsureWritableAtlasPixelsLocked(
 }
 
 void ImageAtlas::EnsureSharedAtlasAllocatedLocked() {
-    if (textureSlots_.find(kSharedUiAtlasTextureId) != textureSlots_.end()) {
+    if (!sharedAtlasPages_.empty() &&
+        textureSlots_.find(kSharedUiAtlasTextureId) != textureSlots_.end()) {
         return;
     }
-    TextureSlotBuffer slot{};
-    slot.textureId = kSharedUiAtlasTextureId;
-    slot.width = sharedAtlasSize_;
-    slot.height = sharedAtlasSize_;
-    slot.dirtyRevision = 1u;
-    slot.isAtlas = true;
-    EnsureWritableAtlasPixelsLocked(slot, sharedAtlasSize_);
-    slot.pixelSnapshot.reset();
-    slot.hasDirtyRect = false;
-    slot.dirtyBaseRevision = 1u;
-    textureSlots_.emplace(kSharedUiAtlasTextureId, std::move(slot));
-
-    skyline_.Reset(sharedAtlasSize_, sharedAtlasSize_);
-    revision_.fetch_add(1u, std::memory_order_release);
+    if (textureSlots_.find(kSharedUiAtlasTextureId) == textureSlots_.end()) {
+        TextureSlotBuffer slot{};
+        slot.textureId = kSharedUiAtlasTextureId;
+        slot.width = sharedAtlasSize_;
+        slot.height = sharedAtlasSize_;
+        slot.dirtyRevision = 1u;
+        slot.isAtlas = true;
+        EnsureWritableAtlasPixelsLocked(slot, sharedAtlasSize_);
+        slot.pixelSnapshot.reset();
+        slot.hasDirtyRect = false;
+        slot.dirtyBaseRevision = 1u;
+        textureSlots_.emplace(kSharedUiAtlasTextureId, std::move(slot));
+        revision_.fetch_add(1u, std::memory_order_release);
+    }
+    if (sharedAtlasPages_.empty()) {
+        SharedAtlasPage page0{};
+        page0.textureId = kSharedUiAtlasTextureId;
+        page0.size = sharedAtlasSize_;
+        page0.skyline.Reset(sharedAtlasSize_, sharedAtlasSize_);
+        sharedAtlasPages_.push_back(std::move(page0));
+    }
 }
 
 bool ImageAtlas::TryAllocateSkylineRectLocked(
@@ -2843,7 +2804,10 @@ bool ImageAtlas::TryAllocateSkylineRectLocked(
     std::uint32_t paddedH,
     std::uint32_t& outX,
     std::uint32_t& outY) noexcept {
-    return skyline_.TryAllocate(paddedW, paddedH, outX, outY);
+    if (sharedAtlasPages_.empty()) {
+        return false;
+    }
+    return sharedAtlasPages_[0].skyline.TryAllocate(paddedW, paddedH, outX, outY);
 }
 
 void ImageAtlas::BlitWithExtrudedBorderLocked(
@@ -3023,7 +2987,9 @@ const ImageAtlasEntry* ImageAtlas::InsertDecodedSharedLocked(
     std::uint32_t width,
     std::uint32_t height,
     std::shared_ptr<const std::vector<std::uint8_t>> pixels,
-    bool forceStandalone) {
+    bool forceStandalone,
+    std::string reloadableFilePath,
+    std::string reloadableMemAssetKey) {
     const std::size_t expectedBytes = static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4u;
     if (width == 0u || height == 0u || !pixels || pixels->size() != expectedBytes) {
         return nullptr;
@@ -3036,8 +3002,8 @@ const ImageAtlasEntry* ImageAtlas::InsertDecodedSharedLocked(
     const bool fitsPackThreshold = !forceStandalone &&
         width <= maxPackableWidth_ &&
         height <= maxPackableHeight_ &&
-        (width + 2u) <= sharedAtlasSize_ &&
-        (height + 2u) <= sharedAtlasSize_;
+        (width + 2u) <= kDefaultMaxSharedAtlasSize &&
+        (height + 2u) <= kDefaultMaxSharedAtlasSize;
 
     ImageAtlasEntry entry{};
     entry.uriKey = canonicalKey;
@@ -3047,27 +3013,71 @@ const ImageAtlasEntry* ImageAtlas::InsertDecodedSharedLocked(
     bool packedInSharedAtlas = false;
     if (fitsPackThreshold) {
         EnsureSharedAtlasAllocatedLocked();
-        std::uint32_t paddedX = 0u;
-        std::uint32_t paddedY = 0u;
-        if (TryAllocateSkylineRectLocked(width + 2u, height + 2u, paddedX, paddedY)) {
+        const std::uint32_t reqW = width + 2u;
+        const std::uint32_t reqH = height + 2u;
+        auto packIntoPage = [&](SharedAtlasPage& pg) -> bool {
+            if (reqW > pg.size || reqH > pg.size) {
+                return false;
+            }
+            std::uint32_t paddedX = 0u;
+            std::uint32_t paddedY = 0u;
+            if (!pg.skyline.TryAllocate(reqW, reqH, paddedX, paddedY)) {
+                return false;
+            }
             const std::uint32_t innerX = paddedX + 1u;
             const std::uint32_t innerY = paddedY + 1u;
-            TextureSlotBuffer& sharedBuf = textureSlots_[kSharedUiAtlasTextureId];
+            TextureSlotBuffer& sharedBuf = textureSlots_[pg.textureId];
             BlitWithExtrudedBorderLocked(sharedBuf, innerX, innerY, width, height, pixels->data());
 
-            const float invAtlasW = 1.0f / static_cast<float>(sharedAtlasSize_);
-            const float invAtlasH = 1.0f / static_cast<float>(sharedAtlasSize_);
-            entry.textureId = kSharedUiAtlasTextureId;
+            const float invAtlas = 1.0f / static_cast<float>(pg.size);
+            entry.textureId = pg.textureId;
             entry.atlasX = innerX;
             entry.atlasY = innerY;
-            entry.atlasWidth = sharedAtlasSize_;
-            entry.atlasHeight = sharedAtlasSize_;
-            entry.u0 = static_cast<float>(innerX) * invAtlasW;
-            entry.v0 = static_cast<float>(innerY) * invAtlasH;
-            entry.u1 = static_cast<float>(innerX + width) * invAtlasW;
-            entry.v1 = static_cast<float>(innerY + height) * invAtlasH;
+            entry.atlasWidth = pg.size;
+            entry.atlasHeight = pg.size;
+            entry.u0 = static_cast<float>(innerX) * invAtlas;
+            entry.v0 = static_cast<float>(innerY) * invAtlas;
+            entry.u1 = static_cast<float>(innerX + width) * invAtlas;
+            entry.v1 = static_cast<float>(innerY + height) * invAtlas;
             entry.isStandalone = false;
-            packedInSharedAtlas = true;
+            return true;
+        };
+
+        for (SharedAtlasPage& pg : sharedAtlasPages_) {
+            if (packIntoPage(pg)) {
+                packedInSharedAtlas = true;
+                break;
+            }
+        }
+
+        if (!packedInSharedAtlas && sharedAtlasPages_.size() < kMaxSharedAtlasPages) {
+            std::uint32_t nextSize = std::max<std::uint32_t>(1024u, sharedAtlasSize_);
+            const std::uint32_t needExtent = std::max(reqW, reqH);
+            while (nextSize < needExtent && nextSize < kDefaultMaxSharedAtlasSize) {
+                nextSize *= 2u;
+            }
+            nextSize = std::min(nextSize, kDefaultMaxSharedAtlasSize);
+            if (needExtent <= nextSize) {
+                const std::uint32_t pageTexId = AllocateStandaloneTextureIdLocked();
+                TextureSlotBuffer pageSlot{};
+                pageSlot.textureId = pageTexId;
+                pageSlot.width = nextSize;
+                pageSlot.height = nextSize;
+                pageSlot.dirtyRevision = 1u;
+                pageSlot.isAtlas = true;
+                EnsureWritableAtlasPixelsLocked(pageSlot, nextSize);
+                pageSlot.pixelSnapshot.reset();
+                pageSlot.hasDirtyRect = false;
+                pageSlot.dirtyBaseRevision = 1u;
+                textureSlots_.emplace(pageTexId, std::move(pageSlot));
+
+                SharedAtlasPage newPage{};
+                newPage.textureId = pageTexId;
+                newPage.size = nextSize;
+                newPage.skyline.Reset(nextSize, nextSize);
+                sharedAtlasPages_.push_back(std::move(newPage));
+                packedInSharedAtlas = packIntoPage(sharedAtlasPages_.back());
+            }
         }
     }
 
@@ -3082,6 +3092,9 @@ const ImageAtlasEntry* ImageAtlas::InsertDecodedSharedLocked(
         slot.isAtlas = false;
         slot.pixelSnapshot = std::move(pixels);
         slot.rgbaPixels.clear();
+        slot.reloadableFilePath = std::move(reloadableFilePath);
+        slot.reloadableMemAssetKey = std::move(reloadableMemAssetKey);
+        slot.cpuPixelsEvicted = false;
         textureSlots_.emplace(texId, std::move(slot));
         revision_.fetch_add(1u, std::memory_order_release);
 
@@ -3593,19 +3606,10 @@ float Perlin3D(float x, float y, float z, std::uint32_t seed) noexcept {
     return lerp(nxy0, nxy1, uz);
 }
 
-struct PlasmaShaderParams {
-    float sx = 64.0f;
-    float sy = 64.0f;
-    float seed = 100.0f;
-    float timeSec = 0.0f;
-    float vw = 300.0f;
-    float vh = 90.0f;
-    std::string colorHex = "#FF01BCFF";
-};
-
-bool ParsePlasmaShaderUri(std::string_view uri, PlasmaShaderParams& outParams, std::string& outSlotKey) {
+bool ParsePlasmaShaderUri(std::string_view uri, PlasmaRenderParams& outParams, std::string& outSlotKey) {
     if (uri.size() < 16u || uri.substr(0u, 16u) != "shader://plasma?") return false;
-    outParams = PlasmaShaderParams{};
+    outParams = PlasmaRenderParams{};
+    std::string colorHex = "#FF01BCFF";
     std::string_view q = uri.substr(16u);
     while (!q.empty()) {
         const std::size_t amp = q.find('&');
@@ -3619,11 +3623,18 @@ bool ParsePlasmaShaderUri(std::string_view uri, PlasmaShaderParams& outParams, s
             else if (k == "time") outParams.timeSec = std::strtof(v.c_str(), nullptr);
             else if (k == "vw") outParams.vw = std::clamp(std::strtof(v.c_str(), nullptr), 32.0f, 512.0f);
             else if (k == "vh") outParams.vh = std::clamp(std::strtof(v.c_str(), nullptr), 16.0f, 512.0f);
-            else if (k == "color") outParams.colorHex = v;
+            else if (k == "color") colorHex = v;
         }
         if (amp == std::string_view::npos) break;
         q.remove_prefix(amp + 1u);
     }
+
+    if (colorHex.size() >= 3u && colorHex.substr(0u, 3u) == "%23") {
+        colorHex = "#" + colorHex.substr(3u);
+    }
+    std::uint32_t rgba = colorHex.empty() ? 0xFFFFBC01u : ParseColorRgba32(colorHex);
+    if (rgba == 0u && !colorHex.empty()) { rgba = 0xFFFFBC01u; }
+    outParams.colorRgba = rgba;
 
     const std::uint32_t w = static_cast<std::uint32_t>(std::lround(outParams.vw));
     const std::uint32_t h = static_cast<std::uint32_t>(std::lround(outParams.vh));
@@ -3632,25 +3643,17 @@ bool ParsePlasmaShaderUri(std::string_view uri, PlasmaShaderParams& outParams, s
     const long syQ = std::lround(outParams.sy * 100.0f);
     outSlotKey = "shader://plasma_slot?seed=" + std::to_string(seedInt) +
                  "&sx=" + std::to_string(sxQ) + "&sy=" + std::to_string(syQ) +
-                 "&color=" + outParams.colorHex +
+                 "&rgba=" + std::to_string(rgba) +
                  "&w=" + std::to_string(w) + "&h=" + std::to_string(h);
     return true;
 }
 
-bool SynthesizePlasmaShaderImageFromParams(const PlasmaShaderParams& params, DecodedImage& outImg) {
-    float baseR = 0.004f, baseG = 0.737f, baseB = 1.0f, baseA = 1.0f;
-    std::string cleanCol = params.colorHex;
-    if (cleanCol.size() >= 3u && cleanCol.substr(0u, 3u) == "%23") {
-        cleanCol = "#" + cleanCol.substr(3u);
-    }
-    if (!cleanCol.empty()) {
-        std::uint32_t rgba = ParseColorRgba32(cleanCol);
-        if (rgba == 0u) { rgba = 0xFFFFBC01u; }
-        baseR = static_cast<float>(rgba & 0xFFu) / 255.0f;
-        baseG = static_cast<float>((rgba >> 8u) & 0xFFu) / 255.0f;
-        baseB = static_cast<float>((rgba >> 16u) & 0xFFu) / 255.0f;
-        baseA = static_cast<float>((rgba >> 24u) & 0xFFu) / 255.0f;
-    }
+bool SynthesizePlasmaShaderImageFromParams(const PlasmaRenderParams& params, DecodedImage& outImg) {
+    const std::uint32_t rgba = (params.colorRgba == 0u) ? 0xFFFFBC01u : params.colorRgba;
+    const float baseR = static_cast<float>(rgba & 0xFFu) / 255.0f;
+    const float baseG = static_cast<float>((rgba >> 8u) & 0xFFu) / 255.0f;
+    const float baseB = static_cast<float>((rgba >> 16u) & 0xFFu) / 255.0f;
+    const float baseA = static_cast<float>((rgba >> 24u) & 0xFFu) / 255.0f;
 
     const std::uint32_t w = static_cast<std::uint32_t>(std::lround(params.vw));
     const std::uint32_t h = static_cast<std::uint32_t>(std::lround(params.vh));
@@ -3749,6 +3752,259 @@ bool SynthesizePlasmaShaderImageFromParams(const PlasmaShaderParams& params, Dec
 
 } // namespace
 
+const ImageAtlasEntry* ImageAtlas::FindLoadedRive(
+    std::uint32_t instanceId,
+    std::string_view assetPath,
+    std::string_view localBaseDir) const noexcept {
+    if (assetPath.empty()) {
+        return nullptr;
+    }
+    std::string_view pathPart = assetPath;
+    if (pathPart.size() >= 7u && pathPart.substr(0u, 7u) == "rive://") {
+        pathPart.remove_prefix(7u);
+    }
+    if (const std::size_t q = pathPart.find('?'); q != std::string_view::npos) {
+        pathPart = pathPart.substr(0u, q);
+    }
+    const std::string instKey = std::to_string(instanceId);
+    const std::string riveKey = "rive_slot://" + std::string(localBaseDir) + "|" +
+        std::string(pathPart) + "|" + instKey;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (const auto it = riveSlots_.find(riveKey);
+        it != riveSlots_.end() && textureSlots_.find(it->second.entry.textureId) != textureSlots_.end()) {
+        return &it->second.entry;
+    }
+    if (localBaseDir.empty()) {
+        const std::string suffix = "|" + std::string(pathPart) + "|" + instKey;
+        for (const auto& [k, v] : riveSlots_) {
+            if (k.size() >= suffix.size() &&
+                k.compare(k.size() - suffix.size(), suffix.size(), suffix) == 0 &&
+                textureSlots_.find(v.entry.textureId) != textureSlots_.end()) {
+                return &v.entry;
+            }
+        }
+    }
+    return nullptr;
+}
+
+const ImageAtlasEntry* ImageAtlas::LoadOrGetPlasma(const PlasmaRenderParams& rawParams) {
+    constexpr std::size_t kMaxPlasmaSlotCache = 64u;
+    PlasmaRenderParams params = rawParams;
+    params.sx = std::max(4.0f, params.sx);
+    params.sy = std::max(4.0f, params.sy);
+    params.vw = std::clamp(params.vw, 32.0f, 512.0f);
+    params.vh = std::clamp(params.vh, 16.0f, 512.0f);
+    if (params.colorRgba == 0u) {
+        params.colorRgba = 0xFFFFBC01u;
+    }
+
+    const std::uint32_t w = static_cast<std::uint32_t>(std::lround(params.vw));
+    const std::uint32_t h = static_cast<std::uint32_t>(std::lround(params.vh));
+    const int seedInt = static_cast<int>(std::lround(params.seed));
+    const long sxQ = std::lround(params.sx * 100.0f);
+    const long syQ = std::lround(params.sy * 100.0f);
+    const std::string slotKey =
+        "shader://plasma_slot?seed=" + std::to_string(seedInt) +
+        "&sx=" + std::to_string(sxQ) + "&sy=" + std::to_string(syQ) +
+        "&rgba=" + std::to_string(params.colorRgba) +
+        "&w=" + std::to_string(w) + "&h=" + std::to_string(h);
+
+    std::uint32_t reuseSlotId = 0u;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (const auto it = plasmaSlots_.find(slotKey); it != plasmaSlots_.end()) {
+            it->second.lastUsedTick = ++dynamicSlotTick_;
+            if (it->second.hasNumericPlasma &&
+                it->second.lastPlasma.timeSec == params.timeSec &&
+                it->second.lastPlasma.sx == params.sx &&
+                it->second.lastPlasma.sy == params.sy &&
+                it->second.lastPlasma.seed == params.seed &&
+                it->second.lastPlasma.vw == params.vw &&
+                it->second.lastPlasma.vh == params.vh &&
+                it->second.lastPlasma.colorRgba == params.colorRgba &&
+                textureSlots_.find(it->second.entry.textureId) != textureSlots_.end()) {
+                return &it->second.entry;
+            }
+            reuseSlotId = it->second.entry.textureId;
+        }
+    }
+
+    DecodedImage plasmaImg{};
+    if (!SynthesizePlasmaShaderImageFromParams(params, plasmaImg)) {
+        return nullptr;
+    }
+    if (reuseSlotId == 0u) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (plasmaSlots_.size() >= kMaxPlasmaSlotCache) {
+            auto lruIt = plasmaSlots_.begin();
+            for (auto it = plasmaSlots_.begin(); it != plasmaSlots_.end(); ++it) {
+                if (it->second.lastUsedTick < lruIt->second.lastUsedTick) {
+                    lruIt = it;
+                }
+            }
+            reuseSlotId = lruIt->second.entry.textureId;
+            plasmaSlots_.erase(lruIt);
+        }
+    }
+    const std::uint32_t finalTexId = RegisterOrUpdateRgbaTextureSlot(
+        reuseSlotId, plasmaImg.width, plasmaImg.height, std::move(plasmaImg.rgbaPixels));
+    if (finalTexId == 0u) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    DynamicSlotCacheEntry& cached = plasmaSlots_[slotKey];
+    cached.slotKey = slotKey;
+    cached.currentExactUri = slotKey;
+    cached.lastUsedTick = ++dynamicSlotTick_;
+    cached.hasNumericPlasma = true;
+    cached.lastPlasma = params;
+    cached.entry.uriKey = slotKey;
+    cached.entry.textureId = finalTexId;
+    cached.entry.width = plasmaImg.width;
+    cached.entry.height = plasmaImg.height;
+    cached.entry.atlasX = 0u;
+    cached.entry.atlasY = 0u;
+    cached.entry.atlasWidth = plasmaImg.width;
+    cached.entry.atlasHeight = plasmaImg.height;
+    cached.entry.u0 = 0.0f;
+    cached.entry.v0 = 0.0f;
+    cached.entry.u1 = 1.0f;
+    cached.entry.v1 = 1.0f;
+    cached.entry.isStandalone = true;
+    return &cached.entry;
+}
+
+const ImageAtlasEntry* ImageAtlas::LoadOrGetRive(
+    const RiveRenderRequest& request,
+    std::uint64_t inputsRevision,
+    std::string_view localBaseDir) {
+    constexpr std::size_t kMaxRiveSlotCache = 16u;
+    if (request.assetPath.empty()) {
+        return nullptr;
+    }
+    std::string_view pathPart = request.assetPath;
+    if (pathPart.size() >= 7u && pathPart.substr(0u, 7u) == "rive://") {
+        pathPart.remove_prefix(7u);
+    }
+    if (const std::size_t q = pathPart.find('?'); q != std::string_view::npos) {
+        pathPart = pathPart.substr(0u, q);
+    }
+    if (pathPart.empty()) {
+        return nullptr;
+    }
+
+    const std::string riveKey = "rive_slot://" + std::string(localBaseDir) + "|" +
+        std::string(pathPart) + "|" + std::to_string(request.instanceId);
+    std::uint32_t reuseSlotId = 0u;
+    std::uint64_t prevPoseHash = 0u;
+    bool hasPrevPose = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (const auto it = riveSlots_.find(riveKey); it != riveSlots_.end()) {
+            it->second.lastUsedTick = ++dynamicSlotTick_;
+            const bool hasSlot =
+                textureSlots_.find(it->second.entry.textureId) != textureSlots_.end();
+            if (hasSlot &&
+                it->second.hasNumericRive &&
+                it->second.lastRiveT == request.tLoopSec &&
+                it->second.lastRiveTs == request.tStateSec &&
+                it->second.lastRiveW == request.reqW &&
+                it->second.lastRiveH == request.reqH &&
+                it->second.lastRiveInputsRev == inputsRevision) {
+                return &it->second.entry;
+            }
+            reuseSlotId = it->second.entry.textureId;
+            if (hasSlot && it->second.hasLastPoseHash) {
+                prevPoseHash = it->second.lastPoseHash;
+                hasPrevPose = true;
+            }
+        }
+    }
+
+    DecodedImage riveImg{};
+    std::uint64_t newPoseHash = 0u;
+    bool poseChanged = true;
+    if (!RenderRiveParamsToImageIfChanged(
+            request,
+            *this,
+            localBaseDir,
+            hasPrevPose ? &prevPoseHash : nullptr,
+            newPoseHash,
+            poseChanged,
+            riveImg)) {
+        return nullptr;
+    }
+    if (!poseChanged && hasPrevPose) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (const auto it = riveSlots_.find(riveKey);
+            it != riveSlots_.end() &&
+            textureSlots_.find(it->second.entry.textureId) != textureSlots_.end()) {
+            it->second.lastUsedTick = ++dynamicSlotTick_;
+            it->second.hasNumericRive = true;
+            it->second.lastRiveT = request.tLoopSec;
+            it->second.lastRiveTs = request.tStateSec;
+            it->second.lastRiveW = request.reqW;
+            it->second.lastRiveH = request.reqH;
+            it->second.lastRiveInputsRev = inputsRevision;
+            return &it->second.entry;
+        }
+        if (!RenderRiveParamsToImageIfChanged(
+                request, *this, localBaseDir, nullptr, newPoseHash, poseChanged, riveImg)) {
+            return nullptr;
+        }
+    }
+    if (!riveImg.Valid()) {
+        return nullptr;
+    }
+    if (reuseSlotId == 0u) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (const auto it = riveSlots_.find(riveKey); it != riveSlots_.end()) {
+            reuseSlotId = it->second.entry.textureId;
+        } else if (riveSlots_.size() >= kMaxRiveSlotCache) {
+            auto lruIt = riveSlots_.begin();
+            for (auto it = riveSlots_.begin(); it != riveSlots_.end(); ++it) {
+                if (it->second.lastUsedTick < lruIt->second.lastUsedTick) {
+                    lruIt = it;
+                }
+            }
+            reuseSlotId = lruIt->second.entry.textureId;
+            riveSlots_.erase(lruIt);
+        }
+    }
+    const std::uint32_t finalTexId = RegisterOrUpdateRgbaTextureSlot(
+        reuseSlotId, riveImg.width, riveImg.height, std::move(riveImg.rgbaPixels));
+    if (finalTexId == 0u) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    DynamicSlotCacheEntry& cached = riveSlots_[riveKey];
+    cached.slotKey = riveKey;
+    cached.currentExactUri = riveKey;
+    cached.lastUsedTick = ++dynamicSlotTick_;
+    cached.lastPoseHash = newPoseHash;
+    cached.hasLastPoseHash = true;
+    cached.hasNumericRive = true;
+    cached.lastRiveT = request.tLoopSec;
+    cached.lastRiveTs = request.tStateSec;
+    cached.lastRiveW = request.reqW;
+    cached.lastRiveH = request.reqH;
+    cached.lastRiveInputsRev = inputsRevision;
+    cached.entry.uriKey = riveKey;
+    cached.entry.textureId = finalTexId;
+    cached.entry.width = riveImg.width;
+    cached.entry.height = riveImg.height;
+    cached.entry.atlasX = 0u;
+    cached.entry.atlasY = 0u;
+    cached.entry.atlasWidth = riveImg.width;
+    cached.entry.atlasHeight = riveImg.height;
+    cached.entry.u0 = 0.0f;
+    cached.entry.v0 = 0.0f;
+    cached.entry.u1 = 1.0f;
+    cached.entry.v1 = 1.0f;
+    cached.entry.isStandalone = true;
+    return &cached.entry;
+}
+
 const ImageAtlasEntry* ImageAtlas::LoadOrGet(
     std::string_view uri,
     std::string_view localBaseDir) {
@@ -3844,7 +4100,7 @@ const ImageAtlasEntry* ImageAtlas::LoadOrGet(
     }
     if (uri.size() >= 16u && uri.substr(0u, 16u) == "shader://plasma?") {
         constexpr std::size_t kMaxPlasmaSlotCache = 64u;
-        PlasmaShaderParams params{};
+        PlasmaRenderParams params{};
         std::string slotKey;
         if (!ParsePlasmaShaderUri(uri, params, slotKey)) {
             return nullptr;
@@ -4120,13 +4376,122 @@ const ImageAtlasEntry* ImageAtlas::LoadOrGet(
         return nullptr;
     }
 
+    std::string reloadFilePath;
+    std::string reloadMemKey;
+    if (!memCopy.empty()) {
+        reloadMemKey = clean;
+    } else if (!resolvedDiskPath.empty()) {
+        reloadFilePath = resolvedDiskPath;
+    }
+
     std::lock_guard<std::mutex> lock(mutex_);
     return InsertDecodedSharedLocked(
         std::move(canonicalKey),
         sharedDecoded.width,
         sharedDecoded.height,
         std::move(sharedDecoded.rgbaPixels),
-        false);
+        false,
+        std::move(reloadFilePath),
+        std::move(reloadMemKey));
+}
+
+bool ImageAtlas::EvictStandaloneCpuPixelsAfterGpuUpload(
+    std::uint32_t textureId,
+    std::uint32_t uploadedRevision) const noexcept {
+    if (textureId == kSharedUiAtlasTextureId || uploadedRevision == 0u) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = textureSlots_.find(textureId);
+    if (it == textureSlots_.end()) {
+        return false;
+    }
+    const TextureSlotBuffer& slot = it->second;
+    if (slot.isAtlas || slot.isExternalGpuHandle || slot.isAlpha8 ||
+        slot.dirtyRevision != uploadedRevision ||
+        (slot.reloadableFilePath.empty() && slot.reloadableMemAssetKey.empty())) {
+        return false;
+    }
+    slot.pixelSnapshot.reset();
+    std::vector<std::uint8_t>().swap(slot.rgbaPixels);
+    slot.cpuPixelsEvicted = true;
+    return true;
+}
+
+bool ImageAtlas::TryReloadEvictedSlotPixels(std::uint32_t textureId) const noexcept {
+    std::uint32_t expectedRev = 0u;
+    std::uint32_t expectedW = 0u;
+    std::uint32_t expectedH = 0u;
+    std::string filePath;
+    std::string memKey;
+    std::vector<std::uint8_t> memBytes;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto it = textureSlots_.find(textureId);
+        if (it == textureSlots_.end()) {
+            return false;
+        }
+        const TextureSlotBuffer& slot = it->second;
+        if (!slot.cpuPixelsEvicted) {
+            const std::size_t bpp = slot.isAlpha8 ? 1u : 4u;
+            const std::size_t expectedBytes = static_cast<std::size_t>(slot.width) * slot.height * bpp;
+            const bool hasPx = (slot.cowAtlasPixels && slot.cowAtlasPixels->size() >= expectedBytes) ||
+                               (slot.pixelSnapshot && slot.pixelSnapshot->size() >= expectedBytes) ||
+                               (slot.rgbaPixels.size() >= expectedBytes);
+            return hasPx;
+        }
+        if (slot.pixelSnapshot &&
+            slot.pixelSnapshot->size() >= static_cast<std::size_t>(slot.width) * slot.height * 4u) {
+            slot.cpuPixelsEvicted = false;
+            return true;
+        }
+        expectedRev = slot.dirtyRevision;
+        expectedW = slot.width;
+        expectedH = slot.height;
+        filePath = slot.reloadableFilePath;
+        memKey = slot.reloadableMemAssetKey;
+        if (!memKey.empty()) {
+            if (const auto mit = memoryEncodedAssets_.find(memKey); mit != memoryEncodedAssets_.end()) {
+                memBytes = mit->second;
+            }
+        }
+    }
+
+    DecodedImage decoded{};
+    bool ok = false;
+    try {
+        if (!memBytes.empty()) {
+            ok = DecodeImageFromMemory(memBytes.data(), memBytes.size(), decoded);
+        } else if (!filePath.empty()) {
+            ok = DecodeImageFromFile(filePath, decoded);
+        }
+    } catch (...) {
+        return false;
+    }
+    if (!ok || !decoded.Valid() || decoded.width != expectedW || decoded.height != expectedH) {
+        return false;
+    }
+
+    std::shared_ptr<const std::vector<std::uint8_t>> snap;
+    try {
+        snap = std::make_shared<const std::vector<std::uint8_t>>(std::move(decoded.rgbaPixels));
+    } catch (...) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = textureSlots_.find(textureId);
+    if (it == textureSlots_.end()) {
+        return false;
+    }
+    const TextureSlotBuffer& slot = it->second;
+    if (slot.isAtlas || slot.dirtyRevision != expectedRev ||
+        slot.width != expectedW || slot.height != expectedH) {
+        return false;
+    }
+    slot.pixelSnapshot = std::move(snap);
+    slot.cpuPixelsEvicted = false;
+    return true;
 }
 
 bool ImageAtlas::HasTextureSlot(std::uint32_t textureId) const noexcept {
@@ -4152,42 +4517,51 @@ bool ImageAtlas::TryGetTextureSlotSnapshot(
     std::uint32_t& outHeight,
     std::shared_ptr<const std::vector<std::uint8_t>>& outPixels,
     bool* optOutIsAlpha8) const noexcept {
-    std::lock_guard<std::mutex> lock(mutex_);
-    const auto it = textureSlots_.find(textureId);
-    if (it == textureSlots_.end()) {
-        outWidth = 0u;
-        outHeight = 0u;
-        outPixels.reset();
-        if (optOutIsAlpha8) *optOutIsAlpha8 = false;
-        return false;
-    }
-    const TextureSlotBuffer& slot = it->second;
-    std::shared_ptr<const std::vector<std::uint8_t>> snap =
-        slot.cowAtlasPixels
-            ? std::static_pointer_cast<const std::vector<std::uint8_t>>(slot.cowAtlasPixels)
-            : slot.pixelSnapshot;
-    if (!snap && !slot.rgbaPixels.empty()) {
-        try {
-            snap = std::make_shared<const std::vector<std::uint8_t>>(slot.rgbaPixels);
-            slot.pixelSnapshot = snap;
-        } catch (...) {
-            snap.reset();
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        bool needReload = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            const auto it = textureSlots_.find(textureId);
+            if (it == textureSlots_.end()) {
+                outWidth = 0u;
+                outHeight = 0u;
+                outPixels.reset();
+                if (optOutIsAlpha8) *optOutIsAlpha8 = false;
+                return false;
+            }
+            const TextureSlotBuffer& slot = it->second;
+            std::shared_ptr<const std::vector<std::uint8_t>> snap =
+                slot.cowAtlasPixels
+                    ? std::static_pointer_cast<const std::vector<std::uint8_t>>(slot.cowAtlasPixels)
+                    : slot.pixelSnapshot;
+            if (!snap && !slot.rgbaPixels.empty()) {
+                try {
+                    snap = std::make_shared<const std::vector<std::uint8_t>>(slot.rgbaPixels);
+                    slot.pixelSnapshot = snap;
+                } catch (...) {
+                    snap.reset();
+                }
+            }
+            const std::size_t bpp = slot.isAlpha8 ? 1u : 4u;
+            const std::size_t expectedBytes = static_cast<std::size_t>(slot.width) * slot.height * bpp;
+            if (slot.width > 0u && slot.height > 0u && snap && snap->size() >= expectedBytes) {
+                outWidth = slot.width;
+                outHeight = slot.height;
+                outPixels = std::move(snap);
+                if (optOutIsAlpha8) *optOutIsAlpha8 = slot.isAlpha8;
+                return true;
+            }
+            needReload = (attempt == 0 && slot.cpuPixelsEvicted);
+        }
+        if (!needReload || !TryReloadEvictedSlotPixels(textureId)) {
+            break;
         }
     }
-    const std::size_t bpp = slot.isAlpha8 ? 1u : 4u;
-    const std::size_t expectedBytes = static_cast<std::size_t>(slot.width) * slot.height * bpp;
-    if (slot.width == 0u || slot.height == 0u || !snap || snap->size() < expectedBytes) {
-        outWidth = 0u;
-        outHeight = 0u;
-        outPixels.reset();
-        if (optOutIsAlpha8) *optOutIsAlpha8 = false;
-        return false;
-    }
-    outWidth = slot.width;
-    outHeight = slot.height;
-    outPixels = std::move(snap);
-    if (optOutIsAlpha8) *optOutIsAlpha8 = slot.isAlpha8;
-    return true;
+    outWidth = 0u;
+    outHeight = 0u;
+    outPixels.reset();
+    if (optOutIsAlpha8) *optOutIsAlpha8 = false;
+    return false;
 }
 
 bool ImageAtlas::CopyTextureSlotIfModified(
@@ -4198,44 +4572,61 @@ bool ImageAtlas::CopyTextureSlotIfModified(
     std::vector<std::uint8_t>& outRgba8,
     bool& outWasUpdated) const {
     outWasUpdated = false;
-    std::lock_guard<std::mutex> lock(mutex_);
-    const auto it = textureSlots_.find(textureId);
-    if (it == textureSlots_.end()) {
-        outWidth = 0u;
-        outHeight = 0u;
-        return false;
-    }
-    const TextureSlotBuffer& slot = it->second;
-    const std::vector<std::uint8_t>& px =
-        slot.cowAtlasPixels ? *slot.cowAtlasPixels
-                            : (slot.pixelSnapshot ? *slot.pixelSnapshot : slot.rgbaPixels);
-    const std::size_t bpp = slot.isAlpha8 ? 1u : 4u;
-    const std::size_t expectedBytes = static_cast<std::size_t>(slot.width) * slot.height * bpp;
-    if (slot.width == 0u || slot.height == 0u || px.size() < expectedBytes) {
-        outWidth = 0u;
-        outHeight = 0u;
-        return false;
-    }
-    outWidth = slot.width;
-    outHeight = slot.height;
-    if (ioKnownSlotRevision == 0u || ioKnownSlotRevision != slot.dirtyRevision) {
-        if (slot.isAlpha8) {
-            const std::size_t nPx = static_cast<std::size_t>(slot.width) * slot.height;
-            outRgba8.resize(nPx * 4u);
-            for (std::size_t i = 0u; i < nPx; ++i) {
-                const std::size_t o = i * 4u;
-                outRgba8[o + 0u] = 255u;
-                outRgba8[o + 1u] = 255u;
-                outRgba8[o + 2u] = 255u;
-                outRgba8[o + 3u] = px[i];
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        bool needReload = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            const auto it = textureSlots_.find(textureId);
+            if (it == textureSlots_.end()) {
+                outWidth = 0u;
+                outHeight = 0u;
+                return false;
             }
-        } else {
-            outRgba8.assign(px.data(), px.data() + expectedBytes);
+            const TextureSlotBuffer& slot = it->second;
+            if (slot.width > 0u && slot.height > 0u &&
+                ioKnownSlotRevision != 0u &&
+                ioKnownSlotRevision == slot.dirtyRevision &&
+                slot.cpuPixelsEvicted) {
+                outWidth = slot.width;
+                outHeight = slot.height;
+                return true;
+            }
+            const std::vector<std::uint8_t>& px =
+                slot.cowAtlasPixels ? *slot.cowAtlasPixels
+                                    : (slot.pixelSnapshot ? *slot.pixelSnapshot : slot.rgbaPixels);
+            const std::size_t bpp = slot.isAlpha8 ? 1u : 4u;
+            const std::size_t expectedBytes = static_cast<std::size_t>(slot.width) * slot.height * bpp;
+            if (slot.width > 0u && slot.height > 0u && px.size() >= expectedBytes) {
+                outWidth = slot.width;
+                outHeight = slot.height;
+                if (ioKnownSlotRevision == 0u || ioKnownSlotRevision != slot.dirtyRevision) {
+                    if (slot.isAlpha8) {
+                        const std::size_t nPx = static_cast<std::size_t>(slot.width) * slot.height;
+                        outRgba8.resize(nPx * 4u);
+                        for (std::size_t i = 0u; i < nPx; ++i) {
+                            const std::size_t o = i * 4u;
+                            outRgba8[o + 0u] = 255u;
+                            outRgba8[o + 1u] = 255u;
+                            outRgba8[o + 2u] = 255u;
+                            outRgba8[o + 3u] = px[i];
+                        }
+                    } else {
+                        outRgba8.assign(px.data(), px.data() + expectedBytes);
+                    }
+                    ioKnownSlotRevision = slot.dirtyRevision;
+                    outWasUpdated = true;
+                }
+                return true;
+            }
+            needReload = (attempt == 0 && slot.cpuPixelsEvicted);
         }
-        ioKnownSlotRevision = slot.dirtyRevision;
-        outWasUpdated = true;
+        if (!needReload || !TryReloadEvictedSlotPixels(textureId)) {
+            break;
+        }
     }
-    return true;
+    outWidth = 0u;
+    outHeight = 0u;
+    return false;
 }
 
 bool ImageAtlas::AcquireTextureSlotUploadIfModified(
@@ -4254,74 +4645,92 @@ bool ImageAtlas::AcquireTextureSlotUploadIfModified(
     outWasUpdated = false;
     outFullSnapshot.reset();
     if (optOutIsAlpha8) *optOutIsAlpha8 = false;
-    std::lock_guard<std::mutex> lock(mutex_);
-    const auto it = textureSlots_.find(textureId);
-    if (it == textureSlots_.end()) {
-        outSlotWidth = 0u;
-        outSlotHeight = 0u;
-        return false;
-    }
-    const TextureSlotBuffer& slot = it->second;
-    const std::shared_ptr<const std::vector<std::uint8_t>> snapPtr =
-        slot.cowAtlasPixels ? std::static_pointer_cast<const std::vector<std::uint8_t>>(slot.cowAtlasPixels)
-                            : slot.pixelSnapshot;
-    const std::vector<std::uint8_t>& px = snapPtr ? *snapPtr : slot.rgbaPixels;
-    const std::size_t bpp = slot.isAlpha8 ? 1u : 4u;
-    const std::size_t expectedBytes = static_cast<std::size_t>(slot.width) * slot.height * bpp;
-    if (slot.width == 0u || slot.height == 0u || px.size() < expectedBytes) {
-        outSlotWidth = 0u;
-        outSlotHeight = 0u;
-        return false;
-    }
-    outSlotWidth = slot.width;
-    outSlotHeight = slot.height;
-    if (optOutIsAlpha8) *optOutIsAlpha8 = slot.isAlpha8;
-    if (ioKnownSlotRevision != 0u && ioKnownSlotRevision == slot.dirtyRevision) {
-        return true;
-    }
-    if (ioKnownSlotRevision != 0u &&
-        slot.isAtlas &&
-        slot.hasDirtyRect &&
-        ioKnownSlotRevision == slot.dirtyBaseRevision &&
-        slot.dirtyX1 > slot.dirtyX0 &&
-        slot.dirtyY1 > slot.dirtyY0 &&
-        slot.dirtyX1 <= slot.width &&
-        slot.dirtyY1 <= slot.height) {
-        const std::uint32_t subW = slot.dirtyX1 - slot.dirtyX0;
-        const std::uint32_t subH = slot.dirtyY1 - slot.dirtyY0;
-        outDirtyX = slot.dirtyX0;
-        outDirtyY = slot.dirtyY0;
-        outDirtyW = subW;
-        outDirtyH = subH;
-        outSubRectRgba8.resize(static_cast<std::size_t>(subW) * subH * 4u);
-        for (std::uint32_t row = 0u; row < subH; ++row) {
-            const std::uint8_t* srcRow = px.data() +
-                (static_cast<std::size_t>(slot.dirtyY0 + row) * slot.width + slot.dirtyX0) * 4u;
-            std::memcpy(
-                outSubRectRgba8.data() + static_cast<std::size_t>(row) * subW * 4u,
-                srcRow,
-                static_cast<std::size_t>(subW) * 4u);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        bool needReload = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            const auto it = textureSlots_.find(textureId);
+            if (it == textureSlots_.end()) {
+                outSlotWidth = 0u;
+                outSlotHeight = 0u;
+                return false;
+            }
+            const TextureSlotBuffer& slot = it->second;
+            if (slot.width > 0u && slot.height > 0u &&
+                ioKnownSlotRevision != 0u &&
+                ioKnownSlotRevision == slot.dirtyRevision &&
+                slot.cpuPixelsEvicted) {
+                outSlotWidth = slot.width;
+                outSlotHeight = slot.height;
+                if (optOutIsAlpha8) *optOutIsAlpha8 = slot.isAlpha8;
+                return true;
+            }
+            const std::shared_ptr<const std::vector<std::uint8_t>> snapPtr =
+                slot.cowAtlasPixels ? std::static_pointer_cast<const std::vector<std::uint8_t>>(slot.cowAtlasPixels)
+                                    : slot.pixelSnapshot;
+            const std::vector<std::uint8_t>& px = snapPtr ? *snapPtr : slot.rgbaPixels;
+            const std::size_t bpp = slot.isAlpha8 ? 1u : 4u;
+            const std::size_t expectedBytes = static_cast<std::size_t>(slot.width) * slot.height * bpp;
+            if (slot.width > 0u && slot.height > 0u && px.size() >= expectedBytes) {
+                outSlotWidth = slot.width;
+                outSlotHeight = slot.height;
+                if (optOutIsAlpha8) *optOutIsAlpha8 = slot.isAlpha8;
+                if (ioKnownSlotRevision != 0u && ioKnownSlotRevision == slot.dirtyRevision) {
+                    return true;
+                }
+                if (ioKnownSlotRevision != 0u &&
+                    slot.isAtlas &&
+                    slot.hasDirtyRect &&
+                    ioKnownSlotRevision == slot.dirtyBaseRevision &&
+                    slot.dirtyX1 > slot.dirtyX0 &&
+                    slot.dirtyY1 > slot.dirtyY0 &&
+                    slot.dirtyX1 <= slot.width &&
+                    slot.dirtyY1 <= slot.height) {
+                    const std::uint32_t subW = slot.dirtyX1 - slot.dirtyX0;
+                    const std::uint32_t subH = slot.dirtyY1 - slot.dirtyY0;
+                    outDirtyX = slot.dirtyX0;
+                    outDirtyY = slot.dirtyY0;
+                    outDirtyW = subW;
+                    outDirtyH = subH;
+                    outSubRectRgba8.resize(static_cast<std::size_t>(subW) * subH * 4u);
+                    for (std::uint32_t row = 0u; row < subH; ++row) {
+                        const std::uint8_t* srcRow = px.data() +
+                            (static_cast<std::size_t>(slot.dirtyY0 + row) * slot.width + slot.dirtyX0) * 4u;
+                        std::memcpy(
+                            outSubRectRgba8.data() + static_cast<std::size_t>(row) * subW * 4u,
+                            srcRow,
+                            static_cast<std::size_t>(subW) * 4u);
+                    }
+                    slot.dirtyBaseRevision = slot.dirtyRevision;
+                    slot.hasDirtyRect = false;
+                    ioKnownSlotRevision = slot.dirtyRevision;
+                    outWasUpdated = true;
+                    return true;
+                }
+                outDirtyX = 0u;
+                outDirtyY = 0u;
+                outDirtyW = slot.width;
+                outDirtyH = slot.height;
+                if (snapPtr) {
+                    outFullSnapshot = snapPtr;
+                } else {
+                    outSubRectRgba8.assign(px.data(), px.data() + expectedBytes);
+                }
+                slot.dirtyBaseRevision = slot.dirtyRevision;
+                slot.hasDirtyRect = false;
+                ioKnownSlotRevision = slot.dirtyRevision;
+                outWasUpdated = true;
+                return true;
+            }
+            needReload = (attempt == 0 && slot.cpuPixelsEvicted);
         }
-        slot.dirtyBaseRevision = slot.dirtyRevision;
-        slot.hasDirtyRect = false;
-        ioKnownSlotRevision = slot.dirtyRevision;
-        outWasUpdated = true;
-        return true;
+        if (!needReload || !TryReloadEvictedSlotPixels(textureId)) {
+            break;
+        }
     }
-    outDirtyX = 0u;
-    outDirtyY = 0u;
-    outDirtyW = slot.width;
-    outDirtyH = slot.height;
-    if (snapPtr) {
-        outFullSnapshot = snapPtr;
-    } else {
-        outSubRectRgba8.assign(px.data(), px.data() + expectedBytes);
-    }
-    slot.dirtyBaseRevision = slot.dirtyRevision;
-    slot.hasDirtyRect = false;
-    ioKnownSlotRevision = slot.dirtyRevision;
-    outWasUpdated = true;
-    return true;
+    outSlotWidth = 0u;
+    outSlotHeight = 0u;
+    return false;
 }
 
 bool ImageAtlas::CopyTextureSlotDirtySubRectIfModified(
@@ -4336,67 +4745,84 @@ bool ImageAtlas::CopyTextureSlotDirtySubRectIfModified(
     std::vector<std::uint8_t>& outSubRectRgba8,
     bool& outWasUpdated) const {
     outWasUpdated = false;
-    std::lock_guard<std::mutex> lock(mutex_);
-    const auto it = textureSlots_.find(textureId);
-    if (it == textureSlots_.end()) {
-        outSlotWidth = 0u;
-        outSlotHeight = 0u;
-        return false;
-    }
-    const TextureSlotBuffer& slot = it->second;
-    const std::vector<std::uint8_t>& px =
-        slot.cowAtlasPixels ? *slot.cowAtlasPixels
-                            : (slot.pixelSnapshot ? *slot.pixelSnapshot : slot.rgbaPixels);
-    const std::size_t expectedBytes = static_cast<std::size_t>(slot.width) * slot.height * 4u;
-    if (slot.width == 0u || slot.height == 0u || px.size() < expectedBytes) {
-        outSlotWidth = 0u;
-        outSlotHeight = 0u;
-        return false;
-    }
-    outSlotWidth = slot.width;
-    outSlotHeight = slot.height;
-    if (ioKnownSlotRevision != 0u && ioKnownSlotRevision == slot.dirtyRevision) {
-        return true;
-    }
-    if (ioKnownSlotRevision != 0u &&
-        slot.isAtlas &&
-        slot.hasDirtyRect &&
-        ioKnownSlotRevision == slot.dirtyBaseRevision &&
-        slot.dirtyX1 > slot.dirtyX0 &&
-        slot.dirtyY1 > slot.dirtyY0 &&
-        slot.dirtyX1 <= slot.width &&
-        slot.dirtyY1 <= slot.height) {
-        const std::uint32_t subW = slot.dirtyX1 - slot.dirtyX0;
-        const std::uint32_t subH = slot.dirtyY1 - slot.dirtyY0;
-        outDirtyX = slot.dirtyX0;
-        outDirtyY = slot.dirtyY0;
-        outDirtyW = subW;
-        outDirtyH = subH;
-        outSubRectRgba8.resize(static_cast<std::size_t>(subW) * subH * 4u);
-        for (std::uint32_t row = 0u; row < subH; ++row) {
-            const std::uint8_t* srcRow = px.data() +
-                (static_cast<std::size_t>(slot.dirtyY0 + row) * slot.width + slot.dirtyX0) * 4u;
-            std::memcpy(
-                outSubRectRgba8.data() + static_cast<std::size_t>(row) * subW * 4u,
-                srcRow,
-                static_cast<std::size_t>(subW) * 4u);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        bool needReload = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            const auto it = textureSlots_.find(textureId);
+            if (it == textureSlots_.end()) {
+                outSlotWidth = 0u;
+                outSlotHeight = 0u;
+                return false;
+            }
+            const TextureSlotBuffer& slot = it->second;
+            if (slot.width > 0u && slot.height > 0u &&
+                ioKnownSlotRevision != 0u &&
+                ioKnownSlotRevision == slot.dirtyRevision &&
+                slot.cpuPixelsEvicted) {
+                outSlotWidth = slot.width;
+                outSlotHeight = slot.height;
+                return true;
+            }
+            const std::vector<std::uint8_t>& px =
+                slot.cowAtlasPixels ? *slot.cowAtlasPixels
+                                    : (slot.pixelSnapshot ? *slot.pixelSnapshot : slot.rgbaPixels);
+            const std::size_t expectedBytes = static_cast<std::size_t>(slot.width) * slot.height * 4u;
+            if (slot.width > 0u && slot.height > 0u && px.size() >= expectedBytes) {
+                outSlotWidth = slot.width;
+                outSlotHeight = slot.height;
+                if (ioKnownSlotRevision != 0u && ioKnownSlotRevision == slot.dirtyRevision) {
+                    return true;
+                }
+                if (ioKnownSlotRevision != 0u &&
+                    slot.isAtlas &&
+                    slot.hasDirtyRect &&
+                    ioKnownSlotRevision == slot.dirtyBaseRevision &&
+                    slot.dirtyX1 > slot.dirtyX0 &&
+                    slot.dirtyY1 > slot.dirtyY0 &&
+                    slot.dirtyX1 <= slot.width &&
+                    slot.dirtyY1 <= slot.height) {
+                    const std::uint32_t subW = slot.dirtyX1 - slot.dirtyX0;
+                    const std::uint32_t subH = slot.dirtyY1 - slot.dirtyY0;
+                    outDirtyX = slot.dirtyX0;
+                    outDirtyY = slot.dirtyY0;
+                    outDirtyW = subW;
+                    outDirtyH = subH;
+                    outSubRectRgba8.resize(static_cast<std::size_t>(subW) * subH * 4u);
+                    for (std::uint32_t row = 0u; row < subH; ++row) {
+                        const std::uint8_t* srcRow = px.data() +
+                            (static_cast<std::size_t>(slot.dirtyY0 + row) * slot.width + slot.dirtyX0) * 4u;
+                        std::memcpy(
+                            outSubRectRgba8.data() + static_cast<std::size_t>(row) * subW * 4u,
+                            srcRow,
+                            static_cast<std::size_t>(subW) * 4u);
+                    }
+                    slot.dirtyBaseRevision = slot.dirtyRevision;
+                    slot.hasDirtyRect = false;
+                    ioKnownSlotRevision = slot.dirtyRevision;
+                    outWasUpdated = true;
+                    return true;
+                }
+                outDirtyX = 0u;
+                outDirtyY = 0u;
+                outDirtyW = slot.width;
+                outDirtyH = slot.height;
+                outSubRectRgba8.assign(px.data(), px.data() + expectedBytes);
+                slot.dirtyBaseRevision = slot.dirtyRevision;
+                slot.hasDirtyRect = false;
+                ioKnownSlotRevision = slot.dirtyRevision;
+                outWasUpdated = true;
+                return true;
+            }
+            needReload = (attempt == 0 && slot.cpuPixelsEvicted);
         }
-        slot.dirtyBaseRevision = slot.dirtyRevision;
-        slot.hasDirtyRect = false;
-        ioKnownSlotRevision = slot.dirtyRevision;
-        outWasUpdated = true;
-        return true;
+        if (!needReload || !TryReloadEvictedSlotPixels(textureId)) {
+            break;
+        }
     }
-    outDirtyX = 0u;
-    outDirtyY = 0u;
-    outDirtyW = slot.width;
-    outDirtyH = slot.height;
-    outSubRectRgba8.assign(px.data(), px.data() + expectedBytes);
-    slot.dirtyBaseRevision = slot.dirtyRevision;
-    slot.hasDirtyRect = false;
-    ioKnownSlotRevision = slot.dirtyRevision;
-    outWasUpdated = true;
-    return true;
+    outSlotWidth = 0u;
+    outSlotHeight = 0u;
+    return false;
 }
 
 Color ImageAtlas::SampleBilinearRgba(std::uint32_t textureId, float u, float v) const noexcept {
@@ -4421,48 +4847,57 @@ Color ImageAtlas::SampleBilinearRgba(std::uint32_t textureId, float u, float v) 
     auto& ts = tlsTex[textureId & 15u];
     if (ts.instanceId != instanceId_ || ts.rev != curRev || ts.texId != textureId ||
         ts.status == SlotCacheStatus::Unset) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        const std::uint64_t lockedRev = revision_.load(std::memory_order_acquire);
-        const auto it = textureSlots_.find(textureId);
-        ts.instanceId = instanceId_;
-        ts.rev = lockedRev;
-        ts.texId = textureId;
-        if (it == textureSlots_.end()) {
-            ts.width = 0u;
-            ts.height = 0u;
-            ts.isAlpha8 = false;
-            ts.status = SlotCacheStatus::Missing;
-            ts.pixels.reset();
-            return Color{1.0f, 1.0f, 1.0f, 1.0f};
-        }
-        const TextureSlotBuffer& sBuf = it->second;
-        std::shared_ptr<const std::vector<std::uint8_t>> snap =
-            sBuf.cowAtlasPixels
-                ? std::static_pointer_cast<const std::vector<std::uint8_t>>(sBuf.cowAtlasPixels)
-                : sBuf.pixelSnapshot;
-        if (!snap && !sBuf.rgbaPixels.empty()) {
-            try {
-                snap = std::make_shared<const std::vector<std::uint8_t>>(sBuf.rgbaPixels);
-                sBuf.pixelSnapshot = snap;
-            } catch (...) {
-                snap.reset();
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            bool needReload = false;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                const std::uint64_t lockedRev = revision_.load(std::memory_order_acquire);
+                const auto it = textureSlots_.find(textureId);
+                ts.instanceId = instanceId_;
+                ts.rev = lockedRev;
+                ts.texId = textureId;
+                if (it == textureSlots_.end()) {
+                    ts.width = 0u;
+                    ts.height = 0u;
+                    ts.isAlpha8 = false;
+                    ts.status = SlotCacheStatus::Missing;
+                    ts.pixels.reset();
+                    return Color{1.0f, 1.0f, 1.0f, 1.0f};
+                }
+                const TextureSlotBuffer& sBuf = it->second;
+                std::shared_ptr<const std::vector<std::uint8_t>> snap =
+                    sBuf.cowAtlasPixels
+                        ? std::static_pointer_cast<const std::vector<std::uint8_t>>(sBuf.cowAtlasPixels)
+                        : sBuf.pixelSnapshot;
+                if (!snap && !sBuf.rgbaPixels.empty()) {
+                    try {
+                        snap = std::make_shared<const std::vector<std::uint8_t>>(sBuf.rgbaPixels);
+                        sBuf.pixelSnapshot = snap;
+                    } catch (...) {
+                        snap.reset();
+                    }
+                }
+                const std::size_t bpp = sBuf.isAlpha8 ? 1u : 4u;
+                if (sBuf.width > 0u && sBuf.height > 0u && snap &&
+                    snap->size() >= static_cast<std::size_t>(sBuf.width) * sBuf.height * bpp) {
+                    ts.width = sBuf.width;
+                    ts.height = sBuf.height;
+                    ts.isAlpha8 = sBuf.isAlpha8;
+                    ts.status = SlotCacheStatus::Valid;
+                    ts.pixels = std::move(snap);
+                    break;
+                }
+                needReload = (attempt == 0 && sBuf.cpuPixelsEvicted);
+            }
+            if (!needReload || !TryReloadEvictedSlotPixels(textureId)) {
+                ts.width = 0u;
+                ts.height = 0u;
+                ts.isAlpha8 = false;
+                ts.status = SlotCacheStatus::Invalid;
+                ts.pixels.reset();
+                return Color{0.0f, 0.0f, 0.0f, 0.0f};
             }
         }
-        const std::size_t bpp = sBuf.isAlpha8 ? 1u : 4u;
-        if (sBuf.width == 0u || sBuf.height == 0u || !snap ||
-            snap->size() < static_cast<std::size_t>(sBuf.width) * sBuf.height * bpp) {
-            ts.width = 0u;
-            ts.height = 0u;
-            ts.isAlpha8 = false;
-            ts.status = SlotCacheStatus::Invalid;
-            ts.pixels.reset();
-            return Color{0.0f, 0.0f, 0.0f, 0.0f};
-        }
-        ts.width = sBuf.width;
-        ts.height = sBuf.height;
-        ts.isAlpha8 = sBuf.isAlpha8;
-        ts.status = SlotCacheStatus::Valid;
-        ts.pixels = std::move(snap);
     }
     if (ts.status == SlotCacheStatus::Missing) {
         return Color{1.0f, 1.0f, 1.0f, 1.0f};
@@ -4557,7 +4992,7 @@ std::size_t ImageAtlas::EstimatedMemoryBytes() const noexcept {
 
 void ImageAtlas::Clear() noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
-    skyline_.ClearToEmpty();
+    sharedAtlasPages_.clear();
     memoryEncodedAssets_.clear();
     entries_.clear();
     packedMasks_.clear();

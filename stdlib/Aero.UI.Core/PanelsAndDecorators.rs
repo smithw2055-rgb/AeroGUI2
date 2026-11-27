@@ -203,9 +203,59 @@ public class StackPanel : Panel {
     }
 }
 
-public class VirtualizingStackPanel : StackPanel {
+public interface IVirtualizingItemsPanel {
+    bool IsVirtualizingEnabled();
+    int ComputeItemsPerRow(float viewportWidth, float estimatedItemWidth);
+    float ComputeRowStride(float estimatedItemHeight);
+    void ApplyVirtualWindowPadding(int firstRow, int lastRow, int totalRows, float rowStride);
+    void ResetVirtualWindowPadding();
+}
+
+public class VirtualizingStackPanel : StackPanel, IVirtualizingItemsPanel {
+    private bool _hasBasePad = false;
+    private float _basePadL = 0.0f;
+    private float _basePadT = 0.0f;
+    private float _basePadR = 0.0f;
+    private float _basePadB = 0.0f;
+    private float _lastVirtPadTop = -1.0f;
+    private float _lastVirtPadBottom = -1.0f;
+
     public VirtualizingStackPanel() : base() {}
     public override string GetTypeName() { return "VirtualizingStackPanel"; }
+
+    public virtual bool IsVirtualizingEnabled() { return true; }
+    public virtual int ComputeItemsPerRow(float viewportWidth, float estimatedItemWidth) { return 1; }
+    public virtual float ComputeRowStride(float estimatedItemHeight) {
+        float h = estimatedItemHeight > 8.0f ? estimatedItemHeight : 32.0f;
+        return h + Spacing;
+    }
+    public virtual void ApplyVirtualWindowPadding(int firstRow, int lastRow, int totalRows, float rowStride) {
+        if (!_hasBasePad) {
+            Thickness p = Padding;
+            if (p != null) {
+                _basePadL = p.Left;
+                _basePadT = p.Top;
+                _basePadR = p.Right;
+                _basePadB = p.Bottom;
+            }
+            _hasBasePad = true;
+        }
+        int remRows = totalRows > (lastRow + 1) ? (totalRows - 1 - lastRow) : 0;
+        float topPad = _basePadT + (float)firstRow * rowStride;
+        float botPad = _basePadB + (float)remRows * rowStride;
+        if (topPad != _lastVirtPadTop || botPad != _lastVirtPadBottom) {
+            _lastVirtPadTop = topPad;
+            _lastVirtPadBottom = botPad;
+            SetPadding4(_basePadL, topPad, _basePadR, botPad);
+        }
+    }
+    public virtual void ResetVirtualWindowPadding() {
+        if (_hasBasePad && (_lastVirtPadTop != _basePadT || _lastVirtPadBottom != _basePadB)) {
+            _lastVirtPadTop = _basePadT;
+            _lastVirtPadBottom = _basePadB;
+            SetPadding4(_basePadL, _basePadT, _basePadR, _basePadB);
+        }
+    }
 }
 
 public class TabPanel : StackPanel {
@@ -294,8 +344,8 @@ public class WrapPanel : Panel {
         if (value is BoxedInt && !(value is BoxedEnum)) { return (float)(value as BoxedInt).Value; }
         object rawObj = DependencyObject.Unbox(value);
         string s = DependencyObject.UnboxString(value, "").Trim();
-        if ((s.Length == 0 || s == "ComboBoxItem" || s == "ListBoxItem") && rawObj is ContentControl) {
-            s = DependencyObject.UnboxString((rawObj as ContentControl).ContentBox, "").Trim();
+        if ((s.Length == 0 || s == "ComboBoxItem" || s == "ListBoxItem") && rawObj is UIElement) {
+            s = DependencyObject.UnboxString((rawObj as UIElement).GetContentBoxInternal(), "").Trim();
         }
         string low = s.ToLower();
         if (low.Length == 0 || low == "auto" || low == "nan") { return ParseUtil.NaN(); }
@@ -310,8 +360,8 @@ public class WrapPanel : Panel {
             }
             object rawObj = DependencyObject.Unbox(value);
             string os = DependencyObject.UnboxString(value, "Horizontal").Trim();
-            if ((os.Length == 0 || os == "ComboBoxItem" || os == "ListBoxItem") && rawObj is ContentControl) {
-                os = DependencyObject.UnboxString((rawObj as ContentControl).ContentBox, "Horizontal").Trim();
+            if ((os.Length == 0 || os == "ComboBoxItem" || os == "ListBoxItem") && rawObj is UIElement) {
+                os = DependencyObject.UnboxString((rawObj as UIElement).GetContentBoxInternal(), "Horizontal").Trim();
             }
             Orientation = os == "Vertical" ? Orientation.Vertical : Orientation.Horizontal;
             return true;
@@ -383,6 +433,119 @@ public class UniformGrid : Panel {
         if (propName == "FirstColumn") { return DependencyObject.BoxInt(_firstColumn); }
         if (propName == "Spacing") { return DependencyObject.BoxFloat(_spacing); }
         return base.GetPropertyValue(propName);
+    }
+}
+
+public class VirtualizingUniformGrid : UniformGrid, IVirtualizingItemsPanel {
+    private bool _hasBasePad = false;
+    private float _basePadL = 0.0f;
+    private float _basePadT = 0.0f;
+    private float _basePadR = 0.0f;
+    private float _basePadB = 0.0f;
+    private float _lastVirtPadTop = -1.0f;
+    private float _lastVirtPadBottom = -1.0f;
+
+    public VirtualizingUniformGrid() : base() {}
+    public override string GetTypeName() { return "VirtualizingUniformGrid"; }
+
+    public virtual bool IsVirtualizingEnabled() { return true; }
+    public virtual int ComputeItemsPerRow(float viewportWidth, float estimatedItemWidth) {
+        if (Columns > 0) { return Columns; }
+        float cellW = estimatedItemWidth > 16.0f ? estimatedItemWidth : 120.0f;
+        if (viewportWidth <= 0.0f) { return 1; }
+        float denom = cellW + Spacing;
+        int cols = denom > 0.0f ? (int)((viewportWidth + Spacing) / denom) : 1;
+        return cols > 1 ? cols : 1;
+    }
+    public virtual float ComputeRowStride(float estimatedItemHeight) {
+        float h = estimatedItemHeight > 8.0f ? estimatedItemHeight : 32.0f;
+        return h + Spacing;
+    }
+    public virtual void ApplyVirtualWindowPadding(int firstRow, int lastRow, int totalRows, float rowStride) {
+        if (!_hasBasePad) {
+            Thickness p = Padding;
+            if (p != null) {
+                _basePadL = p.Left;
+                _basePadT = p.Top;
+                _basePadR = p.Right;
+                _basePadB = p.Bottom;
+            }
+            _hasBasePad = true;
+        }
+        int remRows = totalRows > (lastRow + 1) ? (totalRows - 1 - lastRow) : 0;
+        float topPad = _basePadT + (float)firstRow * rowStride;
+        float botPad = _basePadB + (float)remRows * rowStride;
+        if (topPad != _lastVirtPadTop || botPad != _lastVirtPadBottom) {
+            _lastVirtPadTop = topPad;
+            _lastVirtPadBottom = botPad;
+            SetPadding4(_basePadL, topPad, _basePadR, botPad);
+        }
+    }
+    public float VirtualTopPadding() { return _lastVirtPadTop; }
+    public float VirtualBottomPadding() { return _lastVirtPadBottom; }
+    public virtual void ResetVirtualWindowPadding() {
+        if (_hasBasePad && (_lastVirtPadTop != _basePadT || _lastVirtPadBottom != _basePadB)) {
+            _lastVirtPadTop = _basePadT;
+            _lastVirtPadBottom = _basePadB;
+            SetPadding4(_basePadL, _basePadT, _basePadR, _basePadB);
+        }
+    }
+}
+
+public class VirtualizingWrapGrid : WrapPanel, IVirtualizingItemsPanel {
+    private bool _hasBasePad = false;
+    private float _basePadL = 0.0f;
+    private float _basePadT = 0.0f;
+    private float _basePadR = 0.0f;
+    private float _basePadB = 0.0f;
+    private float _lastVirtPadTop = -1.0f;
+    private float _lastVirtPadBottom = -1.0f;
+
+    public VirtualizingWrapGrid() : base() {}
+    public override string GetTypeName() { return "VirtualizingWrapGrid"; }
+
+    public virtual bool IsVirtualizingEnabled() { return true; }
+    public virtual int ComputeItemsPerRow(float viewportWidth, float estimatedItemWidth) {
+        float iw = ItemWidth;
+        float effW = (!ParseUtil.IsNaN(iw) && iw > 0.0f) ? iw : (estimatedItemWidth > 16.0f ? estimatedItemWidth : 120.0f);
+        if (viewportWidth <= 0.0f) { return 1; }
+        float denom = effW + Spacing;
+        int cols = denom > 0.0f ? (int)((viewportWidth + Spacing) / denom) : 1;
+        return cols > 1 ? cols : 1;
+    }
+    public virtual float ComputeRowStride(float estimatedItemHeight) {
+        float ih = ItemHeight;
+        float effH = (!ParseUtil.IsNaN(ih) && ih > 0.0f) ? ih : (estimatedItemHeight > 8.0f ? estimatedItemHeight : 32.0f);
+        return effH + Spacing;
+    }
+    public virtual void ApplyVirtualWindowPadding(int firstRow, int lastRow, int totalRows, float rowStride) {
+        if (!_hasBasePad) {
+            Thickness p = Padding;
+            if (p != null) {
+                _basePadL = p.Left;
+                _basePadT = p.Top;
+                _basePadR = p.Right;
+                _basePadB = p.Bottom;
+            }
+            _hasBasePad = true;
+        }
+        int remRows = totalRows > (lastRow + 1) ? (totalRows - 1 - lastRow) : 0;
+        float topPad = _basePadT + (float)firstRow * rowStride;
+        float botPad = _basePadB + (float)remRows * rowStride;
+        if (topPad != _lastVirtPadTop || botPad != _lastVirtPadBottom) {
+            _lastVirtPadTop = topPad;
+            _lastVirtPadBottom = botPad;
+            SetPadding4(_basePadL, topPad, _basePadR, botPad);
+        }
+    }
+    public float VirtualTopPadding() { return _lastVirtPadTop; }
+    public float VirtualBottomPadding() { return _lastVirtPadBottom; }
+    public virtual void ResetVirtualWindowPadding() {
+        if (_hasBasePad && (_lastVirtPadTop != _basePadT || _lastVirtPadBottom != _basePadB)) {
+            _lastVirtPadTop = _basePadT;
+            _lastVirtPadBottom = _basePadB;
+            SetPadding4(_basePadL, _basePadT, _basePadR, _basePadB);
+        }
     }
 }
 

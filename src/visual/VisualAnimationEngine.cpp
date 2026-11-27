@@ -546,6 +546,7 @@ bool ApplyScalarProp(VisualWorld& world, VisualNodeId id, VisualAnimProp prop, f
     }
     }
     world.MarkDirty(id, DirtyFlagsForScalarProp(prop));
+    world.MarkBindingPropDirty(id);
     return true;
 }
 
@@ -563,6 +564,7 @@ bool ApplyColorProp(VisualWorld& world, VisualNodeId id, VisualAnimProp prop, st
         if (GradientBrushRegistry* reg = EnsureMutableNodeGradient(world, node, target.isStroke, brushId)) {
             if (reg->UpdateBrushStopColor(brushId, target.stopIndex, UnpackRgba(rgba))) {
                 world.MarkDirty(id, VisualDirty_Visual);
+                world.MarkBindingPropDirty(id);
                 return true;
             }
         }
@@ -597,6 +599,7 @@ bool ApplyColorProp(VisualWorld& world, VisualNodeId id, VisualAnimProp prop, st
         return false;
     }
     world.MarkDirty(id, VisualDirty_Visual);
+    world.MarkBindingPropDirty(id);
     return true;
 }
 

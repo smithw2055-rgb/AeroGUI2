@@ -2315,6 +2315,13 @@ public class ScrollBar : RangeBase {
         UpdateDefaultHoverState();
     }
 
+    public override void OnMouseLeftButtonDown(MouseButtonEventArgs e) {
+        base.OnMouseLeftButtonDown(e);
+        if (!e.Handled && IsEnabled) {
+            e.Handled = true;
+        }
+    }
+
     protected override UIElement CreateDefaultTemplate() {
         _partTrack = null;
         _hoverExpanded = false;

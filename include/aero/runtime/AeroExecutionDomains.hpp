@@ -128,6 +128,9 @@ public:
     [[nodiscard]] bool isTypeObservable(realscript::semantic::SymbolId typeId) const noexcept;
     [[nodiscard]] bool isSimCommandFunction(realscript::semantic::SymbolId functionId) const noexcept;
     [[nodiscard]] std::uint64_t globalObservableEpoch() const noexcept;
+    [[nodiscard]] std::int32_t getOrAssignObservableToken(realscript::runtime::ObjectRef ref);
+    [[nodiscard]] std::int32_t beginConsumeDirtyObservableTokens();
+    [[nodiscard]] std::int32_t getConsumedDirtyObservableToken(std::size_t idx) const noexcept;
 
     [[nodiscard]] std::optional<realscript::runtime::Value> readCrossHeapFieldFast(
         realscript::runtime::ObjectRef simObject,
@@ -386,11 +389,21 @@ private:
         std::size_t fieldIndex,
         std::uint8_t dirtyBit);
 
+    static void onObservableListOwnerDirtyCallback(
+        void* context,
+        realscript::runtime::ManagedHeap& heap,
+        realscript::runtime::ObjectRef ownerRef,
+        std::uint8_t bitIndex);
+
     void handleFieldMutated(
         realscript::runtime::ManagedHeap& heap,
         realscript::runtime::ObjectRef object,
         std::size_t fieldIndex,
         std::uint8_t dirtyBit);
+
+    void noteSubscribedObjectMutated(
+        const realscript::runtime::ManagedHeap& heap,
+        realscript::runtime::ObjectRef object);
 
     void ensureProgramMetadataComputedLocked(
         const realscript::runtime::ProgramImage& program,
@@ -457,6 +470,14 @@ private:
     mutable std::atomic<bool> hasSimCommands_{false};
     mutable std::atomic<bool> hasSimStateTypes_{false};
     mutable std::atomic<bool> hasObservableTypes_{false};
+    std::unordered_map<std::uint64_t, std::int32_t> objectTokensByRefKey_;
+    std::int32_t nextObjectToken_ = 1;
+    std::vector<std::int32_t> dirtyObservableTokens_;
+    std::unordered_set<std::int32_t> dirtyObservableTokenSet_;
+    std::vector<std::int32_t> consumedDirtyTokens_;
+    bool dirtyObservableOverflow_ = false;
+    std::atomic<bool> hasSubscribedTokens_{false};
+
     mutable std::atomic<std::uint64_t> globalObservableEpoch_{1u};
     mutable std::atomic<std::uint64_t> desktopJitInvokeHits_{0u};
     mutable std::atomic<std::uint64_t> desktopJitFallbackHits_{0u};

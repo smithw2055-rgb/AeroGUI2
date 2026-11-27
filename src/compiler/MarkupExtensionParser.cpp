@@ -392,6 +392,11 @@ bool TryExtractBindingSpec(
     if (const auto* srcArg = node.FindNamed("Source")) {
         outSpec.hasSourceLiteral = true;
         outSpec.sourceLiteral = ArgToString(*srcArg);
+        if (srcArg->isExtension && srcArg->extension &&
+            (srcArg->extension->kind == MarkupExtensionKind::StaticResource ||
+             srcArg->extension->kind == MarkupExtensionKind::DynamicResource)) {
+            outSpec.sourceResourceKey = ArgToString(*srcArg);
+        }
     }
     if (const auto* modeArg = node.FindNamed("Mode")) {
         outSpec.mode = modeArg->literal;

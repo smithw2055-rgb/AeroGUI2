@@ -208,8 +208,12 @@ void PrintUsage() {
         "  --stdlib-source         Fallback to stdlib source tree compilation\n"
         "  --stdlib <dir>          Path to stdlib source dir (implies --stdlib-source)\n"
         "  --profile-startup       Print startup & lazy compilation profile metrics\n"
+        "  --jit                   Enable tiered StencilJIT in bytecode/DLL mode\n"
+        "  --no-jit                Disable StencilJIT (default)\n"
+        "  --jit-threshold <N>     Calls before promoting a UI function to native (default: 32)\n"
         "  --benchmark-subpages <mode>  Benchmark Gallery subpages (containers|all)\n"
         "  --benchmark-cycles <N>  Number of benchmark cycles (default: 2)\n"
+        "  --compiled-xaml-catalog Compile catalog XAMLs (Data/Samples, Theme brushes, Languages)\n"
         "  -h, --help              Show this help\n",
         AERO_SAMPLE_APP_TITLE);
 }
@@ -287,8 +291,11 @@ int main(int argc, char** argv) {
     std::string stdlibDllPath;
     std::string stdlibDir;
     bool profileStartup = false;
+    bool enableStencilJit = false;
+    std::uint32_t jitThreshold = 32u;
     std::string benchmarkSubpagesMode;
     std::uint64_t benchmarkCycles = 2u;
+    bool compiledXamlCatalog = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg(argv[i]);
@@ -353,6 +360,14 @@ int main(int argc, char** argv) {
             }
         } else if (arg == "--profile-startup") {
             profileStartup = true;
+        } else if (arg == "--jit") {
+            enableStencilJit = true;
+        } else if (arg == "--no-jit") {
+            enableStencilJit = false;
+        } else if (arg == "--jit-threshold") {
+            const char* v = needNext(arg);
+            if (!v) return 2;
+            jitThreshold = static_cast<std::uint32_t>(std::max<unsigned long long>(1ull, std::strtoull(v, nullptr, 10)));
         } else if (arg == "--benchmark-subpages") {
             const char* v = needNext(arg);
             if (!v) return 2;
@@ -361,6 +376,8 @@ int main(int argc, char** argv) {
             const char* v = needNext(arg);
             if (!v) return 2;
             benchmarkCycles = std::max<std::uint64_t>(1u, std::strtoull(v, nullptr, 10));
+        } else if (arg == "--compiled-xaml-catalog") {
+            compiledXamlCatalog = true;
         } else {
             std::cerr << "Unknown option: " << arg << "\n";
             PrintUsage();
@@ -368,8 +385,35 @@ int main(int argc, char** argv) {
         }
     }
 
-#ifndef AERO_HAS_COMPILER_V3
-    std::cerr << "Standalone sample requires AERO_HAS_COMPILER_V3.\n";
+#if defined(AERO_SAMPLE_PRECOMPILED_ARBC)
+    const std::filesystem::path exeDir = ResolveSelfExecutableDir(argc > 0 ? argv[0] : nullptr);
+    const std::filesystem::path precompiledArbc = exeDir / AERO_SAMPLE_PRECOMPILED_ARBC;
+    if (!std::filesystem::is_regular_file(precompiledArbc)) {
+        std::cerr << "Missing precompiled bytecode bundle: " << precompiledArbc.generic_string() << "\n";
+        return 1;
+    }
+    aero::AeroAppHostConfig hostCfg;
+    hostCfg.windowTitle = AERO_SAMPLE_APP_TITLE;
+    hostCfg.viewportWidth = width;
+    hostCfg.viewportHeight = height;
+    hostCfg.headless = headless;
+    hostCfg.enableHighDpi = !headless && !noDpiFlag;
+    hostCfg.dpiScale = noDpiFlag ? 0.0f : dpiScaleOverride;
+    if (softwareFlagSet) {
+        hostCfg.preferSoftwareRasterizer = preferSoftware;
+    }
+    hostCfg.optimizeBytecode = false;
+    hostCfg.enableStencilJit = enableStencilJit;
+    hostCfg.stencilJitHotnessThreshold = jitThreshold;
+
+    aero::AeroAppHost host(hostCfg);
+    host.DiscoverAssetDirectories(exeDir);
+    if (!host.LoadProgramImageFile(precompiledArbc)) {
+        std::cerr << host.LastError() << "\n";
+        return 1;
+    }
+#elif !defined(AERO_HAS_COMPILER_V3)
+    std::cerr << "Standalone sample requires AERO_HAS_COMPILER_V3 or AERO_SAMPLE_PRECOMPILED_ARBC.\n";
     return 1;
 #else
     const std::filesystem::path exeDir = ResolveSelfExecutableDir(argc > 0 ? argv[0] : nullptr);
@@ -383,6 +427,9 @@ int main(int argc, char** argv) {
 
     compileInput.includeStdlib = true;
     compileInput.useStdlibDll = useStdlibDll;
+    if (compiledXamlCatalog) {
+        aero::DiscoverCatalogXamlSources(exeDir, compileInput.catalogXamlSources);
+    }
     compileInput.stdlibDllPath = stdlibDllPath;
     compileInput.retainStdlibDllCache = false;
     compileInput.treeShakeStdlib = false;
@@ -410,7 +457,8 @@ int main(int argc, char** argv) {
         hostCfg.preferSoftwareRasterizer = preferSoftware;
     }
     hostCfg.optimizeBytecode = false;
-    hostCfg.enableStencilJit = false;
+    hostCfg.enableStencilJit = enableStencilJit;
+    hostCfg.stencilJitHotnessThreshold = jitThreshold;
 
     aero::AeroAppHost host(hostCfg);
     std::string err;
@@ -419,6 +467,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     compileInput = {};
+#endif
 
     const auto tReady = std::chrono::steady_clock::now();
 
@@ -426,10 +475,18 @@ int main(int argc, char** argv) {
         if (!profileStartup) {
             return;
         }
+#ifdef AERO_HAS_COMPILER_V3
         const auto* cr = host.LastCompileResult();
         const double dllMs = cr ? cr->stdlibDllLoadMs : 0.0;
         const double compMs = cr ? cr->compileFrontendAndMirMs : 0.0;
         const double lnkMs = cr ? cr->linkMs : 0.0;
+        const char* modeName = (cr && cr->usedStdlibDll) ? "dll" : "source";
+#else
+        const double dllMs = 0.0;
+        const double compMs = 0.0;
+        const double lnkMs = 0.0;
+        const char* modeName = "precompiled-arbc";
+#endif
         const auto tNow = std::chrono::steady_clock::now();
         const double totalMs = std::chrono::duration<double, std::milli>(tNow - tProcStart).count();
         const auto prog = host.Program();
@@ -455,7 +512,7 @@ int main(int argc, char** argv) {
         const double resMb = resStoreMb + fontMb + imgMb;
         std::printf(
             "[PROFILE] mode=%s dll_load_ms=%.2f compile_ms=%.2f link_ms=%.2f first_frame_ms=%.2f total_ms=%.2f lazy_compiled=%zu/%zu (%.1f%%) rss_mb=%.2f\n",
-            (cr && cr->usedStdlibDll) ? "dll" : "source",
+            modeName,
             dllMs,
             compMs,
             lnkMs,
@@ -483,6 +540,19 @@ int main(int argc, char** argv) {
             fontMb,
             imgMb,
             prog ? prog->decodedLazyChunkCacheSize() : 0u);
+        const auto js = host.StencilJitStats();
+        if (js.active) {
+            std::printf(
+                "[JIT_PROFILE] native_backend=%d tracked=%zu native=%zu threaded=%zu fallback=%zu code_bytes=%zu invoke_hits=%llu fallback_hits=%llu\n",
+                js.nativeBackendActive ? 1 : 0,
+                js.trackedFunctions,
+                js.nativeFunctions,
+                js.threadedFunctions,
+                js.fallbackFunctions,
+                js.machineCodeBytes,
+                static_cast<unsigned long long>(js.invokeHits),
+                static_cast<unsigned long long>(js.fallbackHits));
+        }
         std::fflush(stdout);
     };
 
@@ -770,6 +840,19 @@ int main(int argc, char** argv) {
                 cycle1EndNodes,
                 cycle2EndNodes,
                 prog ? prog->decodedLazyChunkCacheSize() : 0u);
+            const auto js = host.StencilJitStats();
+            if (js.active) {
+                std::printf(
+                    "[JIT_PROFILE] native_backend=%d tracked=%zu native=%zu threaded=%zu fallback=%zu code_bytes=%zu invoke_hits=%llu fallback_hits=%llu\n",
+                    js.nativeBackendActive ? 1 : 0,
+                    js.trackedFunctions,
+                    js.nativeFunctions,
+                    js.threadedFunctions,
+                    js.fallbackFunctions,
+                    js.machineCodeBytes,
+                    static_cast<unsigned long long>(js.invokeHits),
+                    static_cast<unsigned long long>(js.fallbackHits));
+            }
             std::fflush(stdout);
         }
 
@@ -798,5 +881,4 @@ int main(int argc, char** argv) {
         AERO_SAMPLE_APP_TITLE,
         static_cast<unsigned long long>(rendered));
     return 0;
-#endif
 }

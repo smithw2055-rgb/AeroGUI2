@@ -47,7 +47,15 @@ struct LoadedStdlibDll final {
     std::string_view explicitPath = {},
     std::string* outError = nullptr);
 
+[[nodiscard]] std::shared_ptr<LoadedStdlibDll> LoadStdlibDllFrontendOnly(
+    std::string_view explicitPath = {},
+    std::string* outError = nullptr);
+
 [[nodiscard]] bool DecodeStdlibDllFrontendPack(
+    LoadedStdlibDll& loaded,
+    std::string* outError = nullptr);
+
+[[nodiscard]] bool DecodeStdlibDllLazyBundle(
     LoadedStdlibDll& loaded,
     std::string* outError = nullptr);
 

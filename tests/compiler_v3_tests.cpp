@@ -1777,6 +1777,134 @@ public class HeroStore {
     Require(r3.succeeded && r3.programImage != nullptr, "TestIncrementalSpecModuleCacheInvalidation compile #3 failed");
 }
 
+void TestPhase4PackagesCatalogAndPruning() {
+    std::cout << "[Test] 4-package stdlib split, CompiledXamlCatalog, and Workbench pruning...\n";
+
+    // 1. Selective stdlib package source packing
+    const auto packCore = aero::LoadStdlibModulePack(AERO_STDLIB_DIR, aero::AeroStdlibPkg_Core);
+    const auto packControls = aero::LoadStdlibModulePack(AERO_STDLIB_DIR, aero::AeroStdlibPkg_Controls);
+    const auto packAll = aero::LoadStdlibModulePack(AERO_STDLIB_DIR, aero::AeroStdlibPkg_All);
+    Require(!packCore.empty() && packCore.size() < packControls.size() && packControls.size() < packAll.size(),
+        "4-package stdlib split source counts unexpected: core=" + std::to_string(packCore.size()) +
+        " controls=" + std::to_string(packControls.size()) +
+        " all=" + std::to_string(packAll.size()));
+
+    // 2. Minimal Grid + TextBlock view infers AeroStdlibPkg_Core and prunes __RegisterWorkbenchXamlFactories
+    aero::AeroCompilerV3 compiler;
+    aero::AeroV3CompileInput minIn;
+    minIn.xamlPath = "MinView.xaml";
+    minIn.xamlContent = R"XML(
+<UserControl xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="Samples.MinPkg.MinView">
+    <Grid>
+        <TextBlock Text="Hello Core" />
+    </Grid>
+</UserControl>
+)XML";
+    minIn.stdlibRootDir = AERO_STDLIB_DIR;
+    minIn.allowDiskCache = false;
+    minIn.allowStdlibCache = false;
+    minIn.treeShakeStdlib = true;
+    minIn.stdlibPackages = aero::AeroStdlibPkg_Auto;
+
+    const auto minRes = compiler.Compile(minIn);
+    Require(minRes.succeeded && minRes.programImage != nullptr, "Min Core package compile failed");
+    Require(minRes.resolvedStdlibPackages == aero::AeroStdlibPkg_Core,
+        "Expected Auto inference to pick AeroStdlibPkg_Core");
+
+    bool hasWorkbenchHookInMin = false;
+    for (const auto& mod : minRes.programImage->modules()) {
+        for (const auto& fn : mod.functions) {
+            if (fn.name.find("__RegisterWorkbenchXamlFactories") != std::string::npos) {
+                hasWorkbenchHookInMin = true;
+            }
+        }
+    }
+    Require(!hasWorkbenchHookInMin,
+        "__RegisterWorkbenchXamlFactories must be tree-shaken when XamlReader and Workbench types are absent");
+
+    // 3. Compare unpruned Core vs All MIR type counts
+    aero::AeroV3CompileInput unprunedCoreIn = minIn;
+    unprunedCoreIn.treeShakeStdlib = false;
+    unprunedCoreIn.stdlibPackages = aero::AeroStdlibPkg_Core;
+    const auto unprunedCore = compiler.Compile(unprunedCoreIn);
+
+    aero::AeroV3CompileInput unprunedAllIn = minIn;
+    unprunedAllIn.treeShakeStdlib = false;
+    unprunedAllIn.stdlibPackages = aero::AeroStdlibPkg_All;
+    const auto unprunedAll = compiler.Compile(unprunedAllIn);
+
+    Require(unprunedCore.succeeded && unprunedAll.succeeded, "Core vs All unpruned compile failed");
+    Require(unprunedCore.retainedMirTypes < unprunedAll.retainedMirTypes,
+        "Core package retainedMirTypes (" + std::to_string(unprunedCore.retainedMirTypes) +
+        ") should be < All (" + std::to_string(unprunedAll.retainedMirTypes) + ")");
+
+    // 4. CompiledXamlCatalog emission + tree-shaking coexistence
+    aero::AeroV3CompileInput catIn;
+    catIn.xamlPath = "HostPage.xaml";
+    catIn.xamlContent = R"XML(
+<Page xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+      xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+      x:Class="Samples.CatTest.HostPage">
+    <Border x:Name="HostSlot" />
+</Page>
+)XML";
+    catIn.scriptSources.push_back(aero::SourceFile{"HostPage.rs", R"RS(
+module Samples.CatTest;
+import Aero.UI;
+public partial class HostPage : Page {
+    public void LoadCatalogItems() {
+        var rd = XamlReader.LoadResourceDictionary("Theme/CatTheme.xaml");
+        var ui = XamlReader.LoadUri("Data/Samples/DemoCard.xaml", rd);
+        if (this.HostSlot != null) { this.HostSlot.Child = ui; }
+    }
+}
+)RS"});
+    catIn.catalogXamlSources.push_back(aero::CatalogXamlEntry{
+        "Data/Samples/DemoCard.xaml",
+        {"/Data/Samples/DemoCard.xaml", "DemoCard.xaml"},
+        "Data/Samples/DemoCard.xaml",
+        R"XML(
+<Border xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Background="#FF223344">
+    <TextBlock Text="FromCatalog" />
+</Border>
+)XML",
+        false});
+    catIn.catalogXamlSources.push_back(aero::CatalogXamlEntry{
+        "Theme/CatTheme.xaml",
+        {"/Theme/CatTheme.xaml", "CatTheme.xaml"},
+        "Theme/CatTheme.xaml",
+        R"XML(
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <SolidColorBrush x:Key="CatalogAccent" Color="#FF11AAFF" />
+</ResourceDictionary>
+)XML",
+        true});
+    catIn.stdlibRootDir = AERO_STDLIB_DIR;
+    catIn.allowDiskCache = false;
+    catIn.allowStdlibCache = false;
+    catIn.treeShakeStdlib = true;
+
+    const auto catRes = compiler.Compile(catIn);
+    Require(catRes.succeeded && catRes.programImage != nullptr, "CompiledXamlCatalog compile failed");
+    Require(catRes.compiledCatalogEntryCount == 2u,
+        "Expected 2 compiled catalog entries, got " + std::to_string(catRes.compiledCatalogEntryCount));
+
+    bool foundCatalogInit = false;
+    for (const auto& mod : catRes.programImage->modules()) {
+        if (mod.name == "__AeroCompiledCatalog") {
+            for (const auto& fn : mod.functions) {
+                if (fn.name.find("RegisterAll") != std::string::npos) {
+                    foundCatalogInit = true;
+                }
+            }
+        }
+    }
+    Require(foundCatalogInit, "Missing __AeroCompiledXamlCatalogInit.RegisterAll in __AeroCompiledCatalog");
+}
+
 } // namespace
 
 int main() {
@@ -1792,6 +1920,7 @@ int main() {
     TestP0P1CompilerSemanticsAndStdlibGenericCache();
     TestGalleryEngineCompilerFixes();
     TestIncrementalSpecModuleCacheInvalidation();
+    TestPhase4PackagesCatalogAndPruning();
 
     if (gFailureCount > 0) {
         std::cerr << gFailureCount << " compiler_v3_tests assertion(s) failed.\n";

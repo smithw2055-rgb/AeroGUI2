@@ -242,8 +242,33 @@ struct VisualTextData {
     void InvalidateLayoutCache() noexcept { hasCachedLayout = false; }
 };
 
+struct VisualPlasmaState {
+    bool active = false;
+    float sx = 64.0f;
+    float sy = 64.0f;
+    float timeSec = 0.0f;
+    float seed = 100.0f;
+    float vw = 300.0f;
+    float vh = 90.0f;
+    std::uint32_t colorRgba = 0xFFFFBC01u;
+};
+
+struct VisualRiveState {
+    bool active = false;
+    std::uint32_t instanceId = 0u;
+    std::string assetPath;
+    float tLoopSec = 0.0f;
+    float tStateSec = 0.0f;
+    float reqW = 0.0f;
+    float reqH = 0.0f;
+    std::uint64_t inputsRevision = 1u;
+    std::vector<std::pair<std::string, float>> inputs;
+};
+
 struct VisualImageData {
     std::string uri;
+    VisualPlasmaState plasma{};
+    VisualRiveState rive{};
     Stretch stretch = Stretch::Uniform;
     StretchDirection stretchDir = StretchDirection::Both;
     std::uint32_t tintRgba = 0xFFFFFFFFu;
@@ -261,6 +286,13 @@ struct VisualImageData {
     bool hasExplicitViewport = false;
     bool viewportAbsolute = false;
     bool tileWrap = false;
+
+    [[nodiscard]] bool HasNonVisualBrushSource() const noexcept {
+        return !uri.empty() || plasma.active || rive.active;
+    }
+    [[nodiscard]] bool HasSource() const noexcept {
+        return HasNonVisualBrushSource() || visualBrushSource.IsValid();
+    }
 };
 
 struct VisualVectorData {
@@ -304,7 +336,11 @@ struct VisualLayoutData {
         , hasValidArrange(false)
         , needsLayoutClip(false)
         , lastMeasureInnerInfW(false)
-        , lastMeasureInnerInfH(false) {}
+        , lastMeasureInnerInfH(false)
+        , suppressNativePadding(false)
+        , suppressNativeBoxVisual(false)
+        , includeBorderInPadding(false)
+        , hitTestBorderOnly(false) {}
 
     float width = std::numeric_limits<float>::quiet_NaN();
     float height = std::numeric_limits<float>::quiet_NaN();
@@ -377,6 +413,10 @@ struct VisualLayoutData {
     bool needsLayoutClip : 1;
     bool lastMeasureInnerInfW : 1;
     bool lastMeasureInnerInfH : 1;
+    bool suppressNativePadding : 1;
+    bool suppressNativeBoxVisual : 1;
+    bool includeBorderInPadding : 1;
+    bool hitTestBorderOnly : 1;
 };
 
 struct VisualSpatial3DData {
@@ -411,7 +451,8 @@ struct VisualNode {
         : alive(false)
         , hasScriptOwner(false)
         , drawDirty(false)
-        , inCanvasDrawList(false) {}
+        , inCanvasDrawList(false)
+        , inDirtyBindingPropList(false) {}
 
     VisualNodeId id{};
     VisualNodeId parent{};
@@ -434,6 +475,7 @@ struct VisualNode {
     bool hasScriptOwner : 1;
     bool drawDirty : 1;
     bool inCanvasDrawList : 1;
+    bool inDirtyBindingPropList : 1;
 
     [[nodiscard]] bool HasExtras() const noexcept { return extras != nullptr; }
     [[nodiscard]] bool HasSpatial3D() const noexcept { return extras && extras->spatial3D != nullptr; }
@@ -523,6 +565,17 @@ struct VisualNode {
     }
     [[nodiscard]] const Matrix4x4& ModelMatrix3D() const noexcept {
         return HasSpatial3D() ? extras->spatial3D->modelMatrix3D : DefaultSpatial3D().modelMatrix3D;
+    }
+    [[nodiscard]] Thickness EffectivePadding() const noexcept {
+        if (layout.suppressNativePadding) return Thickness{};
+        if (layout.includeBorderInPadding) {
+            return Thickness{
+                std::max(0.0f, layout.padding.left) + std::max(0.0f, box.borderThickness.left),
+                std::max(0.0f, layout.padding.top) + std::max(0.0f, box.borderThickness.top),
+                std::max(0.0f, layout.padding.right) + std::max(0.0f, box.borderThickness.right),
+                std::max(0.0f, layout.padding.bottom) + std::max(0.0f, box.borderThickness.bottom)};
+        }
+        return layout.padding;
     }
     [[nodiscard]] const Matrix4x4& WorldMatrix3D() const noexcept {
         return HasSpatial3D() ? extras->spatial3D->worldMatrix3D : DefaultSpatial3D().worldMatrix3D;
@@ -617,6 +670,7 @@ public:
     bool SetZIndex(VisualNodeId id, std::int32_t zIndex) noexcept;
     bool SetClipToBounds(VisualNodeId id, bool clip) noexcept;
     bool SetInteractiveFlags(VisualNodeId id, bool enabled, bool hitTestVisible, bool focusable) noexcept;
+    bool SetHitTestBorderOnly(VisualNodeId id, bool borderOnly) noexcept;
     bool SetLayoutMode(VisualNodeId id, LayoutMode mode, float p0, float p1, std::int32_t i0, std::int32_t i1) noexcept;
     bool GridClearDefs(VisualNodeId id) noexcept;
     bool GridAddRowDef(VisualNodeId id, GridUnitType unit, float value);
@@ -646,6 +700,16 @@ public:
     bool SetBoxGradients(VisualNodeId id, std::int32_t bgGradId, std::int32_t borderGradId) noexcept;
     bool SetBoxBrushOpacity(VisualNodeId id, float bgOpacity) noexcept;
     bool SetBoxShadow(VisualNodeId id, bool isBoxShadow) noexcept;
+    bool SetBoxColors(VisualNodeId id, std::uint32_t bgRgba, std::uint32_t borderRgba) noexcept;
+    bool SetBorderThickness(VisualNodeId id, float l, float t, float r, float b) noexcept;
+    bool SetCornerRadius(VisualNodeId id, float tl, float tr, float br, float bl) noexcept;
+    bool SetTransformOrigin(VisualNodeId id, float ox, float oy) noexcept;
+    bool SetNodeVisualFlags(
+        VisualNodeId id,
+        bool suppressPadding,
+        bool suppressBoxVisual,
+        bool includeBorderInPadding) noexcept;
+    [[nodiscard]] float GetNodeGeometryFloat(VisualNodeId id, std::int32_t propCode) const noexcept;
     bool SetTransform2D(
         VisualNodeId id,
         float tx,
@@ -773,6 +837,30 @@ public:
         Stretch stretch,
         StretchDirection stretchDir,
         std::uint32_t tintRgba);
+    bool SetPlasmaImage(
+        VisualNodeId id,
+        float sx,
+        float sy,
+        float timeSec,
+        float seed,
+        std::uint32_t colorRgba,
+        float vw,
+        float vh,
+        Stretch stretch,
+        StretchDirection stretchDir,
+        std::uint32_t tintRgba);
+    bool SetRiveParams(
+        VisualNodeId id,
+        std::string_view assetPath,
+        std::uint32_t instanceId,
+        float tLoopSec,
+        float tStateSec,
+        float reqW,
+        float reqH,
+        Stretch stretch,
+        std::uint32_t tintRgba);
+    bool ClearRiveInputs(VisualNodeId id);
+    bool SetRiveInput(VisualNodeId id, std::string_view inputName, float value);
     bool SetImageViewbox(
         VisualNodeId id,
         float vx,
@@ -834,6 +922,9 @@ public:
     std::size_t FlushTrackB();
 
     void MarkDirty(VisualNodeId id, VisualDirtyFlags flags) noexcept;
+    void MarkBindingPropDirty(VisualNodeId id) noexcept;
+    [[nodiscard]] std::int32_t BeginConsumeDirtyBindingPropNodes();
+    [[nodiscard]] ObjectRef GetConsumedDirtyBindingPropOwner(std::size_t idx) const noexcept;
     [[nodiscard]] bool HasAnyDirty() const noexcept { return anyDirty_; }
     [[nodiscard]] bool HasLayoutOrTransformDirty() const noexcept { return layoutOrTransformDirty_; }
     [[nodiscard]] bool IsStructureDirty() const noexcept { return structureDirty_; }
@@ -904,6 +995,9 @@ private:
     bool layoutOrTransformDirty_ = true;
     bool structureDirty_ = true;
     std::vector<VisualNodeId> dirtyNodes_;
+    std::vector<VisualNodeId> dirtyBindingPropNodes_;
+    std::vector<VisualNodeId> consumedDirtyBindingPropNodes_;
+    bool dirtyBindingPropOverflow_ = false;
     std::vector<VisualEcsColumnBinding> ecsBindings_;
 
     Size lastViewportSize_{

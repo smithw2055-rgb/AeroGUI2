@@ -10,6 +10,7 @@
 #include "aero/asset/GradientBrush.hpp"
 #include "aero/core/UIResourceStore.hpp"
 #include "aero/render/FontAtlas.hpp"
+#include "aero/render/RiveRenderer.hpp"
 #include "aero/visual/VisualAnimationEngine.hpp"
 
 namespace aero {
@@ -221,6 +222,7 @@ void VisualWorld::DestroySubtreeDetached(VisualNodeId id) noexcept {
     node->extras.reset();
     node->alive = false;
     SyncCanvasDrawRegistration(*node);
+    node->inDirtyBindingPropList = false;
     node->drawDirty = false;
     node->dirtyFlags = VisualDirty_Clean;
     freeIndices_.push_back(id.index);
@@ -662,6 +664,15 @@ bool VisualWorld::SetInteractiveFlags(
     return true;
 }
 
+bool VisualWorld::SetHitTestBorderOnly(
+    VisualNodeId id,
+    bool borderOnly) noexcept {
+    VisualNode* node = GetNode(id);
+    if (!node) return false;
+    node->layout.hitTestBorderOnly = borderOnly;
+    return true;
+}
+
 bool VisualWorld::SetLayoutMode(
     VisualNodeId id,
     LayoutMode mode,
@@ -883,6 +894,128 @@ bool VisualWorld::SetBoxStyle(
     node->box.cornerRadius = nextCr;
     MarkDirty(id, VisualDirty_Visual);
     return true;
+}
+
+bool VisualWorld::SetBoxColors(
+    VisualNodeId id,
+    std::uint32_t bgRgba,
+    std::uint32_t borderRgba) noexcept {
+    VisualNode* node = GetNode(id);
+    if (!node) return false;
+    if (node->box.bgRgba == bgRgba && node->box.borderRgba == borderRgba) {
+        return true;
+    }
+    node->box.bgRgba = bgRgba;
+    node->box.borderRgba = borderRgba;
+    MarkDirty(id, VisualDirty_Visual);
+    return true;
+}
+
+bool VisualWorld::SetBorderThickness(
+    VisualNodeId id,
+    float l,
+    float t,
+    float r,
+    float b) noexcept {
+    VisualNode* node = GetNode(id);
+    if (!node) return false;
+    const Thickness next{l, t, r, b};
+    if (SameThicknessExact(node->box.borderThickness, next)) {
+        return true;
+    }
+    node->box.borderThickness = next;
+    MarkDirty(id, VisualDirty_Visual);
+    if (node->layout.includeBorderInPadding) {
+        MarkAncestorsDirty(id, VisualDirty_Layout);
+    }
+    return true;
+}
+
+bool VisualWorld::SetCornerRadius(
+    VisualNodeId id,
+    float tl,
+    float tr,
+    float br,
+    float bl) noexcept {
+    VisualNode* node = GetNode(id);
+    if (!node) return false;
+    const CornerRadius next{tl, tr, br, bl};
+    if (SameCornerRadiusExact(node->box.cornerRadius, next)) {
+        return true;
+    }
+    node->box.cornerRadius = next;
+    MarkDirty(id, VisualDirty_Visual);
+    return true;
+}
+
+bool VisualWorld::SetTransformOrigin(VisualNodeId id, float ox, float oy) noexcept {
+    VisualNode* node = GetNode(id);
+    if (!node) return false;
+    if (node->transform2D.originX == ox && node->transform2D.originY == oy) {
+        return true;
+    }
+    node->transform2D.originX = ox;
+    node->transform2D.originY = oy;
+    MarkDirty(id, static_cast<VisualDirtyFlags>(VisualDirty_Transform | VisualDirty_Visual));
+    return true;
+}
+
+bool VisualWorld::SetNodeVisualFlags(
+    VisualNodeId id,
+    bool suppressPadding,
+    bool suppressBoxVisual,
+    bool includeBorderInPadding) noexcept {
+    VisualNode* node = GetNode(id);
+    if (!node) return false;
+    const bool padChanged = (node->layout.suppressNativePadding != suppressPadding) ||
+                            (node->layout.includeBorderInPadding != includeBorderInPadding);
+    const bool boxChanged = (node->layout.suppressNativeBoxVisual != suppressBoxVisual);
+    if (!padChanged && !boxChanged) {
+        return true;
+    }
+    node->layout.suppressNativePadding = suppressPadding;
+    node->layout.suppressNativeBoxVisual = suppressBoxVisual;
+    node->layout.includeBorderInPadding = includeBorderInPadding;
+    if (padChanged) {
+        MarkAncestorsDirty(id, VisualDirty_Layout);
+    }
+    if (boxChanged) {
+        MarkDirty(id, VisualDirty_Visual);
+    }
+    return true;
+}
+
+float VisualWorld::GetNodeGeometryFloat(VisualNodeId id, std::int32_t propCode) const noexcept {
+    const VisualNode* node = GetNode(id);
+    if (!node) {
+        return (propCode == 16 || propCode == 17) ? 0.5f : 0.0f;
+    }
+    switch (propCode) {
+    case 0: return node->layout.margin.left;
+    case 1: return node->layout.margin.top;
+    case 2: return node->layout.margin.right;
+    case 3: return node->layout.margin.bottom;
+    case 4: return node->layout.padding.left;
+    case 5: return node->layout.padding.top;
+    case 6: return node->layout.padding.right;
+    case 7: return node->layout.padding.bottom;
+    case 8: return node->box.borderThickness.left;
+    case 9: return node->box.borderThickness.top;
+    case 10: return node->box.borderThickness.right;
+    case 11: return node->box.borderThickness.bottom;
+    case 12: return node->box.cornerRadius.topLeft;
+    case 13: return node->box.cornerRadius.topRight;
+    case 14: return node->box.cornerRadius.bottomRight;
+    case 15: return node->box.cornerRadius.bottomLeft;
+    case 16: return node->transform2D.originX;
+    case 17: return node->transform2D.originY;
+    case 18:
+        return (node->box.borderThickness.left > 0.0f ||
+                node->box.borderThickness.top > 0.0f ||
+                node->box.borderThickness.right > 0.0f ||
+                node->box.borderThickness.bottom > 0.0f) ? 1.0f : 0.0f;
+    default: return 0.0f;
+    }
 }
 
 bool VisualWorld::SetBoxGradients(VisualNodeId id, std::int32_t bgGradId, std::int32_t borderGradId) noexcept {
@@ -1609,14 +1742,17 @@ bool VisualWorld::SetImage(
     if (!node) return false;
     const bool hadImg = node->HasImageData();
     auto& img = node->EnsureImageData();
-    if (hadImg &&
+    const bool hadSpecial = img.plasma.active || img.rive.active;
+    if (hadImg && !hadSpecial &&
         img.uri == uri &&
         img.stretch == stretch &&
         img.stretchDir == stretchDir &&
         img.tintRgba == tintRgba) {
         return true;
     }
-    const bool layoutChanged = !hadImg || (img.uri != uri) || (img.stretch != stretch) || (img.stretchDir != stretchDir);
+    const bool layoutChanged = !hadImg || hadSpecial || (img.uri != uri) || (img.stretch != stretch) || (img.stretchDir != stretchDir);
+    img.plasma.active = false;
+    img.rive.active = false;
     img.uri.assign(uri);
     img.stretch = stretch;
     img.stretchDir = stretchDir;
@@ -1624,6 +1760,155 @@ bool VisualWorld::SetImage(
     if (layoutChanged) {
         MarkAncestorsDirty(id, VisualDirty_All);
     } else {
+        MarkDirty(id, VisualDirty_Visual);
+    }
+    return true;
+}
+
+bool VisualWorld::SetPlasmaImage(
+    VisualNodeId id,
+    float sx,
+    float sy,
+    float timeSec,
+    float seed,
+    std::uint32_t colorRgba,
+    float vw,
+    float vh,
+    Stretch stretch,
+    StretchDirection stretchDir,
+    std::uint32_t tintRgba) {
+    VisualNode* node = GetNode(id);
+    if (!node) return false;
+    const bool hadImg = node->HasImageData();
+    auto& img = node->EnsureImageData();
+    const bool wasPlasma = img.plasma.active;
+    const float clSx = std::max(4.0f, sx);
+    const float clSy = std::max(4.0f, sy);
+    const float clVw = std::clamp(vw, 32.0f, 512.0f);
+    const float clVh = std::clamp(vh, 16.0f, 512.0f);
+    if (hadImg && wasPlasma &&
+        img.plasma.sx == clSx &&
+        img.plasma.sy == clSy &&
+        img.plasma.timeSec == timeSec &&
+        img.plasma.seed == seed &&
+        img.plasma.colorRgba == colorRgba &&
+        img.plasma.vw == clVw &&
+        img.plasma.vh == clVh &&
+        img.stretch == stretch &&
+        img.stretchDir == stretchDir &&
+        img.tintRgba == tintRgba) {
+        return true;
+    }
+    const bool layoutChanged =
+        !hadImg || !wasPlasma ||
+        img.stretch != stretch || img.stretchDir != stretchDir ||
+        img.plasma.vw != clVw || img.plasma.vh != clVh;
+    img.uri.clear();
+    img.rive.active = false;
+    img.plasma.active = true;
+    img.plasma.sx = clSx;
+    img.plasma.sy = clSy;
+    img.plasma.timeSec = timeSec;
+    img.plasma.seed = seed;
+    img.plasma.colorRgba = colorRgba;
+    img.plasma.vw = clVw;
+    img.plasma.vh = clVh;
+    img.stretch = stretch;
+    img.stretchDir = stretchDir;
+    img.tintRgba = tintRgba;
+    if (layoutChanged) {
+        MarkAncestorsDirty(id, VisualDirty_All);
+    } else {
+        MarkDirty(id, VisualDirty_Visual);
+    }
+    return true;
+}
+
+bool VisualWorld::SetRiveParams(
+    VisualNodeId id,
+    std::string_view assetPath,
+    std::uint32_t instanceId,
+    float tLoopSec,
+    float tStateSec,
+    float reqW,
+    float reqH,
+    Stretch stretch,
+    std::uint32_t tintRgba) {
+    VisualNode* node = GetNode(id);
+    if (!node) return false;
+    const bool hadImg = node->HasImageData();
+    auto& img = node->EnsureImageData();
+    const bool wasRive = img.rive.active;
+    if (hadImg && wasRive &&
+        img.rive.assetPath == assetPath &&
+        img.rive.instanceId == instanceId &&
+        img.rive.tLoopSec == tLoopSec &&
+        img.rive.tStateSec == tStateSec &&
+        img.rive.reqW == reqW &&
+        img.rive.reqH == reqH &&
+        img.stretch == stretch &&
+        img.tintRgba == tintRgba) {
+        return true;
+    }
+    const bool layoutChanged =
+        !hadImg || !wasRive ||
+        img.rive.assetPath != assetPath ||
+        img.stretch != stretch ||
+        img.rive.reqW != reqW ||
+        img.rive.reqH != reqH;
+    img.uri.clear();
+    img.plasma.active = false;
+    img.rive.active = true;
+    img.rive.assetPath.assign(assetPath);
+    img.rive.instanceId = instanceId;
+    img.rive.tLoopSec = tLoopSec;
+    img.rive.tStateSec = tStateSec;
+    img.rive.reqW = reqW;
+    img.rive.reqH = reqH;
+    img.stretch = stretch;
+    img.stretchDir = StretchDirection::Both;
+    img.tintRgba = tintRgba;
+    if (layoutChanged) {
+        MarkAncestorsDirty(id, VisualDirty_All);
+    } else {
+        MarkDirty(id, VisualDirty_Visual);
+    }
+    return true;
+}
+
+bool VisualWorld::ClearRiveInputs(VisualNodeId id) {
+    VisualNode* node = GetNode(id);
+    if (!node) return false;
+    auto& img = node->EnsureImageData();
+    if (!img.rive.inputs.empty()) {
+        img.rive.inputs.clear();
+        ++img.rive.inputsRevision;
+        if (img.rive.active) {
+            MarkDirty(id, VisualDirty_Visual);
+        }
+    }
+    return true;
+}
+
+bool VisualWorld::SetRiveInput(VisualNodeId id, std::string_view inputName, float value) {
+    VisualNode* node = GetNode(id);
+    if (!node || inputName.empty()) return false;
+    auto& img = node->EnsureImageData();
+    for (auto& kv : img.rive.inputs) {
+        if (kv.first == inputName) {
+            if (kv.second != value) {
+                kv.second = value;
+                ++img.rive.inputsRevision;
+                if (img.rive.active) {
+                    MarkDirty(id, VisualDirty_Visual);
+                }
+            }
+            return true;
+        }
+    }
+    img.rive.inputs.emplace_back(std::string(inputName), value);
+    ++img.rive.inputsRevision;
+    if (img.rive.active) {
         MarkDirty(id, VisualDirty_Visual);
     }
     return true;
@@ -2016,6 +2301,61 @@ void VisualWorld::MarkDirty(VisualNodeId id, VisualDirtyFlags flags) noexcept {
     }
 }
 
+void VisualWorld::MarkBindingPropDirty(VisualNodeId id) noexcept {
+    if (dirtyBindingPropOverflow_) {
+        return;
+    }
+    VisualNode* node = GetNode(id);
+    if (!node || !node->alive || !node->hasScriptOwner || !node->scriptOwner.valid() ||
+        node->inDirtyBindingPropList) {
+        return;
+    }
+    if (dirtyBindingPropNodes_.size() >= 512u) {
+        dirtyBindingPropOverflow_ = true;
+        for (const VisualNodeId prevId : dirtyBindingPropNodes_) {
+            if (VisualNode* prevNode = GetNode(prevId)) {
+                prevNode->inDirtyBindingPropList = false;
+            }
+        }
+        dirtyBindingPropNodes_.clear();
+        return;
+    }
+    node->inDirtyBindingPropList = true;
+    dirtyBindingPropNodes_.push_back(id);
+}
+
+std::int32_t VisualWorld::BeginConsumeDirtyBindingPropNodes() {
+    consumedDirtyBindingPropNodes_.clear();
+    if (dirtyBindingPropOverflow_) {
+        dirtyBindingPropOverflow_ = false;
+        for (const VisualNodeId id : dirtyBindingPropNodes_) {
+            if (VisualNode* node = GetNode(id)) {
+                node->inDirtyBindingPropList = false;
+            }
+        }
+        dirtyBindingPropNodes_.clear();
+        return -1;
+    }
+    for (const VisualNodeId id : dirtyBindingPropNodes_) {
+        if (VisualNode* node = GetNode(id)) {
+            node->inDirtyBindingPropList = false;
+        }
+    }
+    consumedDirtyBindingPropNodes_.swap(dirtyBindingPropNodes_);
+    return static_cast<std::int32_t>(consumedDirtyBindingPropNodes_.size());
+}
+
+ObjectRef VisualWorld::GetConsumedDirtyBindingPropOwner(std::size_t idx) const noexcept {
+    if (idx >= consumedDirtyBindingPropNodes_.size()) {
+        return ObjectRef{};
+    }
+    const VisualNode* node = GetNode(consumedDirtyBindingPropNodes_[idx]);
+    if (!node || !node->alive || !node->hasScriptOwner) {
+        return ObjectRef{};
+    }
+    return node->scriptOwner;
+}
+
 void VisualWorld::ClearDirtyFlags() noexcept {
     if (!structureDirty_ && !dirtyNodes_.empty() && dirtyNodes_.size() * 2u < nodes_.size()) {
         for (VisualNodeId id : dirtyNodes_) {
@@ -2046,6 +2386,7 @@ void VisualWorld::Clear() noexcept {
         node.pinnedOwnerRoot.reset();
         node.scriptOwner = ObjectRef{};
         node.hasScriptOwner = false;
+        node.inDirtyBindingPropList = false;
         if (node.nativeHandle.valid()) {
             (void)handleRegistry_->release(node.nativeHandle);
             node.nativeHandle = NativeHandle{};
@@ -2086,6 +2427,9 @@ void VisualWorld::Clear() noexcept {
     rootId_ = VisualNodeId{};
     liveCount_ = 0u;
     dirtyNodes_.clear();
+    dirtyBindingPropNodes_.clear();
+    consumedDirtyBindingPropNodes_.clear();
+    dirtyBindingPropOverflow_ = false;
     structureDirty_ = true;
     layoutOrTransformDirty_ = true;
     ++structureVersion_;

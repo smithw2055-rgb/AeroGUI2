@@ -2503,6 +2503,11 @@ AeroGLuint OpenGlDeviceBackend::ResolveBatchImageTexture(
         }
     }
     fullSnapshot.reset();
+    if (needsAlloc &&
+        textureId != ImageAtlas::kSharedUiAtlasTextureId &&
+        !slot.isExternal) {
+        (void)imageAtlas.EvictStandaloneCpuPixelsAfterGpuUpload(textureId, slot.slotRevision);
+    }
     if (imageUploadScratchRgba8_.capacity() > 256u * 1024u) {
         std::vector<std::uint8_t>().swap(imageUploadScratchRgba8_);
     }
@@ -4155,6 +4160,10 @@ void SoftwareSurfaceBackend::Shutdown() noexcept {
     framebufferHeight_ = 0u;
     lastRenderedTreeId_ = 0xFFFFFFFFu;
     lastRenderedNodeCount_ = 0u;
+    lastPageBounds_.clear();
+    lastPageRevisions_.clear();
+    lastPageQuads_.clear();
+    lastDirtyStats_ = SoftwareDirtyRectStats{};
     quadIndexMirror_.clear();
     atlasRgba8_.clear();
     framebufferRgba8_.clear();
@@ -4323,12 +4332,136 @@ GpuBackendFrameStats SoftwareSurfaceBackend::ExecuteSubmission(
         treeChanged ||
         clearedToEmpty ||
         framebufferRgba8_.empty()) {
-        ZeroCopyGpuStream::RasterizeTreeToRgba8(
-            tree,
-            viewportWidth,
-            viewportHeight,
-            framebufferRgba8_,
-            clearColor);
+        const std::size_t curPages = tree.PageCount();
+        const bool canUseDirtyRects =
+            !viewportChanged &&
+            !clearChanged &&
+            !treeChanged &&
+            !clearedToEmpty &&
+            !framebufferRgba8_.empty() &&
+            tree.BlurLayerSpans().empty() &&
+            curPages > 0u &&
+            curPages == lastPageBounds_.size() &&
+            curPages == lastPageRevisions_.size();
+
+        auto makeQuadSnap = [](const CommandPage& pg, std::size_t q) noexcept {
+            SoftwareSurfaceBackend::CachedQuadSnapshot snap{};
+            const std::size_t vIdx = q * 4u;
+            if (vIdx + 4u > pg.header.vertexCount || vIdx + 4u > kVerticesPerCommandPage) {
+                return snap;
+            }
+            const auto* bytes = reinterpret_cast<const unsigned char*>(&pg.vertices[vIdx]);
+            std::uint64_t h = 14695981039346656037ull;
+            for (std::size_t bi = 0u; bi < sizeof(AeroVertex) * 4u; ++bi) {
+                h ^= static_cast<std::uint64_t>(bytes[bi]);
+                h *= 1099511628211ull;
+            }
+            snap.vertexHash = h;
+            float minX = 1e30f, minY = 1e30f, maxX = -1e30f, maxY = -1e30f;
+            bool anyOpaque = false;
+            for (std::size_t k = 0u; k < 4u; ++k) {
+                const AeroVertex& v = pg.vertices[vIdx + k];
+                if ((v.rgba & 0xFF000000u) == 0u) {
+                    continue;
+                }
+                if (std::isfinite(v.x) && std::isfinite(v.y)) {
+                    minX = std::min(minX, v.x);
+                    minY = std::min(minY, v.y);
+                    maxX = std::max(maxX, v.x);
+                    maxY = std::max(maxY, v.y);
+                    anyOpaque = true;
+                }
+            }
+            if (anyOpaque && maxX >= minX && maxY >= minY) {
+                snap.bounds = Rect{minX, minY, std::max(0.1f, maxX - minX), std::max(0.1f, maxY - minY)};
+                snap.valid = true;
+            }
+            return snap;
+        };
+
+        if (canUseDirtyRects && lastPageQuads_.size() == curPages) {
+            std::vector<Rect> dirtyRects;
+            auto addPaddedBound = [&](const Rect& r) {
+                if (r.width > 0.0f && r.height > 0.0f) {
+                    dirtyRects.push_back(Rect{r.x - 2.0f, r.y - 2.0f, r.width + 4.0f, r.height + 4.0f});
+                }
+            };
+            std::vector<std::uint8_t> visitedPage(curPages, 0u);
+            for (const GlBufferSubDataSpan& span : uploadSpans) {
+                if (span.pageIndex < curPages) {
+                    visitedPage[span.pageIndex] = 1u;
+                }
+            }
+            for (std::size_t p = 0u; p < curPages; ++p) {
+                const std::uint32_t curRev = tree.GetPage(p).header.dirtyRevision;
+                if (visitedPage[p] == 0u && curRev != lastPageRevisions_[p]) {
+                    visitedPage[p] = 1u;
+                }
+                if (visitedPage[p] != 0u) {
+                    const CommandPage& pg = tree.GetPage(p);
+                    const std::size_t qLimit = std::min<std::size_t>(
+                        64u, std::max<std::size_t>(pg.header.vertexCount / 4u, 0u));
+                    bool anyQuadDiff = false;
+                    for (std::size_t q = 0u; q < 64u; ++q) {
+                        const auto& prevQ = lastPageQuads_[p][q];
+                        const auto curQ = (q < qLimit) ? makeQuadSnap(pg, q) : CachedQuadSnapshot{};
+                        if (prevQ.valid != curQ.valid || prevQ.vertexHash != curQ.vertexHash) {
+                            anyQuadDiff = true;
+                            if (prevQ.valid) addPaddedBound(prevQ.bounds);
+                            if (curQ.valid) addPaddedBound(curQ.bounds);
+                        }
+                        lastPageQuads_[p][q] = curQ;
+                    }
+                    Rect curB{};
+                    const bool ok = tree.ComputePageScreenBoundsConst(p, curB);
+                    if (!anyQuadDiff) {
+                        if (lastPageBounds_[p].first) {
+                            addPaddedBound(lastPageBounds_[p].second);
+                        }
+                        if (ok) {
+                            addPaddedBound(curB);
+                        }
+                    }
+                    lastPageBounds_[p] = {ok, curB};
+                    lastPageRevisions_[p] = curRev;
+                }
+            }
+            ZeroCopyGpuStream::RasterizeTreeDirtyRectsToRgba8(
+                tree,
+                viewportWidth,
+                viewportHeight,
+                dirtyRects,
+                framebufferRgba8_,
+                clearColor,
+                &lastDirtyStats_);
+        } else {
+            ZeroCopyGpuStream::RasterizeTreeToRgba8(
+                tree,
+                viewportWidth,
+                viewportHeight,
+                framebufferRgba8_,
+                clearColor);
+            const std::uint32_t tilesX = (viewportWidth + 63u) / 64u;
+            const std::uint32_t tilesY = (viewportHeight + 63u) / 64u;
+            lastDirtyStats_.totalTiles = tilesX * tilesY;
+            lastDirtyStats_.dirtyTiles = lastDirtyStats_.totalTiles;
+            lastDirtyStats_.mergedStrips = (lastDirtyStats_.totalTiles > 0u) ? 1u : 0u;
+            lastDirtyStats_.fellBackToFullFrame = true;
+            lastPageBounds_.resize(curPages);
+            lastPageRevisions_.resize(curPages);
+            lastPageQuads_.resize(curPages);
+            for (std::size_t p = 0u; p < curPages; ++p) {
+                const CommandPage& pg = tree.GetPage(p);
+                Rect b{};
+                const bool ok = tree.ComputePageScreenBoundsConst(p, b);
+                lastPageBounds_[p] = {ok, b};
+                lastPageRevisions_[p] = pg.header.dirtyRevision;
+                const std::size_t qLimit = std::min<std::size_t>(64u, pg.header.vertexCount / 4u);
+                for (std::size_t q = 0u; q < 64u; ++q) {
+                    lastPageQuads_[p][q] = (q < qLimit) ? makeQuadSnap(pg, q) : CachedQuadSnapshot{};
+                }
+            }
+        }
         framebufferWidth_ = viewportWidth;
         framebufferHeight_ = viewportHeight;
         lastClearColor_ = clearColor;

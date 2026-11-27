@@ -112,6 +112,10 @@ public class ItemsPanelTemplate : DependencyObject {
         ItemsPanelTemplate self = this;
         return () => { return self.CreatePanelScoped(); };
     }
+    public static Func<Panel> GetFactoryOrNull(object obj) {
+        ItemsPanelTemplate t = obj as ItemsPanelTemplate;
+        return t != null ? t.GetFactory() : null;
+    }
     public Func<Panel> Factory {
         get { return _factory; }
         set { _factory = value; }
@@ -129,8 +133,11 @@ public class ItemsControl : Control {
 
     private bool _virtualizing = false;
     private float _estimatedItemHeight = 32.0f;
+    private float _estimatedItemWidth = 120.0f;
     private int _virtFirstIndex = 0;
     private int _virtLastIndex = -1;
+    private float _virtLastViewportW = -1.0f;
+    private int _virtLastItemsPerRow = 1;
 
     protected ItemsPresenter _itemsPresenter;
     protected Panel _directItemsHost;
@@ -186,11 +193,27 @@ public class ItemsControl : Control {
     }
     public bool IsVirtualizing {
         get { return _virtualizing; }
-        set { _virtualizing = value; RefreshItems(); }
+        set {
+            _virtualizing = value;
+            if (!value) {
+                Panel host = EnsureItemsHostPanel();
+                if (host is IVirtualizingItemsPanel) {
+                    (host as IVirtualizingItemsPanel).ResetVirtualWindowPadding();
+                }
+            }
+            RefreshItems();
+        }
+    }
+    public Panel ItemsHostPanel {
+        get { return EnsureItemsHostPanel(); }
     }
     public float EstimatedItemHeight {
         get { return _estimatedItemHeight; }
         set { _estimatedItemHeight = value > 8.0f ? value : 32.0f; }
+    }
+    public float EstimatedItemWidth {
+        get { return _estimatedItemWidth; }
+        set { _estimatedItemWidth = value > 16.0f ? value : 120.0f; }
     }
 
     public int ItemCount() {
@@ -489,32 +512,61 @@ public class ItemsControl : Control {
     }
 
     protected virtual bool IsContainerRecyclable(UIElement c) {
+        if (c != null && DragDrop.IsElementInActiveDrag(c)) { return false; }
         return true;
     }
 
-    public void UpdateVirtualizedViewport(float scrollY, float viewportHeight) {
-        if (!_virtualizing || EnsureItemsHostPanel() == null) {
+    public void UpdateVirtualizedViewport(float scrollY, float viewportHeight, float viewportWidth = 0.0f) {
+        Panel host = EnsureItemsHostPanel();
+        if (!_virtualizing || host == null) {
             RefreshItems();
             return;
         }
+        IVirtualizingItemsPanel vp = null;
+        if (host is IVirtualizingItemsPanel) { vp = host as IVirtualizingItemsPanel; }
         int total = ItemCount();
         if (total == 0) {
+            if (vp != null) { vp.ResetVirtualWindowPadding(); }
             RecycleActiveContainers();
             _virtFirstIndex = 0;
             _virtLastIndex = -1;
             return;
         }
+        float vw = viewportWidth > 0.0f ? viewportWidth : (ActualWidth > 0.0f ? ActualWidth : (Width > 0.0f ? Width : 600.0f));
         float vh = viewportHeight > 0.0f ? viewportHeight : 400.0f;
-        int first = (int)(scrollY / _estimatedItemHeight) - 2;
-        if (first < 0) { first = 0; }
-        int visCount = (int)(vh / _estimatedItemHeight) + 5;
-        int last = first + visCount;
+        float effItemH = _estimatedItemHeight;
+        float effItemW = _estimatedItemWidth;
+        if (_activeContainers != null && _activeContainers.Length > 0 && _activeContainers[0] != null) {
+            UIElement sampleContainer = _activeContainers[0];
+            float sh = sampleContainer.Height > 8.0f ? sampleContainer.Height : sampleContainer.ActualHeight;
+            if (sh > 8.0f) { effItemH = sh; }
+            float sw = sampleContainer.Width > 16.0f ? sampleContainer.Width : sampleContainer.ActualWidth;
+            if (sw > 16.0f) { effItemW = sw; }
+        }
+        int itemsPerRow = vp != null ? vp.ComputeItemsPerRow(vw, effItemW) : 1;
+        if (itemsPerRow < 1) { itemsPerRow = 1; }
+        float rowStride = vp != null ? vp.ComputeRowStride(effItemH) : _estimatedItemHeight;
+        if (rowStride < 8.0f) { rowStride = 8.0f; }
+        int totalRows = (total + itemsPerRow - 1) / itemsPerRow;
+        int firstRow = (int)(scrollY / rowStride) - 1;
+        if (firstRow < 0) { firstRow = 0; }
+        int visRows = (int)(vh / rowStride) + 3;
+        int lastRow = firstRow + visRows;
+        if (lastRow >= totalRows) { lastRow = totalRows - 1; }
+        int first = firstRow * itemsPerRow;
+        int last = (lastRow + 1) * itemsPerRow - 1;
         if (last >= total) { last = total - 1; }
-        if (first == _virtFirstIndex && last == _virtLastIndex && _activeContainers != null && _activeContainers.Length > 0) {
+        if (vp != null) {
+            vp.ApplyVirtualWindowPadding(firstRow, lastRow, totalRows, rowStride);
+        }
+        if (first == _virtFirstIndex && last == _virtLastIndex && itemsPerRow == _virtLastItemsPerRow &&
+            _activeContainers != null && _activeContainers.Length > 0) {
             return;
         }
         _virtFirstIndex = first;
         _virtLastIndex = last;
+        _virtLastViewportW = vw;
+        _virtLastItemsPerRow = itemsPerRow;
         BuildContainerRange(first, last);
     }
 
@@ -559,14 +611,16 @@ public class ItemsControl : Control {
 
     protected void TryAttachVirtualizingScroll(Panel host) {
         if (host == null || _virtScrollHooked) { return; }
-        if (host.GetTypeName() != "VirtualizingStackPanel") { return; }
+        if (!(host is IVirtualizingItemsPanel)) { return; }
+        if (!(host as IVirtualizingItemsPanel).IsVirtualizingEnabled()) { return; }
         ScrollViewer sv = FindItemsControlScrollViewer(host, this);
         if (sv == null) { return; }
         _virtScrollHooked = true;
         sv.ScrollChanged += (object s, ScrollEventArgs e) => {
             if (!_isDisposedTree && _virtualizing && !ShouldDeferItemsMaterialization()) {
                 float vh = sv.ViewportHeight > 0.0f ? sv.ViewportHeight : (ActualHeight > 0.0f ? ActualHeight : 600.0f);
-                UpdateVirtualizedViewport(sv.VerticalOffset, vh);
+                float vw = sv.ViewportWidth > 0.0f ? sv.ViewportWidth : (ActualWidth > 0.0f ? ActualWidth : 0.0f);
+                UpdateVirtualizedViewport(sv.VerticalOffset, vh, vw);
             }
         };
     }
@@ -585,16 +639,22 @@ public class ItemsControl : Control {
         _deferredItemsPending = false;
         _itemsRefreshDeferred = false;
         Panel hostPanel = EnsureItemsHostPanel();
-        if (!_virtualizing && total > 12 && hostPanel != null && hostPanel.GetTypeName() == "VirtualizingStackPanel") {
+        bool supportsVirt = (hostPanel is IVirtualizingItemsPanel) &&
+                            (hostPanel as IVirtualizingItemsPanel).IsVirtualizingEnabled();
+        if (!_virtualizing && total > 12 && supportsVirt) {
             TryAttachVirtualizingScroll(hostPanel);
             if (_virtScrollHooked) {
                 _virtualizing = true;
             }
         }
-        if (_virtualizing && total > 12) {
+        if (_virtualizing && supportsVirt && total > 12) {
             float initVh = ActualHeight > 0.0f ? ActualHeight : (Height > 0.0f ? Height : 600.0f);
-            UpdateVirtualizedViewport(0.0f, initVh);
+            float initVw = ActualWidth > 0.0f ? ActualWidth : (Width > 0.0f ? Width : 0.0f);
+            UpdateVirtualizedViewport(0.0f, initVh, initVw);
             return;
+        }
+        if (supportsVirt) {
+            (hostPanel as IVirtualizingItemsPanel).ResetVirtualWindowPadding();
         }
         BuildContainerRange(0, total - 1);
     }
@@ -1377,7 +1437,7 @@ public class ListBox : Selector {
         _scrollViewer.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
         _scrollViewer.ScrollChanged += (object s, ScrollEventArgs e) => {
             if (IsVirtualizing) {
-                UpdateVirtualizedViewport(_scrollViewer.VerticalOffset, _scrollViewer.ViewportHeight);
+                UpdateVirtualizedViewport(_scrollViewer.VerticalOffset, _scrollViewer.ViewportHeight, _scrollViewer.ViewportWidth);
             }
         };
 
@@ -2413,15 +2473,18 @@ public class ComboBox : Selector {
             return;
         }
         if (ParseUtil.IsValidHandle(__nativeHandle)) {
-            Visual_SetPadding(__nativeHandle, 0.0f, 0.0f, 0.0f, 0.0f);
+            Visual_SetNodeVisualFlags(__nativeHandle, true, false, false);
         }
         if (_selectionDisplay != null) {
-            Thickness pad = Padding;
-            float l = pad.Left > 0.0f ? pad.Left : 8.0f;
-            float t = pad.Top > 0.0f ? pad.Top : 5.0f;
-            float r = pad.Right > 0.0f ? pad.Right : 6.0f;
-            float b = pad.Bottom > 0.0f ? pad.Bottom : 5.0f;
-            _selectionDisplay.Margin = new Thickness(l, t, r, b);
+            float pl = ParseUtil.IsValidHandle(__nativeHandle) ? Visual_GetNodeFloat(__nativeHandle, 4) : 0.0f;
+            float pt = ParseUtil.IsValidHandle(__nativeHandle) ? Visual_GetNodeFloat(__nativeHandle, 5) : 0.0f;
+            float pr = ParseUtil.IsValidHandle(__nativeHandle) ? Visual_GetNodeFloat(__nativeHandle, 6) : 0.0f;
+            float pb = ParseUtil.IsValidHandle(__nativeHandle) ? Visual_GetNodeFloat(__nativeHandle, 7) : 0.0f;
+            float l = pl > 0.0f ? pl : 8.0f;
+            float t = pt > 0.0f ? pt : 5.0f;
+            float r = pr > 0.0f ? pr : 6.0f;
+            float b = pb > 0.0f ? pb : 5.0f;
+            _selectionDisplay.SetMargin4(l, t, r, b);
         }
     }
 
@@ -2516,7 +2579,7 @@ public class TabItem : HeaderedContentControl {
     public event RoutedEventHandler Unselected;
 
     public TabItem() : base() {
-        Padding = new Thickness(12.0f, 5.0f, 12.0f, 5.0f);
+        SetPadding4(12.0f, 5.0f, 12.0f, 5.0f);
         Focusable = true;
     }
     public TabItem(string headerText, UIElement content = null) : this() {
@@ -2578,9 +2641,13 @@ public class TabItem : HeaderedContentControl {
 
     protected override void SyncPadding() {
         if (Template == null && _headerPresenter != null) {
-            _headerPresenter.Margin = Padding;
             if (ParseUtil.IsValidHandle(__nativeHandle)) {
-                Visual_SetPadding(__nativeHandle, 0.0f, 0.0f, 0.0f, 0.0f);
+                float pl = Visual_GetNodeFloat(__nativeHandle, 4);
+                float pt = Visual_GetNodeFloat(__nativeHandle, 5);
+                float pr = Visual_GetNodeFloat(__nativeHandle, 6);
+                float pb = Visual_GetNodeFloat(__nativeHandle, 7);
+                _headerPresenter.SetMargin4(pl, pt, pr, pb);
+                Visual_SetNodeVisualFlags(__nativeHandle, true, false, false);
             }
             return;
         }
@@ -2643,7 +2710,13 @@ public class TabItem : HeaderedContentControl {
         _headerPresenter.ContentSource = "Header";
         _headerPresenter.HorizontalAlignment = HorizontalAlignment.Center;
         _headerPresenter.VerticalAlignment = VerticalAlignment.Center;
-        _headerPresenter.Margin = Padding;
+        if (ParseUtil.IsValidHandle(__nativeHandle)) {
+            _headerPresenter.SetMargin4(
+                Visual_GetNodeFloat(__nativeHandle, 4),
+                Visual_GetNodeFloat(__nativeHandle, 5),
+                Visual_GetNodeFloat(__nativeHandle, 6),
+                Visual_GetNodeFloat(__nativeHandle, 7));
+        }
         _headerPresenter.ContentTemplate = HeaderTemplate;
         _headerPresenter.SetContentBox(HeaderBox);
 
@@ -2713,11 +2786,15 @@ public class TabControl : Selector {
     }
 
     protected override void SyncPadding() {
-        if (_contentFrame != null) {
-            _contentFrame.Padding = Padding;
+        if (_contentFrame != null && ParseUtil.IsValidHandle(__nativeHandle)) {
+            _contentFrame.SetPadding4(
+                Visual_GetNodeFloat(__nativeHandle, 4),
+                Visual_GetNodeFloat(__nativeHandle, 5),
+                Visual_GetNodeFloat(__nativeHandle, 6),
+                Visual_GetNodeFloat(__nativeHandle, 7));
         }
         if (ParseUtil.IsValidHandle(__nativeHandle)) {
-            Visual_SetPadding(__nativeHandle, 0.0f, 0.0f, 0.0f, 0.0f);
+            Visual_SetNodeVisualFlags(__nativeHandle, true, Template != null, false);
         }
     }
 

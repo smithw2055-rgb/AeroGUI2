@@ -1269,6 +1269,11 @@ public class RiveControl : Control {
     private float _animTime = 0.0f;
     private float _stateTime = 0.0f;
     private string _lastInputsSig = "";
+    private string _cachedCleanSrc = "";
+    private bool _cachedHasInlineQuery = false;
+    private bool _inputsDirty = true;
+    private string[] _cachedInputNames;
+    private float[] _cachedInputVals;
     private static int _nextInstanceId = 1;
     private static RiveControl[] _activeRives;
     private static bool _riveHookInstalled = false;
@@ -1335,6 +1340,13 @@ public class RiveControl : Control {
                 _source = next;
                 _animTime = 0.0f;
                 _stateTime = 0.0f;
+                string clean = _source.Trim();
+                if (clean.Length >= 7 && clean.Substring(0, 7) == "rive://") {
+                    clean = clean.Substring(7);
+                }
+                _cachedCleanSrc = clean;
+                _cachedHasInlineQuery = clean.Contains("?");
+                _inputsDirty = true;
             }
             SyncRiveVisual();
         }
@@ -1350,14 +1362,31 @@ public class RiveControl : Control {
             input._ownerRive = this;
             _inputs.Push(input);
             AddChild(input);
+            _inputsDirty = true;
             OnInputChanged();
         }
     }
 
     internal void OnInputChanged() {
-        string sig = BuildInputsQuery();
-        if (sig != _lastInputsSig) {
-            _lastInputsSig = sig;
+        bool changed = false;
+        int n = _inputs != null ? _inputs.Length : 0;
+        if (_cachedInputNames == null || _cachedInputNames.Length != n) {
+            changed = true;
+            _cachedInputNames = new string[n];
+            _cachedInputVals = new float[n];
+        }
+        for (int i = 0; i < n; i += 1) {
+            RiveInput ri = _inputs[i];
+            string nm = (ri != null && ri.InputName != null) ? ri.InputName : "";
+            float fv = (ri != null && ri.InputValueBox != null) ? DependencyObject.UnboxFloat(ri.InputValueBox, 0.0f) : 0.0f;
+            if (!changed && (_cachedInputNames[i] != nm || _cachedInputVals[i] != fv)) {
+                changed = true;
+            }
+            _cachedInputNames[i] = nm;
+            _cachedInputVals[i] = fv;
+        }
+        if (changed) {
+            _inputsDirty = true;
             _stateTime = 0.0f;
         }
         SyncRiveVisual();
@@ -1396,13 +1425,61 @@ public class RiveControl : Control {
     internal void SyncRiveVisual() {
         if (_imageView == null) { return; }
         _imageView.Stretch = _stretch;
-        string cleanSrc = _source == null ? "" : _source.Trim();
-        if (cleanSrc.Length >= 7 && cleanSrc.Substring(0, 7) == "rive://") {
-            cleanSrc = cleanSrc.Substring(7);
+        if (_cachedCleanSrc.Length == 0 && _source.Length > 0) {
+            string c0 = _source.Trim();
+            if (c0.Length >= 7 && c0.Substring(0, 7) == "rive://") {
+                c0 = c0.Substring(7);
+            }
+            _cachedCleanSrc = c0;
+            _cachedHasInlineQuery = c0.Contains("?");
         }
+        string cleanSrc = _cachedCleanSrc;
         if (cleanSrc.Length == 0) {
             if (_imageView.Source != "") { _imageView.Source = ""; }
             return;
+        }
+        float reqW = 0.0f;
+        float reqH = 0.0f;
+        if (ActualWidth >= 16.0f && ActualHeight >= 16.0f) {
+            float effScale = (Effect != null) ? 0.5f : 1.0f;
+            int tw = (((int)(ActualWidth * effScale) + 15) / 16) * 16;
+            int th = (((int)(ActualHeight * effScale) + 15) / 16) * 16;
+            if (tw < 64) { tw = 64; }
+            if (th < 64) { th = 64; }
+            reqW = (float)tw;
+            reqH = (float)th;
+        }
+        if (!_cachedHasInlineQuery) {
+            string[] rNames = null;
+            DependencyObject[] rVals = null;
+            if (_inputsDirty && _inputs != null && _inputs.Length > 0) {
+                rNames = new string[_inputs.Length];
+                rVals = new DependencyObject[_inputs.Length];
+                for (int riIdx = 0; riIdx < _inputs.Length; riIdx += 1) {
+                    RiveInput ri = _inputs[riIdx];
+                    if (ri != null) {
+                        rNames[riIdx] = ri.InputName;
+                        rVals[riIdx] = ri.InputValueBox;
+                    }
+                }
+            }
+            if (_imageView.ApplyRiveDirect(
+                    cleanSrc,
+                    _instanceId,
+                    _animTime,
+                    _stateTime,
+                    reqW,
+                    reqH,
+                    _stretch,
+                    rNames,
+                    rVals,
+                    _inputsDirty)) {
+                _inputsDirty = false;
+                if (Visibility == Visibility.Visible) {
+                    Host_RequestRenderWake();
+                }
+                return;
+            }
         }
         string inp = BuildInputsQuery();
         if (inp != _lastInputsSig) {
@@ -1410,15 +1487,10 @@ public class RiveControl : Control {
             _stateTime = 0.0f;
         }
         string sizeQ = "";
-        if (ActualWidth >= 16.0f && ActualHeight >= 16.0f) {
-            float effScale = (Effect != null) ? 0.5f : 1.0f;
-            int tw = (((int)(ActualWidth * effScale) + 15) / 16) * 16;
-            int th = (((int)(ActualHeight * effScale) + 15) / 16) * 16;
-            if (tw < 64) { tw = 64; }
-            if (th < 64) { th = 64; }
-            sizeQ = "&__w=" + tw + "&__h=" + th;
+        if (reqW >= 16.0f && reqH >= 16.0f) {
+            sizeQ = "&__w=" + (int)reqW + "&__h=" + (int)reqH;
         }
-        string sep = cleanSrc.Contains("?") ? "&" : "?";
+        string sep = _cachedHasInlineQuery ? "&" : "?";
         string q = sep + "__inst=" + _instanceId +
                    "&__t=" + QuantizeRiveClock(_animTime) +
                    "&__ts=" + QuantizeRiveClock(_stateTime) +
@@ -1671,7 +1743,7 @@ public class ComparisonCondition : DependencyObject {
     }
 }
 
-public class BehaviorTriggerBase : DependencyObject {
+public class BehaviorTriggerBase : DependencyObject, IBehaviorTrigger {
     private TriggerAction[] _actions;
     private ComparisonCondition[] _conditions;
 
@@ -2868,6 +2940,11 @@ public static class DragDrop {
     private static float _dragAdornerHalfH = 56.0f;
     private static bool _hookInstalled = false;
 
+    internal static bool IsElementInActiveDrag(UIElement el) {
+        if (el == null) { return false; }
+        return el == _selectedSource || (_isDragging && el == _pressCandidate);
+    }
+
     public static void EnsureInstalled() {
         if (_hookInstalled) { return; }
         _hookInstalled = true;
@@ -2971,12 +3048,12 @@ public static class DragDrop {
 
     public static void RefreshElementEmpty(UIElement el) {
         if (el == null || el._isDisposedTree) { return; }
-        if (el._ddInitialized && el._ddLastElemEpoch == el._propEpoch && !el._ddLastEmptyPath.Contains(".")) {
-            object cachedItem = DependencyObject.Unbox(el._ddLastItemBox);
+        if (el._rare != null && el._rare.DdInitialized && el._rare.DdLastElemEpoch == el._propEpoch && !el._rare.DdLastEmptyPath.Contains(".")) {
+            object cachedItem = DependencyObject.Unbox(el._rare.DdLastItemBox);
             int fastDm = (cachedItem != null && !(cachedItem is UIElement) && ParseUtil.IsNativeReady())
                 ? Reflect_GetDirtyMask(cachedItem)
                 : (cachedItem == null ? 0 : -1);
-            if (fastDm >= 0 && fastDm == el._ddLastItemVer) {
+            if (fastDm >= 0 && fastDm == el._rare.DdLastItemVer) {
                 return;
             }
         }
@@ -2986,17 +3063,18 @@ public static class DragDrop {
         int dm = (item != null && !(item is UIElement) && ParseUtil.IsNativeReady())
             ? Reflect_GetDirtyMask(item)
             : (item == null ? 0 : -1);
-        if (dm >= 0 && !emptyPath.Contains(".") && emptyPath == el._ddLastEmptyPath &&
-            el._ddLastItemVer == dm && el._ddLastItemBox == itemBox &&
+        UIElementRareData er = el.EnsureRare();
+        if (dm >= 0 && !emptyPath.Contains(".") && emptyPath == er.DdLastEmptyPath &&
+            er.DdLastItemVer == dm && er.DdLastItemBox == itemBox &&
             el.GetPropertyValue("DragDrop.IsContentEmpty") != null &&
             el.GetPropertyValue("DragDrop.IsDropCompatible") != null) {
-            el._ddInitialized = true;
-            el._ddLastElemEpoch = el._propEpoch;
+            er.DdInitialized = true;
+            er.DdLastElemEpoch = el._propEpoch;
             return;
         }
-        el._ddLastEmptyPath = emptyPath;
-        el._ddLastItemBox = itemBox;
-        el._ddLastItemVer = dm;
+        er.DdLastEmptyPath = emptyPath;
+        er.DdLastItemBox = itemBox;
+        er.DdLastItemVer = dm;
         bool empty = ComputeIsEmpty(el);
         DependencyObject cur = el.GetPropertyValue("DragDrop.IsContentEmpty");
         if (cur == null || DependencyObject.UnboxBool(cur, !empty) != empty) {
@@ -3005,8 +3083,8 @@ public static class DragDrop {
         if (el.GetPropertyValue("DragDrop.IsDropCompatible") == null) {
             el.SetPropertyValue("DragDrop.IsDropCompatible", DependencyObject.BoxBool(true));
         }
-        el._ddInitialized = true;
-        el._ddLastElemEpoch = el._propEpoch;
+        er.DdInitialized = true;
+        er.DdLastElemEpoch = el._propEpoch;
     }
 
     public static void RefreshAllContentEmpty() {

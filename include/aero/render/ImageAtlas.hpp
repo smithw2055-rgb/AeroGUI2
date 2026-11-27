@@ -17,6 +17,17 @@ namespace aero {
 
 class UIResourceStore;
 struct RasterizedPathMaskEntry;
+struct RiveRenderRequest;
+
+struct PlasmaRenderParams {
+    float sx = 64.0f;
+    float sy = 64.0f;
+    float seed = 100.0f;
+    float timeSec = 0.0f;
+    float vw = 300.0f;
+    float vh = 90.0f;
+    std::uint32_t colorRgba = 0xFFFFBC01u;
+};
 
 enum class ImageFormat : std::uint8_t {
     Unknown = 0,
@@ -79,9 +90,12 @@ struct TextureSlotBuffer {
     bool isExternalGpuHandle = false;
     bool isAlpha8 = false;
     std::uint32_t externalGpuHandle = 0u;
-    std::vector<std::uint8_t> rgbaPixels;
+    mutable std::vector<std::uint8_t> rgbaPixels;
     mutable std::shared_ptr<const std::vector<std::uint8_t>> pixelSnapshot;
     std::shared_ptr<std::vector<std::uint8_t>> cowAtlasPixels;
+    std::string reloadableFilePath;
+    std::string reloadableMemAssetKey;
+    mutable bool cpuPixelsEvicted = false;
 };
 
 // Pure C++17 zero-dependency RFC1951 DEFLATE & RFC1950 zlib decompression (100% Wasm-ready)
@@ -159,7 +173,9 @@ class ImageAtlas {
 public:
     static constexpr std::uint32_t kSharedUiAtlasTextureId = 0u;
     static constexpr std::uint32_t kDefaultSharedAtlasSize = 512u;
-    static constexpr std::uint32_t kDefaultMaxPackableExtent = 256u;
+    static constexpr std::uint32_t kDefaultMaxPackableExtent = 512u;
+    static constexpr std::uint32_t kDefaultMaxSharedAtlasSize = 2048u;
+    static constexpr std::uint32_t kMaxSharedAtlasPages = 3u;
 
     static ImageAtlas& Instance() noexcept;
 
@@ -179,6 +195,7 @@ public:
     [[nodiscard]] std::uint32_t SharedAtlasSize() const noexcept;
     [[nodiscard]] std::uint32_t MaxPackableWidth() const noexcept;
     [[nodiscard]] std::uint32_t MaxPackableHeight() const noexcept;
+    [[nodiscard]] std::size_t SharedAtlasPageCount() const noexcept;
 
     // Primary XAML base directory & fallback search roots for relative URIs (e.g. "Images/Earth.png")
     void SetBaseDirectory(std::string_view baseDir);
@@ -257,6 +274,17 @@ public:
         std::string_view uri,
         std::string_view localBaseDir = {}) const noexcept;
 
+    // Zero-string-allocation numeric lookup/synthesis paths for animated PlasmaBrush & RiveControl
+    const ImageAtlasEntry* LoadOrGetPlasma(const PlasmaRenderParams& params);
+    const ImageAtlasEntry* LoadOrGetRive(
+        const RiveRenderRequest& request,
+        std::uint64_t inputsRevision,
+        std::string_view localBaseDir = {});
+    [[nodiscard]] const ImageAtlasEntry* FindLoadedRive(
+        std::uint32_t instanceId,
+        std::string_view assetPath,
+        std::string_view localBaseDir = {}) const noexcept;
+
     [[nodiscard]] std::string ResolveUriToPath(
         std::string_view uri,
         std::string_view localBaseDir = {}) const;
@@ -308,6 +336,9 @@ public:
     [[nodiscard]] std::size_t LoadedEntryCount() const noexcept;
     [[nodiscard]] std::size_t StandaloneTextureCount() const noexcept;
     [[nodiscard]] std::size_t EstimatedMemoryBytes() const noexcept;
+    bool EvictStandaloneCpuPixelsAfterGpuUpload(
+        std::uint32_t textureId,
+        std::uint32_t uploadedRevision) const noexcept;
 
     void Clear() noexcept;
 
@@ -342,7 +373,10 @@ private:
         std::uint32_t width,
         std::uint32_t height,
         std::shared_ptr<const std::vector<std::uint8_t>> pixels,
-        bool forceStandalone);
+        bool forceStandalone,
+        std::string reloadableFilePath = {},
+        std::string reloadableMemAssetKey = {});
+    [[nodiscard]] bool TryReloadEvictedSlotPixels(std::uint32_t textureId) const noexcept;
     [[nodiscard]] std::string ResolveExistingFileLocked(
         std::string_view cleanRelOrAbs,
         std::string_view localBaseDir) const;
@@ -359,7 +393,12 @@ private:
 
     std::string baseDirectory_;
     std::vector<std::string> searchDirectories_;
-    SkylinePacker skyline_;
+    struct SharedAtlasPage {
+        std::uint32_t textureId = 0u;
+        std::uint32_t size = 0u;
+        SkylinePacker skyline;
+    };
+    std::vector<SharedAtlasPage> sharedAtlasPages_;
 
     struct DynamicSlotCacheEntry {
         std::string slotKey;
@@ -368,6 +407,14 @@ private:
         std::uint64_t lastUsedTick = 0u;
         std::uint64_t lastPoseHash = 0u;
         bool hasLastPoseHash = false;
+        bool hasNumericPlasma = false;
+        PlasmaRenderParams lastPlasma{};
+        bool hasNumericRive = false;
+        float lastRiveT = -1.0f;
+        float lastRiveTs = -1.0f;
+        float lastRiveW = -1.0f;
+        float lastRiveH = -1.0f;
+        std::uint64_t lastRiveInputsRev = 0u;
     };
 
     struct PackedMaskUvEntry {

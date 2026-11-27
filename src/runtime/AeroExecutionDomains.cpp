@@ -684,6 +684,10 @@ ExecutionDomainContext::ExecutionDomainContext()
     detail::RetainHeapHookUser(*uiHeap_);
     detail::RegisterFieldMutationListener(*simHeap_, this, &onHeapFieldMutatedCallback, this);
     detail::RegisterFieldMutationListener(*uiHeap_, this, &onHeapFieldMutatedCallback, this);
+    ObservableListHelper::RegisterOwnerDirtyListener(
+        simHeapId_, this, &onObservableListOwnerDirtyCallback, this);
+    ObservableListHelper::RegisterOwnerDirtyListener(
+        uiHeapId_, this, &onObservableListOwnerDirtyCallback, this);
 }
 
 ExecutionDomainContext::ExecutionDomainContext(
@@ -701,13 +705,19 @@ ExecutionDomainContext::ExecutionDomainContext(
     detail::RetainHeapHookUser(*uiHeap_);
     detail::RegisterFieldMutationListener(*simHeap_, this, &onHeapFieldMutatedCallback, this);
     detail::RegisterFieldMutationListener(*uiHeap_, this, &onHeapFieldMutatedCallback, this);
+    ObservableListHelper::RegisterOwnerDirtyListener(
+        simHeapId_, this, &onObservableListOwnerDirtyCallback, this);
+    ObservableListHelper::RegisterOwnerDirtyListener(
+        uiHeapId_, this, &onObservableListOwnerDirtyCallback, this);
 }
 
 ExecutionDomainContext::~ExecutionDomainContext() {
     if (simHeapId_ != 0) {
+        ObservableListHelper::UnregisterOwnerDirtyListener(simHeapId_, this);
         detail::UnregisterFieldMutationListener(simHeapId_, this);
     }
     if (uiHeapId_ != 0) {
+        ObservableListHelper::UnregisterOwnerDirtyListener(uiHeapId_, this);
         detail::UnregisterFieldMutationListener(uiHeapId_, this);
     }
     detail::ReleaseHeapHookUser(simHeap_.get());
@@ -725,6 +735,45 @@ void ExecutionDomainContext::onHeapFieldMutatedCallback(
     }
 }
 
+void ExecutionDomainContext::onObservableListOwnerDirtyCallback(
+    void* context,
+    ManagedHeap& heap,
+    ObjectRef ownerRef,
+    std::uint8_t) {
+    if (auto* self = static_cast<ExecutionDomainContext*>(context)) {
+        self->globalObservableEpoch_.fetch_add(1u, std::memory_order_release);
+        self->noteSubscribedObjectMutated(heap, ownerRef);
+    }
+}
+
+void ExecutionDomainContext::noteSubscribedObjectMutated(
+    const ManagedHeap& heap,
+    ObjectRef object) {
+    if (!hasSubscribedTokens_.load(std::memory_order_acquire) ||
+        !object.valid() || object.kind != ObjectKind::Record) {
+        return;
+    }
+    const std::uint64_t tokKey = (heap.heapId() << 48) ^ refKey(object);
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (dirtyObservableOverflow_) {
+        return;
+    }
+    const auto it = objectTokensByRefKey_.find(tokKey);
+    if (it == objectTokensByRefKey_.end()) {
+        return;
+    }
+    if (dirtyObservableTokens_.size() >= 512u) {
+        dirtyObservableOverflow_ = true;
+        dirtyObservableTokens_.clear();
+        dirtyObservableTokenSet_.clear();
+        return;
+    }
+    const std::int32_t tok = it->second;
+    if (dirtyObservableTokenSet_.insert(tok).second) {
+        dirtyObservableTokens_.push_back(tok);
+    }
+}
+
 void ExecutionDomainContext::handleFieldMutated(
     ManagedHeap& heap,
     ObjectRef object,
@@ -734,6 +783,7 @@ void ExecutionDomainContext::handleFieldMutated(
         return;
     }
     globalObservableEpoch_.fetch_add(1u, std::memory_order_release);
+    noteSubscribedObjectMutated(heap, object);
 
     const std::uint64_t heapKey = heap.heapId();
     const std::uint64_t objKey = refKey(object);
@@ -745,9 +795,9 @@ void ExecutionDomainContext::handleFieldMutated(
             if (dirtyBit < 64u) {
                 ObservableListHelper::UnbindAllForOwnerField(heap, object, dirtyBit);
             }
-            const Value* field0 = heap.fieldGetFast(object, 0u);
-            if (field0) {
-                if (const auto* arrRef = std::get_if<ObjectRef>(field0);
+            Value field0{};
+            if (heap.fieldGetInto(object, 0u, field0)) {
+                if (const auto* arrRef = std::get_if<ObjectRef>(&field0);
                     arrRef && arrRef->valid() && arrRef->kind == ObjectKind::Array &&
                     arrRef->heapId == static_cast<std::uint32_t>(heapKey)) {
                     ObservableListHelper::EnableTracking(heap, *arrRef);
@@ -826,11 +876,11 @@ void ExecutionDomainContext::handleFieldMutated(
         }
     }
 
-    const Value* fieldVal = heap.fieldGetFast(object, fieldIndex);
-    if (!fieldVal) {
+    Value fieldVal{};
+    if (!heap.fieldGetInto(object, fieldIndex, fieldVal)) {
         return;
     }
-    const auto* valRef = std::get_if<ObjectRef>(fieldVal);
+    const auto* valRef = std::get_if<ObjectRef>(&fieldVal);
     if (!valRef || !valRef->valid() || valRef->heapId != static_cast<std::uint32_t>(heapKey)) {
         return;
     }
@@ -896,6 +946,61 @@ std::optional<std::string_view> ExecutionDomainContext::stringViewAcrossDomains(
 std::uint64_t ExecutionDomainContext::globalObservableEpoch() const noexcept {
     return globalObservableEpoch_.load(std::memory_order_acquire) +
         ObservableListHelper::GlobalMutationEpoch();
+}
+
+std::int32_t ExecutionDomainContext::getOrAssignObservableToken(ObjectRef ref) {
+    if (!ref.valid() || ref.kind != ObjectKind::Record) {
+        return 0;
+    }
+    const ManagedHeap* heap = heapForObject(ref);
+    if (!heap || !heap->isAlive(ref)) {
+        return 0;
+    }
+    const std::uint64_t tokKey = (heap->heapId() << 48) ^ refKey(ref);
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (const auto it = objectTokensByRefKey_.find(tokKey); it != objectTokensByRefKey_.end()) {
+        return it->second;
+    }
+    if (objectTokensByRefKey_.size() >= 16384u) {
+        for (auto it = objectTokensByRefKey_.begin(); it != objectTokensByRefKey_.end();) {
+            const std::uint64_t hPart = (it->first >> 48) & 0xFFFFull;
+            const auto slot = static_cast<std::uint32_t>((it->first >> 32) & 0xFFFFull);
+            (void)hPart;
+            (void)slot;
+            ++it;
+        }
+    }
+    std::int32_t assigned = nextObjectToken_++;
+    if (nextObjectToken_ >= 1000000000) {
+        nextObjectToken_ = 1;
+    }
+    if (assigned <= 0) {
+        assigned = 1;
+    }
+    objectTokensByRefKey_.emplace(tokKey, assigned);
+    hasSubscribedTokens_.store(true, std::memory_order_release);
+    return assigned;
+}
+
+std::int32_t ExecutionDomainContext::beginConsumeDirtyObservableTokens() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    consumedDirtyTokens_.clear();
+    if (dirtyObservableOverflow_) {
+        dirtyObservableOverflow_ = false;
+        dirtyObservableTokens_.clear();
+        dirtyObservableTokenSet_.clear();
+        return -1;
+    }
+    consumedDirtyTokens_.swap(dirtyObservableTokens_);
+    dirtyObservableTokenSet_.clear();
+    return static_cast<std::int32_t>(consumedDirtyTokens_.size());
+}
+
+std::int32_t ExecutionDomainContext::getConsumedDirtyObservableToken(std::size_t idx) const noexcept {
+    if (idx >= consumedDirtyTokens_.size()) {
+        return 0;
+    }
+    return consumedDirtyTokens_[idx];
 }
 
 void ExecutionDomainContext::attachInterpreter(Interpreter& interpreter, DomainKind domain) {
@@ -1426,15 +1531,15 @@ std::optional<Value> ExecutionDomainContext::readCrossHeapFieldFast(
             "cross-heap read requires a valid SimHeap ObjectRef");
         return std::nullopt;
     }
-    const Value* rawVal = simHeap_->fieldGetFast(simObject, fieldIndex);
-    if (!rawVal) {
+    Value rawVal{};
+    if (!simHeap_->fieldGetInto(simObject, fieldIndex, rawVal)) {
         setDomainError(
             error,
             ErrorCode::InvalidObjectReference,
             "SimHeap object is dead or fieldIndex is out of range");
         return std::nullopt;
     }
-    return sanitizeCrossHeapValue(*simHeap_, *rawVal);
+    return sanitizeCrossHeapValue(*simHeap_, rawVal);
 }
 
 bool ExecutionDomainContext::readObjectField(
@@ -1451,8 +1556,8 @@ bool ExecutionDomainContext::readObjectField(
             "target object does not belong to SimHeap or UiHeap");
         return false;
     }
-    const Value* rawVal = targetHeap->fieldGetFast(target, fieldIndex);
-    if (!rawVal) {
+    Value rawVal{};
+    if (!targetHeap->fieldGetInto(target, fieldIndex, rawVal)) {
         setDomainError(
             error,
             ErrorCode::InvalidObjectReference,
@@ -1462,7 +1567,7 @@ bool ExecutionDomainContext::readObjectField(
     const bool crossHeapRead =
         (callerDomain == DomainKind::UiPresentation && targetHeap == simHeap_.get()) ||
         (callerDomain == DomainKind::SimDeterministic && targetHeap == uiHeap_.get());
-    outValue = crossHeapRead ? sanitizeCrossHeapValue(*targetHeap, *rawVal) : *rawVal;
+    outValue = crossHeapRead ? sanitizeCrossHeapValue(*targetHeap, rawVal) : std::move(rawVal);
     return true;
 }
 
@@ -1683,15 +1788,15 @@ std::optional<Value> ExecutionDomainContext::readPropertySlotFast(
         (callerDomain == DomainKind::SimDeterministic && targetHeap == uiHeap_.get());
 
     if (slot.isAutoProperty && slot.backingFieldIndex != PropertySlotHandle::InvalidIndex) {
-        const Value* val = targetHeap->fieldGetFast(target, slot.backingFieldIndex);
-        if (!val) {
+        Value val{};
+        if (!targetHeap->fieldGetInto(target, slot.backingFieldIndex, val)) {
             setDomainError(
                 error,
                 ErrorCode::InvalidObjectReference,
                 "target object is dead or slot index is out of range");
             return std::nullopt;
         }
-        return crossHeapRead ? sanitizeCrossHeapValue(*targetHeap, *val) : *val;
+        return crossHeapRead ? sanitizeCrossHeapValue(*targetHeap, val) : val;
     }
 
     if (slot.getterSymbolId != 0 && (interpreter || hasDesktopJitInvoker())) {
@@ -1802,8 +1907,9 @@ bool ExecutionDomainContext::writePropertySlotFast(
     }
 
     if (slot.isAutoProperty && slot.backingFieldIndex != PropertySlotHandle::InvalidIndex) {
-        if (const Value* currentVal = targetHeap->fieldGetFast(target, slot.backingFieldIndex)) {
-            if (valuesEqualForDirtyCheck(*targetHeap, *currentVal, writeVal)) {
+        Value currentVal{};
+        if (targetHeap->fieldGetInto(target, slot.backingFieldIndex, currentVal)) {
+            if (valuesEqualForDirtyCheck(*targetHeap, currentVal, writeVal)) {
                 return true;
             }
         }
@@ -2013,8 +2119,9 @@ UiTaskId ExecutionDomainContext::spawnReentrantSequenceTask(
         if (field.name == completedName) frame->completedFieldIndex = field.index;
         if (field.name == resultName) frame->resultFieldIndex = field.index;
 
-        if (const Value* cur = targetHeap->fieldGetFast(targetObject, field.index)) {
-            backupFields.emplace_back(field.index, *cur);
+        Value cur{};
+        if (targetHeap->fieldGetInto(targetObject, field.index, cur)) {
+            backupFields.emplace_back(field.index, std::move(cur));
         }
     }
 
@@ -2182,8 +2289,9 @@ bool ExecutionDomainContext::stepUiTask(UiTaskId taskId, const Interpreter* uiIn
     std::vector<std::pair<std::size_t, Value>> backupFields;
     backupFields.reserve(frame->isolatedSequenceFields.size());
     for (const auto& [idx, taskVal] : frame->isolatedSequenceFields) {
-        if (const Value* cur = targetHeap->fieldGetFast(targetObject, idx)) {
-            backupFields.emplace_back(idx, *cur);
+        Value cur{};
+        if (targetHeap->fieldGetInto(targetObject, idx, cur)) {
+            backupFields.emplace_back(idx, std::move(cur));
         }
         if (idx == frame->stateFieldIndex &&
             std::holds_alternative<std::int64_t>(taskVal) &&
@@ -2218,8 +2326,9 @@ bool ExecutionDomainContext::stepUiTask(UiTaskId taskId, const Interpreter* uiIn
     ++frame->stepIndex;
 
     for (auto& [idx, taskVal] : frame->isolatedSequenceFields) {
-        if (const Value* updated = targetHeap->fieldGetFast(targetObject, idx)) {
-            taskVal = *updated;
+        Value updated{};
+        if (targetHeap->fieldGetInto(targetObject, idx, updated)) {
+            taskVal = std::move(updated);
         }
     }
     for (const auto& [idx, oldVal] : backupFields) {
