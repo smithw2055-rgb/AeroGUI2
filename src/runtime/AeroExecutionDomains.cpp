@@ -1515,7 +1515,13 @@ bool ExecutionDomainContext::isTypeObservable(SymbolId typeId) const noexcept {
 }
 
 bool ExecutionDomainContext::isSimCommandFunction(SymbolId functionId) const noexcept {
-    if (functionId == 0) return false;
+    if (functionId == 0 || !hasSimCommands_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    const std::uint64_t reqMask = ComputeSimCommandBloomMask(functionId);
+    if ((simCommandBloom_.load(std::memory_order_relaxed) & reqMask) != reqMask) {
+        return false;
+    }
     std::lock_guard<std::mutex> lock(mutex_);
     return simCommandFunctions_.find(functionId) != simCommandFunctions_.end();
 }
@@ -2537,12 +2543,8 @@ bool ExecutionDomainContext::tryInvokeDesktopJit(
     if (!invokerHolder || !(*invokerHolder)) {
         return false;
     }
-    if (domain == DomainKind::UiPresentation &&
-        hasSimCommands_.load(std::memory_order_acquire)) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (simCommandFunctions_.find(functionId) != simCommandFunctions_.end()) {
-            return false;
-        }
+    if (domain == DomainKind::UiPresentation && isSimCommandFunction(functionId)) {
+        return false;
     }
 
     bool outSucceeded = false;
@@ -2550,6 +2552,11 @@ bool ExecutionDomainContext::tryInvokeDesktopJit(
     RuntimeError outErr{};
     if ((*invokerHolder)(domain, functionId, arguments, argumentCount, outSucceeded, outVal, outErr)) {
         desktopJitInvokeHits_.fetch_add(1u, std::memory_order_relaxed);
+        if (domain == DomainKind::SimDeterministic) {
+            desktopJitSimInvokeHits_.fetch_add(1u, std::memory_order_relaxed);
+        } else {
+            desktopJitUiInvokeHits_.fetch_add(1u, std::memory_order_relaxed);
+        }
         outResult = ExecutionResult{};
         outResult.succeeded = outSucceeded;
         outResult.value = std::move(outVal);

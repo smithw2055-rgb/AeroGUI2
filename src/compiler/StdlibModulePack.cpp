@@ -1,6 +1,7 @@
 #include "aero/compiler/StdlibModulePack.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
@@ -187,126 +188,615 @@ std::uint32_t ResolveEffectiveStdlibPackageMask(std::uint32_t requestedMask) noe
     return mask & (AeroStdlibPkg_All | AeroStdlibPkg_GameHud);
 }
 
+namespace {
+
+template <std::size_t N>
+constexpr bool IsStrictlySortedTokens(const std::array<std::string_view, N>& arr) noexcept {
+    for (std::size_t i = 1u; i < N; ++i) {
+        if (!(arr[i - 1u] < arr[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+template <std::size_t N>
+[[nodiscard]] bool ContainsSortedToken(
+    const std::array<std::string_view, N>& arr,
+    std::string_view token) noexcept {
+    return std::binary_search(arr.begin(), arr.end(), token);
+}
+
+constexpr std::array<std::string_view, 3> kRuntimeXamlIdentTokens = {
+    "CompiledXamlCatalog",
+    "XamlReader",
+    "__AeroCompiledXamlCatalogInit",
+};
+static_assert(IsStrictlySortedTokens(kRuntimeXamlIdentTokens));
+
+constexpr std::array<std::string_view, 38> kWorkbenchIdentTokens = {
+    "AssetBrowser",
+    "CodeDiagnosticItem",
+    "CodeEditor",
+    "CodeEditorView",
+    "ColorPicker",
+    "CurveEditor",
+    "DataGrid",
+    "DockLayout",
+    "DockPane",
+    "DockSplitNode",
+    "DockTabGroup",
+    "DockZone",
+    "DockingWorkspace",
+    "EditLifecyclePhase",
+    "EditorMath",
+    "InspectorPanel",
+    "InspectorPropertyItem",
+    "NodeGraphCanvas",
+    "NodeGraphEditor",
+    "NodeGraphLinkData",
+    "NodeGraphNodeData",
+    "NumericScrubber",
+    "PropertyAssetActionEventArgs",
+    "PropertyAssetActionEventHandler",
+    "PropertyCardActionEventArgs",
+    "PropertyCardActionEventHandler",
+    "PropertyGrid",
+    "TimelineEditor",
+    "TreeListView",
+    "ValueEditEventHandler",
+    "ValueEditLifecycleEventArgs",
+    "Vector2Field",
+    "Vector3Field",
+    "Viewport3D",
+    "ViewportInputEventArgs",
+    "ViewportInputEventHandler",
+    "ViewportSurface",
+    "__RegisterWorkbenchXamlFactories",
+};
+static_assert(IsStrictlySortedTokens(kWorkbenchIdentTokens));
+
+constexpr std::array<std::string_view, 103> kControlsIdentTokens = {
+    "AeroFluent",
+    "BackgroundEffectBehavior",
+    "BehaviorBase",
+    "BehaviorDataTrigger",
+    "BehaviorEventTrigger",
+    "BehaviorTriggerBase",
+    "Button",
+    "ButtonBase",
+    "Calendar",
+    "ChangePropertyAction",
+    "CheckBox",
+    "ComboBox",
+    "ComboBoxItem",
+    "CommandTriggerHelper",
+    "ComparisonCondition",
+    "ConditionBehavior",
+    "ConditionalExpression",
+    "ContextMenu",
+    "ControlStoryboardAction",
+    "DatePicker",
+    "DateTimeControl",
+    "DragDrop",
+    "EventTrigger",
+    "FluidMoveBehavior",
+    "FluidMoveSetTagBehavior",
+    "GoToStateAction",
+    "GridSplitter",
+    "GridView",
+    "GridViewColumn",
+    "GridViewColumnHeader",
+    "GridViewHeaderRowPresenter",
+    "GridViewRowPresenter",
+    "HeaderedItemsControl",
+    "Hyperlink",
+    "Interaction",
+    "InvokeCommandAction",
+    "ItemsControl",
+    "ItemsPanelTemplate",
+    "ItemsPresenter",
+    "KeyTrigger",
+    "ListBox",
+    "ListBoxItem",
+    "ListView",
+    "ListViewItem",
+    "MediaElement",
+    "Menu",
+    "MenuBase",
+    "MenuItem",
+    "MouseDragElementBehavior",
+    "NavDestination",
+    "NavigateBackAction",
+    "NavigateToAction",
+    "Navigation",
+    "NavigationService",
+    "PasswordBox",
+    "PauseMediaAction",
+    "PlayMediaAction",
+    "PlaySoundAction",
+    "Popup",
+    "PopupService",
+    "ProgressBar",
+    "PropertyChangedTrigger",
+    "RadialNeedle",
+    "RadialTicks",
+    "RadioButton",
+    "RangeBase",
+    "RemoveElementAction",
+    "RepeatButton",
+    "RewindMediaAction",
+    "RichText",
+    "RichTextBox",
+    "RiveControl",
+    "RiveInput",
+    "ScrollBar",
+    "ScrollViewer",
+    "SelectAction",
+    "SelectAllAction",
+    "SelectableItem",
+    "Selector",
+    "SetFocusAction",
+    "Slider",
+    "StatusBar",
+    "StatusBarItem",
+    "StopMediaAction",
+    "StoryboardCompletedTrigger",
+    "StyleInteraction",
+    "TabControl",
+    "TabItem",
+    "TextBox",
+    "TextBoxBase",
+    "Thumb",
+    "TickBar",
+    "TimerTrigger",
+    "ToggleButton",
+    "ToolBar",
+    "ToolTip",
+    "ToolTipService",
+    "Track",
+    "TransitionContentPresenter",
+    "TranslateZoomRotateBehavior",
+    "TreeView",
+    "TreeViewItem",
+    "TriggerAction",
+};
+static_assert(IsStrictlySortedTokens(kControlsIdentTokens));
+
+constexpr std::array<std::string_view, 30> kControlsFluentCallTokens = {
+    "Box",
+    "Btn",
+    "CanvasBox",
+    "Card",
+    "Check",
+    "Divider",
+    "DockBox",
+    "DropDown",
+    "GridBox",
+    "HStack",
+    "Heading",
+    "InputBox",
+    "Label",
+    "ListPanel",
+    "MutedLabel",
+    "Pic",
+    "PrimaryBtn",
+    "Progress",
+    "Radio",
+    "ScrollBox",
+    "SecretBox",
+    "Slide",
+    "SvgPath",
+    "Tabs",
+    "ToggleBtn",
+    "Tree",
+    "VStack",
+    "Win",
+    "WrapBox",
+    "ZStack",
+};
+static_assert(IsStrictlySortedTokens(kControlsFluentCallTokens));
+
+[[nodiscard]] constexpr bool IsIdentStartChar(char ch) noexcept {
+    return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch == '_';
+}
+
+[[nodiscard]] constexpr bool IsIdentContChar(char ch) noexcept {
+    return IsIdentStartChar(ch) || (ch >= '0' && ch <= '9');
+}
+
+[[nodiscard]] constexpr bool IsXmlNameChar(char ch) noexcept {
+    return IsIdentContChar(ch) || ch == ':' || ch == '.' || ch == '-';
+}
+
+void MatchPackageIdentifierToken(std::string_view tok, std::uint32_t& mask) noexcept {
+    if (tok.empty()) {
+        return;
+    }
+    if (ContainsSortedToken(kRuntimeXamlIdentTokens, tok)) {
+        mask |= AeroStdlibPkg_RuntimeXaml | AeroStdlibPkg_Controls;
+    }
+    if (ContainsSortedToken(kWorkbenchIdentTokens, tok)) {
+        mask |= AeroStdlibPkg_Workbench | AeroStdlibPkg_Controls;
+    }
+    if (ContainsSortedToken(kControlsIdentTokens, tok)) {
+        mask |= AeroStdlibPkg_Controls;
+    }
+}
+
+void CheckResourceUriTriggers(std::string_view sv, std::uint32_t& mask) noexcept {
+    if (sv.find("Data/Samples/") != std::string_view::npos ||
+        sv.find("NoesisTheme.Brushes") != std::string_view::npos) {
+        mask |= AeroStdlibPkg_RuntimeXaml | AeroStdlibPkg_Controls;
+    }
+}
+
+void ScanIdentTokensInText(std::string_view text, std::uint32_t& mask) noexcept {
+    std::size_t i = 0u;
+    const std::size_t n = text.size();
+    while (i < n) {
+        while (i < n && !IsIdentStartChar(text[i])) {
+            ++i;
+        }
+        const std::size_t start = i;
+        while (i < n && IsIdentContChar(text[i])) {
+            ++i;
+        }
+        if (i > start) {
+            MatchPackageIdentifierToken(text.substr(start, i - start), mask);
+        }
+    }
+}
+
+void ScanXamlForPackages(std::string_view xaml, std::uint32_t& mask) noexcept {
+    const std::size_t n = xaml.size();
+    std::size_t i = 0u;
+    while (i < n) {
+        const std::size_t lt = xaml.find('<', i);
+        if (lt == std::string_view::npos) {
+            break;
+        }
+        i = lt;
+        if (i + 3u < n && xaml.substr(i, 4u) == "<!--") {
+            const std::size_t endComment = xaml.find("-->", i + 4u);
+            if (endComment == std::string_view::npos) {
+                break;
+            }
+            i = endComment + 3u;
+            continue;
+        }
+        if (i + 8u < n && xaml.substr(i, 9u) == "<![CDATA[") {
+            const std::size_t endCdata = xaml.find("]]>", i + 9u);
+            if (endCdata == std::string_view::npos) {
+                break;
+            }
+            i = endCdata + 3u;
+            continue;
+        }
+        if (i + 1u < n && (xaml[i + 1u] == '?' || xaml[i + 1u] == '!')) {
+            const std::size_t gt = xaml.find('>', i + 2u);
+            if (gt == std::string_view::npos) {
+                break;
+            }
+            i = gt + 1u;
+            continue;
+        }
+
+        ++i; // skip '<'
+        if (i < n && xaml[i] == '/') {
+            ++i;
+        }
+        while (i < n && (xaml[i] == ' ' || xaml[i] == '\t' || xaml[i] == '\r' || xaml[i] == '\n')) {
+            ++i;
+        }
+        const std::size_t tagStart = i;
+        while (i < n && IsXmlNameChar(xaml[i])) {
+            ++i;
+        }
+        if (i > tagStart) {
+            std::string_view tagName = xaml.substr(tagStart, i - tagStart);
+            if (const std::size_t colon = tagName.find(':'); colon != std::string_view::npos) {
+                tagName = tagName.substr(colon + 1u);
+            }
+            if (const std::size_t dot = tagName.find('.'); dot != std::string_view::npos) {
+                MatchPackageIdentifierToken(tagName.substr(0u, dot), mask);
+                MatchPackageIdentifierToken(tagName.substr(dot + 1u), mask);
+            } else {
+                MatchPackageIdentifierToken(tagName, mask);
+            }
+        }
+
+        // Scan attributes inside the tag until closing '>'
+        while (i < n) {
+            while (i < n && (xaml[i] == ' ' || xaml[i] == '\t' || xaml[i] == '\r' ||
+                             xaml[i] == '\n' || xaml[i] == '/')) {
+                ++i;
+            }
+            if (i >= n) {
+                break;
+            }
+            if (xaml[i] == '>') {
+                ++i;
+                break;
+            }
+            const std::size_t attrStart = i;
+            while (i < n && IsXmlNameChar(xaml[i])) {
+                ++i;
+            }
+            std::string_view attrLocal;
+            if (i > attrStart) {
+                attrLocal = xaml.substr(attrStart, i - attrStart);
+                if (const std::size_t colon = attrLocal.find(':'); colon != std::string_view::npos) {
+                    attrLocal = attrLocal.substr(colon + 1u);
+                }
+                if (const std::size_t dot = attrLocal.find('.'); dot != std::string_view::npos) {
+                    MatchPackageIdentifierToken(attrLocal.substr(0u, dot), mask);
+                } else if (attrLocal == "ToolTip" || attrLocal == "ContextMenu") {
+                    MatchPackageIdentifierToken(attrLocal, mask);
+                }
+            } else {
+                // Unexpected character inside tag; advance safely to avoid stalling.
+                ++i;
+                continue;
+            }
+
+            while (i < n && (xaml[i] == ' ' || xaml[i] == '\t' || xaml[i] == '\r' || xaml[i] == '\n')) {
+                ++i;
+            }
+            if (i < n && xaml[i] == '=') {
+                ++i;
+                while (i < n && (xaml[i] == ' ' || xaml[i] == '\t' || xaml[i] == '\r' || xaml[i] == '\n')) {
+                    ++i;
+                }
+                if (i < n && (xaml[i] == '"' || xaml[i] == '\'')) {
+                    const char quote = xaml[i++];
+                    const std::size_t valStart = i;
+                    while (i < n && xaml[i] != quote) {
+                        ++i;
+                    }
+                    const std::string_view attrVal = xaml.substr(valStart, i - valStart);
+                    if (i < n && xaml[i] == quote) {
+                        ++i;
+                    }
+                    CheckResourceUriTriggers(attrVal, mask);
+                    if (attrLocal == "TargetType" ||
+                        attrLocal == "DataType" ||
+                        attrLocal == "Property" ||
+                        attrVal.find('{') != std::string_view::npos ||
+                        attrVal.find("x:Type") != std::string_view::npos) {
+                        ScanIdentTokensInText(attrVal, mask);
+                    }
+                }
+            }
+        }
+    }
+}
+
+void ScanScriptForPackages(std::string_view script, std::uint32_t& mask) noexcept {
+    const std::size_t n = script.size();
+    std::size_t i = 0u;
+    std::string_view prevIdent;
+    char prevPunct = '\0';
+
+    while (i < n) {
+        const char ch = script[i];
+        if (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n') {
+            ++i;
+            continue;
+        }
+        // Line comment //...
+        if (ch == '/' && i + 1u < n && script[i + 1u] == '/') {
+            i += 2u;
+            while (i < n && script[i] != '\n') {
+                ++i;
+            }
+            continue;
+        }
+        // Block comment /*...*/
+        if (ch == '/' && i + 1u < n && script[i + 1u] == '*') {
+            i += 2u;
+            while (i + 1u < n && !(script[i] == '*' && script[i + 1u] == '/')) {
+                ++i;
+            }
+            i = (i + 1u < n) ? (i + 2u) : n;
+            continue;
+        }
+        // Verbatim string @"..." or $@"..." / @$"..."
+        const bool isVerbatim =
+            (ch == '@' && i + 1u < n && script[i + 1u] == '"') ||
+            ((ch == '$' || ch == '@') && i + 2u < n &&
+             ((script[i] == '$' && script[i + 1u] == '@') ||
+              (script[i] == '@' && script[i + 1u] == '$')) &&
+             script[i + 2u] == '"');
+        if (isVerbatim) {
+            const bool interpolated = (ch == '$' || script[i + 1u] == '$');
+            i += (script[i + 1u] == '"') ? 2u : 3u;
+            const std::size_t strStart = i;
+            while (i < n) {
+                if (script[i] == '"') {
+                    if (i + 1u < n && script[i + 1u] == '"') {
+                        i += 2u;
+                        continue;
+                    }
+                    break;
+                }
+                if (interpolated && script[i] == '{') {
+                    if (i + 1u < n && script[i + 1u] == '{') {
+                        i += 2u;
+                        continue;
+                    }
+                    ++i;
+                    const std::size_t holeStart = i;
+                    int braceDepth = 1;
+                    while (i < n && braceDepth > 0) {
+                        if (script[i] == '{') {
+                            ++braceDepth;
+                        } else if (script[i] == '}') {
+                            --braceDepth;
+                        }
+                        if (braceDepth > 0) {
+                            ++i;
+                        }
+                    }
+                    ScanScriptForPackages(script.substr(holeStart, i - holeStart), mask);
+                    if (i < n && script[i] == '}') {
+                        ++i;
+                    }
+                    continue;
+                }
+                ++i;
+            }
+            CheckResourceUriTriggers(script.substr(strStart, i - strStart), mask);
+            if (i < n && script[i] == '"') {
+                ++i;
+            }
+            prevIdent = {};
+            prevPunct = '"';
+            continue;
+        }
+        // Interpolated string $"..."
+        if (ch == '$' && i + 1u < n && script[i + 1u] == '"') {
+            i += 2u;
+            const std::size_t strStart = i;
+            while (i < n && script[i] != '"') {
+                if (script[i] == '\\' && i + 1u < n) {
+                    i += 2u;
+                    continue;
+                }
+                if (script[i] == '{') {
+                    if (i + 1u < n && script[i + 1u] == '{') {
+                        i += 2u;
+                        continue;
+                    }
+                    ++i;
+                    const std::size_t holeStart = i;
+                    int braceDepth = 1;
+                    while (i < n && braceDepth > 0) {
+                        if (script[i] == '\\' && i + 1u < n) {
+                            i += 2u;
+                            continue;
+                        }
+                        if (script[i] == '{') {
+                            ++braceDepth;
+                        } else if (script[i] == '}') {
+                            --braceDepth;
+                        }
+                        if (braceDepth > 0) {
+                            ++i;
+                        }
+                    }
+                    ScanScriptForPackages(script.substr(holeStart, i - holeStart), mask);
+                    if (i < n && script[i] == '}') {
+                        ++i;
+                    }
+                    continue;
+                }
+                ++i;
+            }
+            CheckResourceUriTriggers(script.substr(strStart, i - strStart), mask);
+            if (i < n && script[i] == '"') {
+                ++i;
+            }
+            prevIdent = {};
+            prevPunct = '"';
+            continue;
+        }
+        // Regular string literal "..."
+        if (ch == '"') {
+            ++i;
+            const std::size_t strStart = i;
+            while (i < n && script[i] != '"') {
+                if (script[i] == '\\' && i + 1u < n) {
+                    i += 2u;
+                    continue;
+                }
+                ++i;
+            }
+            CheckResourceUriTriggers(script.substr(strStart, i - strStart), mask);
+            if (i < n && script[i] == '"') {
+                ++i;
+            }
+            prevIdent = {};
+            prevPunct = '"';
+            continue;
+        }
+        // Character literal '...'
+        if (ch == '\'') {
+            ++i;
+            while (i < n && script[i] != '\'') {
+                if (script[i] == '\\' && i + 1u < n) {
+                    i += 2u;
+                    continue;
+                }
+                ++i;
+            }
+            if (i < n && script[i] == '\'') {
+                ++i;
+            }
+            prevIdent = {};
+            prevPunct = '\'';
+            continue;
+        }
+        // Identifier token [A-Za-z_][A-Za-z0-9_]*
+        if (IsIdentStartChar(ch)) {
+            const std::size_t start = i++;
+            while (i < n && IsIdentContChar(script[i])) {
+                ++i;
+            }
+            const std::string_view tok = script.substr(start, i - start);
+            MatchPackageIdentifierToken(tok, mask);
+
+            if ((mask & AeroStdlibPkg_Controls) == 0u &&
+                ContainsSortedToken(kControlsFluentCallTokens, tok)) {
+                std::size_t look = i;
+                while (look < n && (script[look] == ' ' || script[look] == '\t' ||
+                                    script[look] == '\r' || script[look] == '\n')) {
+                    ++look;
+                }
+                const bool isCallSyntax = (look < n && script[look] == '(');
+                const bool isQualifiedCall = (prevPunct == '.' && prevIdent != "UI");
+                const bool isMethodDecl =
+                    prevPunct == '\0' && !prevIdent.empty() &&
+                    prevIdent != "return" && prevIdent != "else";
+                if (isCallSyntax && !isQualifiedCall && !isMethodDecl) {
+                    mask |= AeroStdlibPkg_Controls;
+                }
+            }
+            prevIdent = tok;
+            prevPunct = '\0';
+            continue;
+        }
+
+        prevPunct = ch;
+        if (ch != '.') {
+            prevIdent = {};
+        }
+        ++i;
+    }
+}
+
+} // namespace
+
 std::uint32_t InferRequiredStdlibPackages(const AeroV3CompileInput& input) noexcept {
     std::uint32_t mask = AeroStdlibPkg_Core;
     if ((input.stdlibPackages & AeroStdlibPkg_GameHud) != 0u) {
         mask |= AeroStdlibPkg_GameHud;
     }
-
-    auto scanText = [&](std::string_view text) noexcept {
-        if (text.empty()) {
-            return;
-        }
-        auto hasAny = [&](std::initializer_list<std::string_view> tokens) noexcept -> bool {
-            for (const std::string_view tok : tokens) {
-                if (text.find(tok) != std::string_view::npos) {
-                    return true;
-                }
-            }
-            return false;
-        };
-        if (hasAny({
-                "XamlReader",
-                "LoadUri(",
-                "LoadResourceDictionary(",
-                "Data/Samples/",
-                "NoesisTheme.Brushes",
-                "__RegisterWorkbenchXamlFactories",
-                "__AeroCompiledXamlCatalogInit",
-            })) {
-            mask |= AeroStdlibPkg_RuntimeXaml | AeroStdlibPkg_Controls;
-        }
-        if (hasAny({
-                "PropertyGrid",
-                "ColorPicker",
-                "NumericScrubber",
-                "Vector2Field",
-                "Vector3Field",
-                "ViewportSurface",
-                "DockPane",
-                "DockTabGroup",
-                "DockSplitNode",
-                "DockingWorkspace",
-                "CodeEditorView",
-                "NodeGraphCanvas",
-                "DataGrid",
-                "InspectorPanel",
-                "CodeEditor",
-                "Viewport3D",
-                "TimelineEditor",
-                "NodeGraphEditor",
-                "CurveEditor",
-                "AssetBrowser",
-                "DockLayout",
-                "TreeListView",
-            })) {
-            mask |= AeroStdlibPkg_Workbench | AeroStdlibPkg_Controls;
-        }
-        if (hasAny({
-                "Button",
-                "ToggleButton",
-                "CheckBox",
-                "RadioButton",
-                "Slider",
-                "ProgressBar",
-                "ScrollBar",
-                "ScrollViewer",
-                "ListBox",
-                "ListView",
-                "ComboBox",
-                "TabControl",
-                "TabItem",
-                "Menu",
-                "MenuItem",
-                "ContextMenu",
-                "TreeView",
-                "Popup",
-                "ToolTip",
-                "TextBox",
-                "PasswordBox",
-                "RichTextBox",
-                "StatusBar",
-                "Expander",
-                "GroupBox",
-                "Calendar",
-                "DatePicker",
-                "WrapPanel",
-                "UniformGrid",
-                "Virtualizing",
-                "DragDrop",
-                "RoutedCommand",
-                "NavigationService",
-                "ItemsControl",
-                "Selector",
-                "AeroFluent",
-                "MutedLabel(",
-                "Heading(",
-                "MathConverter",
-                "BehaviorEventTrigger",
-                "BehaviorDataTrigger",
-                "KeyTrigger",
-                "StoryboardCompletedTrigger",
-                "PropertyChangedTrigger",
-                "Interaction.",
-                "FluidMove",
-                "RiveControl",
-                "RiveInput",
-                "DataGrid",
-                "DateTimeControl",
-            })) {
-            mask |= AeroStdlibPkg_Controls;
-        }
-    };
-
     if (!input.catalogXamlSources.empty()) {
         mask |= AeroStdlibPkg_Controls | AeroStdlibPkg_RuntimeXaml;
     }
-    scanText(input.xamlContent);
+    if (!input.xamlContent.empty()) {
+        ScanXamlForPackages(input.xamlContent, mask);
+    }
     for (const auto& sf : input.additionalXamlSources) {
-        scanText(sf.content);
+        if (!sf.content.empty()) {
+            ScanXamlForPackages(sf.content, mask);
+        }
     }
     for (const auto& sf : input.scriptSources) {
-        scanText(sf.content);
+        if (!sf.content.empty()) {
+            ScanScriptForPackages(sf.content, mask);
+        }
     }
     return ResolveEffectiveStdlibPackageMask(mask);
 }

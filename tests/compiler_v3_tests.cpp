@@ -1908,6 +1908,248 @@ public partial class HostPage : Page {
     Require(foundCatalogInit, "Missing __AeroCompiledXamlCatalogInit.RegisterAll in __AeroCompiledCatalog");
 }
 
+void TestPackageInferenceScannersAndPropertyPruning() {
+    std::cout << "[Test] Token-aware package inference & tightened MIR property pruning...\n";
+
+    // 1. Direct unit checks on InferRequiredStdlibPackages (Controls / Workbench / RuntimeXaml + no false positives)
+    {
+        aero::AeroV3CompileInput falsePosProbe;
+        falsePosProbe.xamlContent = R"XML(
+<UserControl xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="Samples.CleanCore.CleanView">
+    <!-- <Button/> <GridSplitter/> <PropertyGrid/> XamlReader.LoadUri("Data/Samples/Foo.xaml") -->
+    <Grid>
+        <TextBlock Text="Click Button or Menu or ComboBox" />
+    </Grid>
+</UserControl>
+)XML";
+        falsePosProbe.scriptSources.push_back(aero::SourceFile{"CleanView.rs", R"RS(
+module Samples.CleanCore;
+import Aero.UI;
+// Button ComboBox PropertyGrid XamlReader
+/* Menu Popup DockingWorkspace XamlReader.LoadUri("Data/Samples/Ignored.xaml") */
+public partial class CleanView : UserControl {
+    public int CloseButtonCount = 0;
+    public string MenuTitle = "Click Button";
+    public string RawNote = @"Button PropertyGrid XamlReader";
+}
+)RS"});
+        Require(aero::InferRequiredStdlibPackages(falsePosProbe) == aero::AeroStdlibPkg_Core,
+            "Comments, string literals, and compound identifiers must not trigger Controls/Workbench/RuntimeXaml");
+
+        for (const char* ctrlTag : {"GridSplitter", "Hyperlink", "MediaElement", "Thumb", "RadialTicks"}) {
+            aero::AeroV3CompileInput tagProbe;
+            tagProbe.xamlContent = std::string("<Window><") + ctrlTag + " /></Window>";
+            Require(aero::InferRequiredStdlibPackages(tagProbe) ==
+                        (aero::AeroStdlibPkg_Core | aero::AeroStdlibPkg_Controls),
+                std::string("XAML element <") + ctrlTag + "> must infer AeroStdlibPkg_Controls");
+        }
+
+        for (const char* wbSym : {"EditorMath", "NodeGraphNodeData", "CodeDiagnosticItem", "InspectorPropertyItem", "DockZone"}) {
+            aero::AeroV3CompileInput wbProbe;
+            wbProbe.scriptSources.push_back(aero::SourceFile{"Wb.rs", std::string("var x = ") + wbSym + ";"});
+            Require(aero::InferRequiredStdlibPackages(wbProbe) ==
+                        (aero::AeroStdlibPkg_Core | aero::AeroStdlibPkg_Controls | aero::AeroStdlibPkg_Workbench),
+                std::string("Workbench symbol ") + wbSym + " must infer AeroStdlibPkg_Workbench");
+        }
+
+        aero::AeroV3CompileInput catSymProbe;
+        catSymProbe.scriptSources.push_back(aero::SourceFile{"Cat.rs", "CompiledXamlCatalog.NormalizeUriKey(\"a\");"});
+        Require(aero::InferRequiredStdlibPackages(catSymProbe) ==
+                    (aero::AeroStdlibPkg_Core | aero::AeroStdlibPkg_Controls | aero::AeroStdlibPkg_RuntimeXaml),
+            "CompiledXamlCatalog identifier must infer AeroStdlibPkg_RuntimeXaml");
+    }
+
+    const auto realStdlib = aero::LoadStdlibModulePack();
+    if (!RealStdlibHasUiClasses(realStdlib)) {
+        return;
+    }
+
+    aero::AeroCompilerV3 compiler;
+
+    // 2. End-to-end Auto compile (compilerSession == nullptr) with <GridSplitter>, <Hyperlink>, <MediaElement>, <Thumb>, <RadialTicks>
+    {
+        aero::AeroV3CompileInput ctrlIn;
+        ctrlIn.xamlPath = "ControlsSweep.xaml";
+        ctrlIn.xamlContent = R"XML(
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="Samples.PkgSweep.ControlsSweep"
+        Title="Controls Sweep" Width="640" Height="400">
+    <Grid>
+        <GridSplitter Width="4" />
+        <TextBlock><Hyperlink NavigateUri="https://example.com">Docs</Hyperlink></TextBlock>
+        <MediaElement Source="clip.mp4" Volume="0.5" IsMuted="True" />
+        <Thumb Width="16" Height="16" />
+        <RadialTicks Minimum="0" Maximum="100" TickWidth="2" TickLength="8" />
+    </Grid>
+</Window>
+)XML";
+        ctrlIn.stdlibRootDir = AERO_STDLIB_DIR;
+        ctrlIn.compilerSession = nullptr;
+        ctrlIn.stdlibPackages = aero::AeroStdlibPkg_Auto;
+        ctrlIn.treeShakeStdlib = true;
+
+        const auto ctrlRes = compiler.Compile(ctrlIn);
+        for (const auto& d : ctrlRes.diagnostics) {
+            if (!ctrlRes.succeeded) {
+                std::cerr << "  ctrlSweep diag: " << d << "\n";
+            }
+        }
+        Require(ctrlRes.succeeded && ctrlRes.programImage != nullptr,
+            "Auto compile with GridSplitter/Hyperlink/MediaElement/Thumb/RadialTicks failed");
+        Require(ctrlRes.resolvedStdlibPackages == (aero::AeroStdlibPkg_Core | aero::AeroStdlibPkg_Controls),
+            "Expected GridSplitter/Hyperlink/MediaElement/Thumb/RadialTicks view to resolve AeroStdlibPkg_Controls");
+    }
+
+    // 3. End-to-end false-positive resistance compile: stays on AeroStdlibPkg_Core
+    {
+        aero::AeroV3CompileInput coreIn;
+        coreIn.xamlPath = "CleanCoreView.xaml";
+        coreIn.xamlContent = R"XML(
+<UserControl xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="Samples.NoFalsePos.CleanCoreView">
+    <!-- Button ComboBox PropertyGrid XamlReader -->
+    <Grid>
+        <TextBlock Text="Hello"/>
+    </Grid>
+</UserControl>
+)XML";
+        coreIn.scriptSources.push_back(aero::SourceFile{"CleanCoreView.rs", R"RS(
+module Samples.NoFalsePos;
+import Aero.UI;
+// Button ComboBox PropertyGrid XamlReader
+public partial class CleanCoreView : UserControl {
+    public int CloseButtonCount = 0;
+    public string Prompt = "Click Button";
+    public CleanCoreView() {
+        InitializeComponent();
+    }
+}
+)RS"});
+        coreIn.stdlibRootDir = AERO_STDLIB_DIR;
+        coreIn.compilerSession = nullptr;
+        coreIn.stdlibPackages = aero::AeroStdlibPkg_Auto;
+        coreIn.treeShakeStdlib = true;
+
+        const auto coreRes = compiler.Compile(coreIn);
+        for (const auto& d : coreRes.diagnostics) {
+            if (!coreRes.succeeded) {
+                std::cerr << "  cleanCore diag: " << d << "\n";
+            }
+        }
+        Require(coreRes.succeeded && coreRes.programImage != nullptr,
+            "CleanCoreView compilation failed");
+        Require(coreRes.resolvedStdlibPackages == aero::AeroStdlibPkg_Core,
+            "CleanCoreView with comments/strings/CloseButtonCount must resolve AeroStdlibPkg_Core");
+    }
+
+    // 4. Minimal <Window> MIR reachability pruning vs Binding/Setter/Style retention
+    {
+        aero::AeroV3CompileInput minWinIn;
+        minWinIn.xamlPath = "MinimalWin.xaml";
+        minWinIn.xamlContent = R"XML(
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="Samples.MinWin.MinimalWin">
+    <Grid>
+        <TextBlock Text="Hello" />
+    </Grid>
+</Window>
+)XML";
+        minWinIn.stdlibRootDir = AERO_STDLIB_DIR;
+        minWinIn.compilerSession = nullptr;
+        minWinIn.stdlibPackages = aero::AeroStdlibPkg_Auto;
+        minWinIn.treeShakeStdlib = true;
+
+        const auto minWinRes = compiler.Compile(minWinIn);
+        Require(minWinRes.succeeded && minWinRes.programImage != nullptr,
+            "Minimal <Window> tree-shaken compile failed");
+        std::printf(
+            "  [MinimalWindowPrune] retainedFns=%zu, prunedFns=%zu, retainedTypes=%zu\n",
+            minWinRes.retainedMirFunctions,
+            minWinRes.prunedMirFunctions,
+            minWinRes.retainedMirTypes);
+        // Previously ~1,443 MIR functions were retained because every public get_*/set_* on
+        // instantiated Aero.UI classes was treated as an unconditional root (now ~1,282).
+        Require(minWinRes.retainedMirFunctions < 1340u,
+            "Minimal <Window> tree-shaking must retain < 1340 MIR functions (got " +
+            std::to_string(minWinRes.retainedMirFunctions) + ")");
+
+        // Verify a <Window> with Style Setters, DataTrigger, and Binding on SolidColorBrush.Color
+        // retains referenced Aero.UI accessors and compiles/verifies cleanly.
+        aero::AeroV3CompileInput styledIn;
+        styledIn.xamlPath = "StyledWin.xaml";
+        styledIn.xamlContent = R"XML(
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="Samples.StyledProbe.StyledWin">
+    <Window.Resources>
+        <Style x:Key="CardStyle" TargetType="Border">
+            <Setter Property="Background" Value="#FF223344" />
+            <Setter Property="CornerRadius" Value="8" />
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding IsHighlighted}" Value="True">
+                    <Setter Property="Opacity" Value="0.75" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+    </Window.Resources>
+    <Border Style="{StaticResource CardStyle}">
+        <TextBlock x:Name="MsgText" Text="{Binding Headline}">
+            <TextBlock.Foreground>
+                <SolidColorBrush Color="{Binding AccentHex}" />
+            </TextBlock.Foreground>
+        </TextBlock>
+    </Border>
+</Window>
+)XML";
+        styledIn.scriptSources.push_back(aero::SourceFile{"StyledWin.rs", R"RS(
+module Samples.StyledProbe;
+import Aero.UI;
+public class StyledVm {
+    public bool IsHighlighted { get; set; } = true;
+    public string Headline { get; set; } = "Styled OK";
+    public string AccentHex { get; set; } = "#FF00FFAA";
+}
+public partial class StyledWin : Window {
+    public StyledWin() {
+        DataContext = new StyledVm();
+        InitializeComponent();
+    }
+}
+)RS"});
+        styledIn.stdlibRootDir = AERO_STDLIB_DIR;
+        styledIn.compilerSession = nullptr;
+        styledIn.stdlibPackages = aero::AeroStdlibPkg_Auto;
+        styledIn.treeShakeStdlib = true;
+
+        const auto styledRes = compiler.Compile(styledIn);
+        for (const auto& d : styledRes.diagnostics) {
+            if (!styledRes.succeeded) {
+                std::cerr << "  styledWin diag: " << d << "\n";
+            }
+        }
+        Require(styledRes.succeeded && styledRes.programImage != nullptr,
+            "Styled/Bound <Window> tree-shaken compile failed");
+
+        bool hasSolidBrushSetColor = false;
+        for (const auto& mod : styledRes.programImage->modules()) {
+            if (mod.name == "Aero.UI") {
+                for (const auto& fn : mod.functions) {
+                    if (fn.name == "SolidColorBrush.set_Color") {
+                        hasSolidBrushSetColor = true;
+                    }
+                }
+            }
+        }
+        Require(hasSolidBrushSetColor,
+            "SolidColorBrush.set_Color must be retained when bound via {Binding} in XAML");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -1924,6 +2166,7 @@ int main() {
     TestGalleryEngineCompilerFixes();
     TestIncrementalSpecModuleCacheInvalidation();
     TestPhase4PackagesCatalogAndPruning();
+    TestPackageInferenceScannersAndPropertyPruning();
 
     if (gFailureCount > 0) {
         std::cerr << gFailureCount << " compiler_v3_tests assertion(s) failed.\n";

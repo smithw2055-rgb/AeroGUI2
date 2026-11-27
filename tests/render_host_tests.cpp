@@ -1976,6 +1976,237 @@ bool TestPhase4MultiPageAtlasScissorElisionAndDirtyRects() {
     return true;
 }
 
+bool TestPhase1SimdBlendSpansAndParallelDirtyTiles() {
+    // 1. 4-pixel SIMD + odd tail widths (1, 3, 4, 7, 19, 65) in BlendSpanOverNormalFast
+    {
+        constexpr std::uint32_t W = 240u;
+        constexpr std::uint32_t H = 180u;
+        const aero::Color clearCol{0.11f, 0.19f, 0.29f, 1.0f};
+
+        auto buildBaseWorld = [&](aero::VisualWorld& world, aero::VisualNodeId& outRoot) {
+            outRoot = world.CreateNode(aero::VisualKind::Box);
+            world.SetRoot(outRoot);
+            world.SetSize(outRoot, static_cast<float>(W), static_cast<float>(H));
+
+            const std::uint32_t stripeCols[4]{
+                aero::ParseColorRgba32("#FF1E3A8A"),
+                aero::ParseColorRgba32("#FF065F46"),
+                aero::ParseColorRgba32("#FF7C2D12"),
+                aero::ParseColorRgba32("#FF581C87"),
+            };
+            for (int s = 0; s < 4; ++s) {
+                const aero::VisualNodeId stripe = world.CreateNode(aero::VisualKind::Box);
+                world.AddChild(outRoot, stripe);
+                world.SetAlignment(stripe, aero::HorizontalAlignment::Left, aero::VerticalAlignment::Top);
+                world.SetMargin(stripe, static_cast<float>(s * 55 + 5), 6.0f, 0.0f, 0.0f);
+                world.SetSize(stripe, 52.0f, 168.0f);
+                world.SetBoxStyle(stripe, stripeCols[s], 0u, 0, 0, 0, 0, 0, 0, 0, 0);
+            }
+        };
+
+        aero::VisualWorld bgWorld;
+        aero::VisualNodeId bgRoot{};
+        buildBaseWorld(bgWorld, bgRoot);
+        bgWorld.UpdateLayout(static_cast<float>(W), static_cast<float>(H));
+
+        aero::VisualRenderAdapter bgAdapter;
+        aero::PagedRenderTree bgTree;
+        AERO_CHECK(bgAdapter.SyncPagedRenderTree(bgWorld, nullptr, bgTree, nullptr) >= 4u);
+        std::vector<std::uint8_t> bgRgba;
+        aero::ZeroCopyGpuStream::RasterizeTreeToRgba8(bgTree, W, H, bgRgba, clearCol);
+
+        aero::VisualWorld fgWorld;
+        aero::VisualNodeId fgRoot{};
+        buildBaseWorld(fgWorld, fgRoot);
+
+        constexpr int kOddWidths[6]{1, 3, 4, 7, 19, 65};
+        constexpr std::uint8_t kSrcR = 0xE8u;
+        constexpr std::uint8_t kSrcG = 0x5Du;
+        constexpr std::uint8_t kSrcB = 0x2Au;
+        constexpr std::uint8_t kSrcA = 0x96u;
+        const std::uint32_t overlayCol = aero::ParseColorRgba32("#96E85D2A");
+
+        for (int idx = 0; idx < 6; ++idx) {
+            // Sharp translucent box (SolidQuad span path)
+            const aero::VisualNodeId sharp = fgWorld.CreateNode(aero::VisualKind::Box);
+            fgWorld.AddChild(fgRoot, sharp);
+            fgWorld.SetAlignment(sharp, aero::HorizontalAlignment::Left, aero::VerticalAlignment::Top);
+            fgWorld.SetMargin(sharp, 13.0f + static_cast<float>(idx * 3), static_cast<float>(10 + idx * 12), 0.0f, 0.0f);
+            fgWorld.SetSize(sharp, static_cast<float>(kOddWidths[idx]), 8.0f);
+            fgWorld.SetBoxStyle(sharp, overlayCol, 0u, 0, 0, 0, 0, 0, 0, 0, 0);
+
+            // Rounded translucent box (SdfRoundedRect safe-interior span path)
+            const aero::VisualNodeId rounded = fgWorld.CreateNode(aero::VisualKind::Box);
+            fgWorld.AddChild(fgRoot, rounded);
+            fgWorld.SetAlignment(rounded, aero::HorizontalAlignment::Left, aero::VerticalAlignment::Top);
+            fgWorld.SetMargin(rounded, 11.0f + static_cast<float>(idx * 5), static_cast<float>(92 + idx * 14), 0.0f, 0.0f);
+            fgWorld.SetSize(rounded, static_cast<float>(kOddWidths[idx] + 10), 10.0f);
+            fgWorld.SetBoxStyle(rounded, overlayCol, 0u, 2, 2, 2, 2, 0, 0, 0, 0);
+        }
+
+        fgWorld.UpdateLayout(static_cast<float>(W), static_cast<float>(H));
+        aero::VisualRenderAdapter fgAdapter;
+        aero::PagedRenderTree fgTree;
+        AERO_CHECK(fgAdapter.SyncPagedRenderTree(fgWorld, nullptr, fgTree, nullptr) >= 16u);
+        std::vector<std::uint8_t> fgRgba;
+        aero::ZeroCopyGpuStream::RasterizeTreeToRgba8(fgTree, W, H, fgRgba, clearCol);
+
+        const float a = static_cast<float>(kSrcA) / 255.0f;
+        const float invA = 1.0f - a;
+        auto expectedChan = [&](std::uint8_t srcC, std::uint8_t dstC) noexcept -> std::uint8_t {
+            return static_cast<std::uint8_t>(
+                std::clamp(static_cast<float>(srcC) * a + 0.5f + static_cast<float>(dstC) * invA, 0.0f, 255.0f));
+        };
+
+        std::size_t mismatchCount = 0u;
+        for (int idx = 0; idx < 6; ++idx) {
+            const int x0 = 13 + idx * 3;
+            const int w = kOddWidths[idx];
+            const int py = 10 + idx * 12 + 4;
+            for (int px = x0; px < x0 + w; ++px) {
+                const std::size_t off = (static_cast<std::size_t>(py) * W + static_cast<std::size_t>(px)) * 4u;
+                if (fgRgba[off + 0u] != expectedChan(kSrcR, bgRgba[off + 0u]) ||
+                    fgRgba[off + 1u] != expectedChan(kSrcG, bgRgba[off + 1u]) ||
+                    fgRgba[off + 2u] != expectedChan(kSrcB, bgRgba[off + 2u]) ||
+                    fgRgba[off + 3u] != expectedChan(255u, bgRgba[off + 3u])) {
+                    ++mismatchCount;
+                }
+            }
+
+            const int rx0 = 11 + idx * 5 + 5;
+            const int rw = kOddWidths[idx];
+            const int rpy = 92 + idx * 14 + 5;
+            for (int px = rx0; px < rx0 + rw; ++px) {
+                const std::size_t off = (static_cast<std::size_t>(rpy) * W + static_cast<std::size_t>(px)) * 4u;
+                if (fgRgba[off + 0u] != expectedChan(kSrcR, bgRgba[off + 0u]) ||
+                    fgRgba[off + 1u] != expectedChan(kSrcG, bgRgba[off + 1u]) ||
+                    fgRgba[off + 2u] != expectedChan(kSrcB, bgRgba[off + 2u]) ||
+                    fgRgba[off + 3u] != expectedChan(255u, bgRgba[off + 3u])) {
+                    ++mismatchCount;
+                }
+            }
+        }
+        AERO_CHECK(mismatchCount == 0u);
+    }
+
+    // 2. Multi-threaded RasterizeTreeDirtyRectsToRgba8 on 384x320 (6x5 = 30 tiles, 8 dirty tiles across 4 bands)
+    {
+        constexpr std::uint32_t W = 384u;
+        constexpr std::uint32_t H = 320u;
+        const aero::Color clearCol{0.07f, 0.11f, 0.18f, 1.0f};
+
+        auto store = std::make_shared<aero::UIResourceStore>();
+        aero::DecodedImage tex;
+        tex.width = 24u;
+        tex.height = 24u;
+        tex.format = aero::ImageFormat::RawRgba8;
+        tex.rgbaPixels.resize(24u * 24u * 4u);
+        for (std::uint32_t y = 0u; y < 24u; ++y) {
+            for (std::uint32_t x = 0u; x < 24u; ++x) {
+                const std::size_t off = (static_cast<std::size_t>(y) * 24u + x) * 4u;
+                tex.rgbaPixels[off + 0u] = static_cast<std::uint8_t>(40u + x * 8u);
+                tex.rgbaPixels[off + 1u] = static_cast<std::uint8_t>(60u + y * 7u);
+                tex.rgbaPixels[off + 2u] = 210u;
+                tex.rgbaPixels[off + 3u] = 220u;
+            }
+        }
+        AERO_CHECK(store->Images().RegisterDecodedImage("mem://mt_dirty_tex.png", std::move(tex), false) != nullptr);
+
+        aero::VisualWorld world(nullptr, store.get());
+        const aero::VisualNodeId root = world.CreateNode(aero::VisualKind::Box);
+        world.SetRoot(root);
+        world.SetSize(root, static_cast<float>(W), static_cast<float>(H));
+
+        for (int row = 0; row < 5; ++row) {
+            const aero::VisualNodeId card = world.CreateNode(aero::VisualKind::Box);
+            world.AddChild(root, card);
+            world.SetAlignment(card, aero::HorizontalAlignment::Left, aero::VerticalAlignment::Top);
+            world.SetMargin(card, 12.0f, static_cast<float>(row * 64 + 8), 0.0f, 0.0f);
+            world.SetSize(card, 356.0f, 48.0f);
+            world.SetBoxStyle(card, aero::ParseColorRgba32("#AA2563EB"), 0u, 8, 8, 8, 8, 0, 0, 0, 0);
+        }
+
+        const aero::VisualNodeId img = world.CreateNode(aero::VisualKind::Image);
+        world.AddChild(root, img);
+        world.SetAlignment(img, aero::HorizontalAlignment::Left, aero::VerticalAlignment::Top);
+        world.SetMargin(img, 196.0f, 70.0f, 0.0f, 0.0f);
+        world.SetSize(img, 112.0f, 52.0f);
+        world.SetImage(img, "mem://mt_dirty_tex.png", aero::Stretch::Fill, aero::StretchDirection::Both, 0xFFFFFFFFu);
+
+        world.UpdateLayout(static_cast<float>(W), static_cast<float>(H));
+        aero::VisualRenderAdapter adapter;
+        aero::PagedRenderTree tree;
+        tree.SetResourceStore(store.get());
+        AERO_CHECK(adapter.SyncPagedRenderTree(world, nullptr, tree, store.get()) >= 6u);
+
+        std::vector<std::uint8_t> fullRef;
+        aero::ZeroCopyGpuStream::RasterizeTreeToRgba8(tree, W, H, fullRef, clearCol);
+
+        std::vector<std::uint8_t> partialBuf(static_cast<std::size_t>(W) * H * 4u);
+        for (std::size_t p = 0u; p < static_cast<std::size_t>(W) * H; ++p) {
+            partialBuf[p * 4u + 0u] = 0x13u;
+            partialBuf[p * 4u + 1u] = 0x37u;
+            partialBuf[p * 4u + 2u] = 0x5Au;
+            partialBuf[p * 4u + 3u] = 0xFFu;
+        }
+
+        const std::vector<aero::Rect> dirtyRects{
+            aero::Rect{10.0f, 10.0f, 90.0f, 36.0f},    // tx 0..1, ty 0 (2 tiles)
+            aero::Rect{200.0f, 76.0f, 100.0f, 40.0f},  // tx 3..4, ty 1 (2 tiles)
+            aero::Rect{72.0f, 140.0f, 110.0f, 40.0f},  // tx 1..2, ty 2 (2 tiles)
+            aero::Rect{264.0f, 266.0f, 96.0f, 40.0f},  // tx 4..5, ty 4 (2 tiles)
+        };
+
+        aero::SoftwareDirtyRectStats dStats{};
+        aero::ZeroCopyGpuStream::RasterizeTreeDirtyRectsToRgba8(
+            tree, W, H, dirtyRects, partialBuf, clearCol, &dStats);
+
+        AERO_CHECK(!dStats.fellBackToFullFrame);
+        AERO_CHECK(dStats.totalTiles == 30u);
+        AERO_CHECK(dStats.dirtyTiles == 8u);
+        AERO_CHECK(dStats.mergedStrips == 4u);
+
+        auto isTileExpectedDirty = [](std::uint32_t tx, std::uint32_t ty) noexcept -> bool {
+            return (ty == 0u && (tx == 0u || tx == 1u)) ||
+                   (ty == 1u && (tx == 3u || tx == 4u)) ||
+                   (ty == 2u && (tx == 1u || tx == 2u)) ||
+                   (ty == 4u && (tx == 4u || tx == 5u));
+        };
+
+        std::size_t dirtyDiffPixels = 0u;
+        std::size_t cleanTouchedPixels = 0u;
+        for (std::uint32_t py = 0u; py < H; ++py) {
+            for (std::uint32_t px = 0u; px < W; ++px) {
+                const std::size_t off = (static_cast<std::size_t>(py) * W + px) * 4u;
+                if (isTileExpectedDirty(px / 64u, py / 64u)) {
+                    if (std::memcmp(partialBuf.data() + off, fullRef.data() + off, 4u) != 0) {
+                        ++dirtyDiffPixels;
+                    }
+                } else {
+                    if (partialBuf[off + 0u] != 0x13u ||
+                        partialBuf[off + 1u] != 0x37u ||
+                        partialBuf[off + 2u] != 0x5Au ||
+                        partialBuf[off + 3u] != 0xFFu) {
+                        ++cleanTouchedPixels;
+                    }
+                }
+            }
+        }
+        AERO_CHECK(dirtyDiffPixels == 0u);
+        AERO_CHECK(cleanTouchedPixels == 0u);
+
+        // Verify lowered 0.50 full-frame fallback threshold (18 / 30 = 0.60 > 0.50)
+        aero::SoftwareDirtyRectStats fbStats{};
+        const std::vector<aero::Rect> largeDirty{aero::Rect{4.0f, 4.0f, 360.0f, 180.0f}};
+        aero::ZeroCopyGpuStream::RasterizeTreeDirtyRectsToRgba8(
+            tree, W, H, largeDirty, partialBuf, clearCol, &fbStats);
+        AERO_CHECK(fbStats.fellBackToFullFrame);
+        AERO_CHECK(std::memcmp(partialBuf.data(), fullRef.data(), fullRef.size()) == 0);
+    }
+
+    return true;
+}
+
 } // namespace
 
 int main() {
@@ -2006,6 +2237,7 @@ int main() {
         {"StandaloneCpuEvictionAndLazyReload", &TestStandaloneCpuEvictionAndLazyReload},
         {"NumericPlasmaAndRiveAtlasPaths", &TestNumericPlasmaAndRiveAtlasPaths},
         {"Phase4MultiPageAtlasScissorElisionAndDirtyRects", &TestPhase4MultiPageAtlasScissorElisionAndDirtyRects},
+        {"Phase1SimdBlendSpansAndParallelDirtyTiles", &TestPhase1SimdBlendSpansAndParallelDirtyTiles},
     };
 
     int passed = 0;

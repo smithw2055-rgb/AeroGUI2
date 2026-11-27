@@ -292,11 +292,18 @@ public:
     [[nodiscard]] std::uint64_t desktopJitInvokeHits() const noexcept {
         return desktopJitInvokeHits_.load(std::memory_order_relaxed);
     }
+    [[nodiscard]] std::uint64_t desktopJitInvokeHits(DomainKind domain) const noexcept {
+        return (domain == DomainKind::SimDeterministic)
+            ? desktopJitSimInvokeHits_.load(std::memory_order_relaxed)
+            : desktopJitUiInvokeHits_.load(std::memory_order_relaxed);
+    }
     [[nodiscard]] std::uint64_t desktopJitFallbackHits() const noexcept {
         return desktopJitFallbackHits_.load(std::memory_order_relaxed);
     }
     void resetDesktopJitCounters() noexcept {
         desktopJitInvokeHits_.store(0u, std::memory_order_relaxed);
+        desktopJitUiInvokeHits_.store(0u, std::memory_order_relaxed);
+        desktopJitSimInvokeHits_.store(0u, std::memory_order_relaxed);
         desktopJitFallbackHits_.store(0u, std::memory_order_relaxed);
     }
 
@@ -480,6 +487,8 @@ private:
 
     mutable std::atomic<std::uint64_t> globalObservableEpoch_{1u};
     mutable std::atomic<std::uint64_t> desktopJitInvokeHits_{0u};
+    mutable std::atomic<std::uint64_t> desktopJitUiInvokeHits_{0u};
+    mutable std::atomic<std::uint64_t> desktopJitSimInvokeHits_{0u};
     mutable std::atomic<std::uint64_t> desktopJitFallbackHits_{0u};
 };
 

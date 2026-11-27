@@ -55,8 +55,8 @@ public:
     }
 
     template <typename Fn>
-    void ParallelBands4(int totalHeight, Fn&& bandFn) {
-        if (totalHeight < 64 || gInScanlineBand) {
+    void ParallelBands4(int totalHeight, Fn&& bandFn, int minUnits = 64) {
+        if (totalHeight < std::max(4, minUnits) || gInScanlineBand) {
             bandFn(0, totalHeight);
             return;
         }
@@ -189,11 +189,12 @@ void BlendPixelOver(
     if (blendMode == BlendingMode::Normal) {
 #ifdef AERO_SW_SIMD_SSE2
         const __m128 vSrc = _mm_set_ps(255.0f, static_cast<float>(srcB), static_cast<float>(srcG), static_cast<float>(srcR));
-        const __m128 vDst = _mm_set_ps(
-            static_cast<float>(dstRgba[3]),
-            static_cast<float>(dstRgba[2]),
-            static_cast<float>(dstRgba[1]),
-            static_cast<float>(dstRgba[0]));
+        int rawDst = 0;
+        std::memcpy(&rawDst, dstRgba, 4u);
+        const __m128i vZeroI = _mm_setzero_si128();
+        const __m128i dstB8 = _mm_cvtsi32_si128(rawDst);
+        const __m128i dstU16 = _mm_unpacklo_epi8(dstB8, vZeroI);
+        const __m128 vDst = _mm_cvtepi32_ps(_mm_unpacklo_epi16(dstU16, vZeroI));
         const __m128 vA = _mm_set1_ps(a);
         const __m128 vInvA = _mm_set1_ps(invA);
         const __m128 vHalf = _mm_set1_ps(0.5f);
@@ -259,13 +260,33 @@ void BlendSpanOverNormalFast(
     const __m128 vInvA = _mm_set1_ps(invA);
     const __m128 vZero = _mm_setzero_ps();
     const __m128 v255 = _mm_set1_ps(255.0f);
-    for (int i = 0; i < count; ++i) {
+    const __m128i vZeroI = _mm_setzero_si128();
+    int i = 0;
+    for (; i + 4 <= count; i += 4) {
         std::uint8_t* d = dstRgbaSpan + static_cast<std::size_t>(i) * 4u;
-        const __m128 vDst = _mm_set_ps(
-            static_cast<float>(d[3]),
-            static_cast<float>(d[2]),
-            static_cast<float>(d[1]),
-            static_cast<float>(d[0]));
+        const __m128i raw4 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(d));
+        const __m128i u16_01 = _mm_unpacklo_epi8(raw4, vZeroI);
+        const __m128i u16_23 = _mm_unpackhi_epi8(raw4, vZeroI);
+        const __m128 vDst0 = _mm_cvtepi32_ps(_mm_unpacklo_epi16(u16_01, vZeroI));
+        const __m128 vDst1 = _mm_cvtepi32_ps(_mm_unpackhi_epi16(u16_01, vZeroI));
+        const __m128 vDst2 = _mm_cvtepi32_ps(_mm_unpacklo_epi16(u16_23, vZeroI));
+        const __m128 vDst3 = _mm_cvtepi32_ps(_mm_unpackhi_epi16(u16_23, vZeroI));
+
+        const __m128 c0 = _mm_min_ps(_mm_max_ps(_mm_add_ps(vSrcHalf, _mm_mul_ps(vDst0, vInvA)), vZero), v255);
+        const __m128 c1 = _mm_min_ps(_mm_max_ps(_mm_add_ps(vSrcHalf, _mm_mul_ps(vDst1, vInvA)), vZero), v255);
+        const __m128 c2 = _mm_min_ps(_mm_max_ps(_mm_add_ps(vSrcHalf, _mm_mul_ps(vDst2, vInvA)), vZero), v255);
+        const __m128 c3 = _mm_min_ps(_mm_max_ps(_mm_add_ps(vSrcHalf, _mm_mul_ps(vDst3, vInvA)), vZero), v255);
+
+        const __m128i i16_01 = _mm_packs_epi32(_mm_cvttps_epi32(c0), _mm_cvttps_epi32(c1));
+        const __m128i i16_23 = _mm_packs_epi32(_mm_cvttps_epi32(c2), _mm_cvttps_epi32(c3));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(d), _mm_packus_epi16(i16_01, i16_23));
+    }
+    for (; i < count; ++i) {
+        std::uint8_t* d = dstRgbaSpan + static_cast<std::size_t>(i) * 4u;
+        int rawPx = 0;
+        std::memcpy(&rawPx, d, 4u);
+        const __m128i u16 = _mm_unpacklo_epi8(_mm_cvtsi32_si128(rawPx), vZeroI);
+        const __m128 vDst = _mm_cvtepi32_ps(_mm_unpacklo_epi16(u16, vZeroI));
         const __m128 sum = _mm_add_ps(vSrcHalf, _mm_mul_ps(vDst, vInvA));
         const __m128 clamped = _mm_min_ps(_mm_max_ps(sum, vZero), v255);
         const __m128i i32 = _mm_cvttps_epi32(clamped);
@@ -273,6 +294,43 @@ void BlendSpanOverNormalFast(
         const __m128i u8 = _mm_packus_epi16(i16, i16);
         const std::uint32_t packed = static_cast<std::uint32_t>(_mm_cvtsi128_si32(u8));
         std::memcpy(d, &packed, 4u);
+    }
+#elif defined(AERO_SW_SIMD_NEON)
+    alignas(16) const float srcHalfArr[4]{
+        static_cast<float>(srcR) * a + 0.5f,
+        static_cast<float>(srcG) * a + 0.5f,
+        static_cast<float>(srcB) * a + 0.5f,
+        255.0f * a + 0.5f};
+    const float32x4_t vSrcHalf = vld1q_f32(srcHalfArr);
+    const float32x4_t vInvA = vdupq_n_f32(invA);
+    const float32x4_t vZero = vdupq_n_f32(0.0f);
+    const float32x4_t v255 = vdupq_n_f32(255.0f);
+    int i = 0;
+    for (; i + 4 <= count; i += 4) {
+        std::uint8_t* d = dstRgbaSpan + static_cast<std::size_t>(i) * 4u;
+        const uint8x16_t raw4 = vld1q_u8(d);
+        const uint16x8_t u16_01 = vmovl_u8(vget_low_u8(raw4));
+        const uint16x8_t u16_23 = vmovl_u8(vget_high_u8(raw4));
+        const float32x4_t vDst0 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(u16_01)));
+        const float32x4_t vDst1 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(u16_01)));
+        const float32x4_t vDst2 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(u16_23)));
+        const float32x4_t vDst3 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(u16_23)));
+
+        const uint32x4_t o0 = vcvtq_u32_f32(vminq_f32(vmaxq_f32(vaddq_f32(vSrcHalf, vmulq_f32(vDst0, vInvA)), vZero), v255));
+        const uint32x4_t o1 = vcvtq_u32_f32(vminq_f32(vmaxq_f32(vaddq_f32(vSrcHalf, vmulq_f32(vDst1, vInvA)), vZero), v255));
+        const uint32x4_t o2 = vcvtq_u32_f32(vminq_f32(vmaxq_f32(vaddq_f32(vSrcHalf, vmulq_f32(vDst2, vInvA)), vZero), v255));
+        const uint32x4_t o3 = vcvtq_u32_f32(vminq_f32(vmaxq_f32(vaddq_f32(vSrcHalf, vmulq_f32(vDst3, vInvA)), vZero), v255));
+
+        const uint16x8_t o16_01 = vcombine_u16(vqmovn_u32(o0), vqmovn_u32(o1));
+        const uint16x8_t o16_23 = vcombine_u16(vqmovn_u32(o2), vqmovn_u32(o3));
+        vst1q_u8(d, vcombine_u8(vqmovn_u16(o16_01), vqmovn_u16(o16_23)));
+    }
+    for (; i < count; ++i) {
+        std::uint8_t* d = dstRgbaSpan + static_cast<std::size_t>(i) * 4u;
+        d[0] = static_cast<std::uint8_t>(std::clamp(srcHalfArr[0] + static_cast<float>(d[0]) * invA, 0.0f, 255.0f));
+        d[1] = static_cast<std::uint8_t>(std::clamp(srcHalfArr[1] + static_cast<float>(d[1]) * invA, 0.0f, 255.0f));
+        d[2] = static_cast<std::uint8_t>(std::clamp(srcHalfArr[2] + static_cast<float>(d[2]) * invA, 0.0f, 255.0f));
+        d[3] = static_cast<std::uint8_t>(std::clamp(srcHalfArr[3] + static_cast<float>(d[3]) * invA, 0.0f, 255.0f));
     }
 #else
     for (int i = 0; i < count; ++i) {
@@ -1562,7 +1620,7 @@ void RasterizeSingleNode(
         const float maxX = std::max(std::max(v0.x, v1.x), std::max(v2.x, v3.x));
         const int pxStart = SafeFloorToInt(minX, clipMinX, clipMaxX);
         const int pxEnd = SafeCeilToInt(maxX, clipMinX, clipMaxX);
-        if (pxEnd <= pxStart) {
+        if (pxEnd <= effClipMinX || pxStart >= effClipMaxX || pxEnd <= pxStart) {
             continue;
         }
 
@@ -2025,8 +2083,8 @@ void RasterizeSingleNode(
                 if (minEdgeX > maxEdgeX) {
                     continue;
                 }
-                rowPxStart = std::max(pxStart, SafeFloorToInt(minEdgeX - 1.5f, pxStart - 2, pxEnd + 2));
-                rowPxEnd = std::min(pxEnd, SafeCeilToInt(maxEdgeX + 1.5f, pxStart - 2, pxEnd + 2));
+                rowPxStart = std::max(effClipMinX, std::max(pxStart, SafeFloorToInt(minEdgeX - 1.5f, pxStart - 2, pxEnd + 2)));
+                rowPxEnd = std::min(effClipMaxX, std::min(pxEnd, SafeCeilToInt(maxEdgeX + 1.5f, pxStart - 2, pxEnd + 2)));
                 if (rowPxStart >= rowPxEnd) {
                     continue;
                 }
@@ -2068,10 +2126,7 @@ void RasterizeSingleNode(
                         } else {
                             std::uint8_t* dstRow = outRgba8 +
                                 (static_cast<std::size_t>(py) * viewportWidth + static_cast<std::size_t>(xSpan0)) * 4u;
-                            const int spanCount = xSpan1 - xSpan0;
-                            for (int i = 0; i < spanCount; ++i) {
-                                BlendPixelOver(dstRow + static_cast<std::size_t>(i) * 4u, r8, g8, b8, baseAlpha, BlendingMode::Normal);
-                            }
+                            BlendSpanOverNormalFast(dstRow, xSpan1 - xSpan0, r8, g8, b8, baseAlpha);
                         }
                     }
                     continue;
@@ -2508,12 +2563,12 @@ void RasterizeSingleNode(
                             const std::uint8_t* p01 = rowTexPtr1 + static_cast<std::size_t>(x0) * 4u;
                             const std::uint8_t* p11 = rowTexPtr1 + static_cast<std::size_t>(x1) * 4u;
 #ifdef AERO_SW_SIMD_SSE2
-                            auto loadRgbaFloat4 = [](const std::uint8_t* p) noexcept -> __m128 {
-                                return _mm_set_ps(
-                                    static_cast<float>(p[3]),
-                                    static_cast<float>(p[2]),
-                                    static_cast<float>(p[1]),
-                                    static_cast<float>(p[0]));
+                            const __m128i vZeroTexI = _mm_setzero_si128();
+                            auto loadRgbaFloat4 = [vZeroTexI](const std::uint8_t* p) noexcept -> __m128 {
+                                int rawPx = 0;
+                                std::memcpy(&rawPx, p, 4u);
+                                const __m128i u16 = _mm_unpacklo_epi8(_mm_cvtsi32_si128(rawPx), vZeroTexI);
+                                return _mm_cvtepi32_ps(_mm_unpacklo_epi16(u16, vZeroTexI));
                             };
                             const __m128 v00 = loadRgbaFloat4(p00);
                             const __m128 v10 = loadRgbaFloat4(p10);
@@ -3712,10 +3767,41 @@ void ZeroCopyGpuStream::RasterizeTreeDirtyRectsToRgba8(
         return;
     }
 
-    if (static_cast<double>(dirtyTileCount) > 0.65 * static_cast<double>(totalTiles)) {
+    const double fullFrameFallbackRatio = (vpH >= 64) ? 0.50 : 0.65;
+    if (static_cast<double>(dirtyTileCount) > fullFrameFallbackRatio * static_cast<double>(totalTiles)) {
         stats.mergedStrips = 1u;
         stats.fellBackToFullFrame = true;
         RasterizeTreeToRgba8(tree, viewportWidth, viewportHeight, ioRgba8, clearColor);
+        if (outStats) *outStats = stats;
+        return;
+    }
+
+    const std::uint8_t* dirtyTilesPtr = tlDirtyTiles.data();
+    for (std::uint32_t ty = 0u; ty < tilesY; ++ty) {
+        const std::size_t rowBase = static_cast<std::size_t>(ty) * tilesX;
+        const int sy0 = static_cast<int>(ty * kTileSize);
+        const int sy1 = std::min(vpH, static_cast<int>((ty + 1u) * kTileSize));
+        if (sy1 <= sy0) {
+            continue;
+        }
+        std::uint32_t tx = 0u;
+        while (tx < tilesX) {
+            if (dirtyTilesPtr[rowBase + tx] == 0u) {
+                ++tx;
+                continue;
+            }
+            const std::uint32_t txStart = tx;
+            while (tx < tilesX && dirtyTilesPtr[rowBase + tx] != 0u) {
+                ++tx;
+            }
+            const int sx0 = static_cast<int>(txStart * kTileSize);
+            const int sx1 = std::min(vpW, static_cast<int>(tx * kTileSize));
+            if (sx1 > sx0) {
+                stats.mergedStrips += 1u;
+            }
+        }
+    }
+    if (stats.mergedStrips == 0u) {
         if (outStats) *outStats = stats;
         return;
     }
@@ -3785,58 +3871,73 @@ void ZeroCopyGpuStream::RasterizeTreeDirtyRectsToRgba8(
         tlNodeBounds[ni] = NodePxBounds{bX0, bY0, bX1, bY1};
     }
 
-    const int prevX0 = gRasterBandX0;
-    const int prevX1 = gRasterBandX1;
-    const int prevY0 = gRasterBandY0;
-    const int prevY1 = gRasterBandY1;
+    const NodePxBounds* nodeBoundsPtr = tlNodeBounds.data();
     std::uint8_t* rawOut = ioRgba8.data();
     const std::size_t rowStrideBytes = static_cast<std::size_t>(viewportWidth) * 4u;
 
-    for (std::uint32_t ty = 0u; ty < tilesY; ++ty) {
-        const std::size_t rowBase = static_cast<std::size_t>(ty) * tilesX;
-        const int sy0 = static_cast<int>(ty * kTileSize);
-        const int sy1 = std::min(vpH, static_cast<int>((ty + 1u) * kTileSize));
-        std::uint32_t tx = 0u;
-        while (tx < tilesX) {
-            if (tlDirtyTiles[rowBase + tx] == 0u) {
-                ++tx;
+    auto renderTileRowBand = [&](int tyBegin, int tyEnd) {
+        ScopedBandTexCacheGuard bandTexGuard;
+        const int prevX0 = gRasterBandX0;
+        const int prevX1 = gRasterBandX1;
+        const int prevY0 = gRasterBandY0;
+        const int prevY1 = gRasterBandY1;
+
+        for (int tyInt = tyBegin; tyInt < tyEnd; ++tyInt) {
+            const std::uint32_t ty = static_cast<std::uint32_t>(tyInt);
+            const std::size_t rowBase = static_cast<std::size_t>(ty) * tilesX;
+            const int sy0 = static_cast<int>(ty * kTileSize);
+            const int sy1 = std::min(vpH, static_cast<int>((ty + 1u) * kTileSize));
+            if (sy1 <= sy0) {
                 continue;
             }
-            const std::uint32_t txStart = tx;
-            while (tx < tilesX && tlDirtyTiles[rowBase + tx] != 0u) {
-                ++tx;
-            }
-            const int sx0 = static_cast<int>(txStart * kTileSize);
-            const int sx1 = std::min(vpW, static_cast<int>(tx * kTileSize));
-            if (sx1 <= sx0 || sy1 <= sy0) {
-                continue;
-            }
-            stats.mergedStrips += 1u;
+            std::uint32_t tx = 0u;
+            while (tx < tilesX) {
+                if (dirtyTilesPtr[rowBase + tx] == 0u) {
+                    ++tx;
+                    continue;
+                }
+                const std::uint32_t txStart = tx;
+                while (tx < tilesX && dirtyTilesPtr[rowBase + tx] != 0u) {
+                    ++tx;
+                }
+                const int sx0 = static_cast<int>(txStart * kTileSize);
+                const int sx1 = std::min(vpW, static_cast<int>(tx * kTileSize));
+                if (sx1 <= sx0) {
+                    continue;
+                }
 
-            const std::size_t stripCols = static_cast<std::size_t>(sx1 - sx0);
-            for (int py = sy0; py < sy1; ++py) {
-                auto* dst32 = reinterpret_cast<std::uint32_t*>(
-                    rawOut + static_cast<std::size_t>(py) * rowStrideBytes + static_cast<std::size_t>(sx0) * 4u);
-                std::fill_n(dst32, stripCols, clearPacked);
-            }
+                const std::size_t stripCols = static_cast<std::size_t>(sx1 - sx0);
+                for (int py = sy0; py < sy1; ++py) {
+                    auto* dst32 = reinterpret_cast<std::uint32_t*>(
+                        rawOut + static_cast<std::size_t>(py) * rowStrideBytes + static_cast<std::size_t>(sx0) * 4u);
+                    std::fill_n(dst32, stripCols, clearPacked);
+                }
 
-            gRasterBandX0 = sx0;
-            gRasterBandX1 = sx1;
-            gRasterBandY0 = sy0;
-            gRasterBandY1 = sy1;
-            for (std::uint32_t ni = 0u; ni < nNodes; ++ni) {
-                const NodePxBounds& nb = tlNodeBounds[ni];
-                if (nb.x1 > sx0 && nb.x0 < sx1 && nb.y1 > sy0 && nb.y0 < sy1) {
-                    RasterizeSingleNode(tree, ni, viewportWidth, viewportHeight, rawOut, nullptr);
+                gRasterBandX0 = sx0;
+                gRasterBandX1 = sx1;
+                gRasterBandY0 = sy0;
+                gRasterBandY1 = sy1;
+                for (std::uint32_t ni = 0u; ni < nNodes; ++ni) {
+                    const NodePxBounds& nb = nodeBoundsPtr[ni];
+                    if (nb.x1 > sx0 && nb.x0 < sx1 && nb.y1 > sy0 && nb.y0 < sy1) {
+                        RasterizeSingleNode(tree, ni, viewportWidth, viewportHeight, rawOut, nullptr);
+                    }
                 }
             }
         }
+
+        gRasterBandX0 = prevX0;
+        gRasterBandX1 = prevX1;
+        gRasterBandY0 = prevY0;
+        gRasterBandY1 = prevY1;
+    };
+
+    if (dirtyTileCount >= 4u && tilesY >= 4u && vpH >= 64) {
+        ScanlineWorkerPool::Instance().ParallelBands4(static_cast<int>(tilesY), renderTileRowBand, 4);
+    } else {
+        renderTileRowBand(0, static_cast<int>(tilesY));
     }
 
-    gRasterBandX0 = prevX0;
-    gRasterBandX1 = prevX1;
-    gRasterBandY0 = prevY0;
-    gRasterBandY1 = prevY1;
     if (outStats) *outStats = stats;
 }
 

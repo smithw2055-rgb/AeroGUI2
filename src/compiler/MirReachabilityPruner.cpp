@@ -114,14 +114,71 @@ constexpr std::array<std::string_view, 32> kColdSubsystemPropertyNames = {
     return (referencedColdPropMask & (std::uint64_t{1} << static_cast<unsigned>(idx))) == 0u;
 }
 
-[[nodiscard]] bool IsOptionalUiElementAccessorName(
-    std::string_view methodName,
-    std::uint64_t referencedColdPropMask) noexcept {
-    if (StartsWith(methodName, "get_") || StartsWith(methodName, "set_")) {
-        const std::string_view propName = methodName.substr(4u);
-        return IsOptionalUiElementPropertyName(propName, referencedColdPropMask);
+template <std::size_t N>
+constexpr bool IsStrictlySortedProps(const std::array<std::string_view, N>& arr) noexcept {
+    for (std::size_t i = 1u; i < N; ++i) {
+        if (!(arr[i - 1u] < arr[i])) {
+            return false;
+        }
     }
-    return false;
+    return true;
+}
+
+constexpr std::array<std::string_view, 27> kCppHostGetterPropertyNames = {
+    "Content",
+    "DataContext",
+    "Fill",
+    "HorizontalOffset",
+    "ImageSource",
+    "IsChecked",
+    "IsDragging",
+    "IsDropDownOpen",
+    "IsEnabled",
+    "IsExpanded",
+    "IsFocused",
+    "IsMouseOver",
+    "IsOpen",
+    "IsPressed",
+    "IsSubmenuOpen",
+    "MainWindow",
+    "Maximum",
+    "Minimum",
+    "Name",
+    "Password",
+    "SelectedIndex",
+    "SelectedItem",
+    "Text",
+    "Value",
+    "VerticalOffset",
+    "Viewport",
+    "ViewportUnits",
+};
+static_assert(IsStrictlySortedProps(kCppHostGetterPropertyNames));
+
+[[nodiscard]] bool IsHostGetterRootPropertyName(std::string_view propName) noexcept {
+    return std::binary_search(
+        kCppHostGetterPropertyNames.begin(),
+        kCppHostGetterPropertyNames.end(),
+        propName);
+}
+
+[[nodiscard]] bool ShouldRetainAeroUiAccessor(
+    std::string_view propName,
+    bool isGetter,
+    bool xamlReaderLive,
+    const std::unordered_set<std::string>& referencedAeroUiProps,
+    std::uint64_t referencedColdPropMask) {
+    if (propName.empty() || propName[0] == '_' ||
+        IsOptionalUiElementPropertyName(propName, referencedColdPropMask)) {
+        return false;
+    }
+    if (xamlReaderLive) {
+        return true;
+    }
+    if (isGetter && IsHostGetterRootPropertyName(propName)) {
+        return true;
+    }
+    return referencedAeroUiProps.find(std::string(propName)) != referencedAeroUiProps.end();
 }
 
 [[nodiscard]] bool IsHostRootMethod(
@@ -129,13 +186,16 @@ constexpr std::array<std::string_view, 32> kColdSubsystemPropertyNames = {
     const rs_sem::FunctionSymbol& method,
     const std::unordered_map<SymbolId, const rs_sem::TypeSymbol*>& typeById,
     const std::unordered_map<SymbolId, SymbolId>& funcIdToDeclaringTypeId,
-    std::uint64_t referencedColdPropMask) noexcept {
+    bool xamlReaderLive,
+    const std::unordered_set<std::string>& referencedAeroUiProps,
+    std::uint64_t referencedColdPropMask) {
     if (method.constructor || method.name == ".ctor" || method.name == ".cctor" ||
         method.name == owner.name) {
         return true;
     }
-    if (method.propertyGetter || method.propertySetter ||
-        StartsWith(method.name, "get_") || StartsWith(method.name, "set_")) {
+    const bool isGetPrefix = StartsWith(method.name, "get_");
+    const bool isSetPrefix = !isGetPrefix && StartsWith(method.name, "set_");
+    if (method.propertyGetter || method.propertySetter || isGetPrefix || isSetPrefix) {
         bool declaredInAeroUi = (owner.moduleName == "Aero.UI");
         if (!declaredInAeroUi && method.id != 0u) {
             if (const auto dIt = funcIdToDeclaringTypeId.find(method.id); dIt != funcIdToDeclaringTypeId.end()) {
@@ -144,13 +204,17 @@ constexpr std::array<std::string_view, 32> kColdSubsystemPropertyNames = {
                 }
             }
         }
-        if (declaredInAeroUi &&
-            (method.accessibility != rs_sem::Accessibility::Public ||
-             (method.name.size() > 4u && method.name[4u] == '_') ||
-             IsOptionalUiElementAccessorName(method.name, referencedColdPropMask))) {
+        if (!declaredInAeroUi) {
+            return true;
+        }
+        if (method.accessibility != rs_sem::Accessibility::Public || method.name.size() <= 4u) {
             return false;
         }
-        return true;
+        const std::string_view propName =
+            (isGetPrefix || isSetPrefix) ? std::string_view(method.name).substr(4u) : std::string_view{};
+        const bool isGetter = method.propertyGetter || isGetPrefix;
+        return ShouldRetainAeroUiAccessor(
+            propName, isGetter, xamlReaderLive, referencedAeroUiProps, referencedColdPropMask);
     }
     if (owner.delegateType && method.name == "Invoke") {
         return true;
@@ -170,7 +234,8 @@ constexpr std::array<std::string_view, 32> kColdSubsystemPropertyNames = {
             (method.name == "EnsureLoadedSubtree" || method.name == "ApplyTemplateSubtree")) {
             return true;
         }
-        if (owner.name == "FrameworkElement" && method.name == "ApplyTemplate") {
+        if ((owner.name == "FrameworkElement" || owner.name == "Control") &&
+            method.name == "ApplyTemplate") {
             return true;
         }
         if (owner.name == "Application" && method.name == "Run") {
@@ -188,7 +253,9 @@ constexpr std::array<std::string_view, 32> kColdSubsystemPropertyNames = {
     bool isInstantiatedOwner,
     const std::unordered_map<SymbolId, const rs_sem::TypeSymbol*>& typeById,
     const std::unordered_map<SymbolId, SymbolId>& funcIdToDeclaringTypeId,
-    std::uint64_t referencedColdPropMask) noexcept {
+    bool xamlReaderLive,
+    const std::unordered_set<std::string>& referencedAeroUiProps,
+    std::uint64_t referencedColdPropMask) {
     if (owner.delegateType && method.name == "Invoke") {
         return true;
     }
@@ -207,7 +274,9 @@ constexpr std::array<std::string_view, 32> kColdSubsystemPropertyNames = {
         return false;
     }
     if (isInstantiatedOwner &&
-        IsHostRootMethod(owner, method, typeById, funcIdToDeclaringTypeId, referencedColdPropMask)) {
+        IsHostRootMethod(
+            owner, method, typeById, funcIdToDeclaringTypeId,
+            xamlReaderLive, referencedAeroUiProps, referencedColdPropMask)) {
         return true;
     }
     if (liveFuncIds.count(method.id) != 0u) {
@@ -585,14 +654,113 @@ bool PruneUnreachableStdlibMir(
         }
     };
 
-    // 3. Seed roots: all non-stdlib modules + collect user reflection/binding property tokens.
+    // 3. Index Aero.UI public property accessors & seed roots from non-stdlib modules.
+    auto isFuncDeclaredInAeroUi = [&](const rs_sem::TypeSymbol& ownerType, SymbolId accId) noexcept -> bool {
+        if (ownerType.moduleName == "Aero.UI") {
+            return true;
+        }
+        if (accId == 0u) {
+            return false;
+        }
+        const auto dIt = funcIdToDeclaringTypeId.find(accId);
+        if (dIt == funcIdToDeclaringTypeId.end()) {
+            return false;
+        }
+        const auto tIt = typeById.find(dIt->second);
+        return tIt != typeById.end() && tIt->second->moduleName == "Aero.UI";
+    };
+
+    std::unordered_set<std::string> knownAeroUiPropNames;
+    std::unordered_map<std::string, std::vector<std::pair<SymbolId, SymbolId>>> aeroUiAccessorsByProp;
+    knownAeroUiPropNames.reserve(512u);
+    aeroUiAccessorsByProp.reserve(512u);
+    for (const auto& [tid, tPtr] : typeById) {
+        const rs_sem::TypeSymbol& t = *tPtr;
+        for (const auto& prop : t.properties) {
+            if (prop.accessibility != rs_sem::Accessibility::Public ||
+                prop.name.empty() || prop.name[0] == '_') {
+                continue;
+            }
+            const bool aeroUiProp =
+                (prop.getter.has_value() && isFuncDeclaredInAeroUi(t, prop.getter->id)) ||
+                (prop.setter.has_value() && isFuncDeclaredInAeroUi(t, prop.setter->id)) ||
+                (t.moduleName == "Aero.UI");
+            if (!aeroUiProp) {
+                continue;
+            }
+            knownAeroUiPropNames.insert(prop.name);
+            auto& vec = aeroUiAccessorsByProp[prop.name];
+            if (prop.getter.has_value() && prop.getter->id != 0u) {
+                vec.emplace_back(tid, prop.getter->id);
+            }
+            if (prop.setter.has_value() && prop.setter->id != 0u) {
+                vec.emplace_back(tid, prop.setter->id);
+            }
+        }
+        for (const auto& m : t.methods) {
+            if (m.accessibility != rs_sem::Accessibility::Public || m.name.size() <= 4u) {
+                continue;
+            }
+            const bool isGet = StartsWith(m.name, "get_");
+            const bool isSet = !isGet && StartsWith(m.name, "set_");
+            if (!isGet && !isSet) {
+                continue;
+            }
+            if (!isFuncDeclaredInAeroUi(t, m.id)) {
+                continue;
+            }
+            const std::string propName(std::string_view(m.name).substr(4u));
+            if (propName.empty() || propName[0] == '_') {
+                continue;
+            }
+            knownAeroUiPropNames.insert(propName);
+            if (m.id != 0u) {
+                aeroUiAccessorsByProp[propName].emplace_back(tid, m.id);
+            }
+        }
+    }
+
     constexpr std::uint64_t kAllColdPropMask =
         (kColdSubsystemPropertyNames.size() >= 64u)
             ? ~std::uint64_t{0}
             : ((std::uint64_t{1} << kColdSubsystemPropertyNames.size()) - 1u);
     std::uint64_t referencedColdPropMask = 0u;
-    auto collectTokensFromString = [&](std::string_view sv) {
-        if (referencedColdPropMask == kAllColdPropMask) {
+    std::unordered_set<std::string> referencedAeroUiProps;
+    referencedAeroUiProps.reserve(128u);
+    bool xamlReaderLive = false;
+
+    auto activateXamlReaderConservativeMode = [&]() {
+        if (xamlReaderLive) {
+            return;
+        }
+        xamlReaderLive = true;
+        for (const SymbolId instTid : instantiatedTypeIds) {
+            typeQueue.push_back(instTid);
+        }
+    };
+
+    auto markReferencedAeroUiProp = [&](std::string_view propName) {
+        if (propName.empty() || propName[0] == '_') {
+            return;
+        }
+        const std::string key(propName);
+        if (knownAeroUiPropNames.find(key) == knownAeroUiPropNames.end()) {
+            return;
+        }
+        if (referencedAeroUiProps.insert(key).second &&
+            !IsOptionalUiElementPropertyName(propName, referencedColdPropMask)) {
+            if (const auto it = aeroUiAccessorsByProp.find(key); it != aeroUiAccessorsByProp.end()) {
+                for (const auto& [ownerTid, accFuncId] : it->second) {
+                    if (instantiatedTypeIds.count(ownerTid) != 0u) {
+                        markFuncId(accFuncId);
+                    }
+                }
+            }
+        }
+    };
+
+    auto collectTokensFromString = [&](std::string_view sv, bool markDynamicProps) {
+        if (!markDynamicProps && referencedColdPropMask == kAllColdPropMask) {
             return;
         }
         std::size_t i = 0u;
@@ -612,12 +780,19 @@ bool PruneUnreachableStdlibMir(
                 if (const int idx = FindColdSubsystemPropIndex(tok); idx >= 0) {
                     referencedColdPropMask |= (std::uint64_t{1} << static_cast<unsigned>(idx));
                 }
-                if ((StartsWith(tok, "get_") || StartsWith(tok, "set_")) && tok.size() > 4u) {
+                const bool hasAccPrefix =
+                    (StartsWith(tok, "get_") || StartsWith(tok, "set_")) && tok.size() > 4u;
+                if (hasAccPrefix) {
                     if (const int idx = FindColdSubsystemPropIndex(tok.substr(4u)); idx >= 0) {
                         referencedColdPropMask |= (std::uint64_t{1} << static_cast<unsigned>(idx));
                     }
                 }
-                if (referencedColdPropMask == kAllColdPropMask) {
+                if (markDynamicProps) {
+                    markReferencedAeroUiProp(tok);
+                    if (hasAccPrefix) {
+                        markReferencedAeroUiProp(tok.substr(4u));
+                    }
+                } else if (referencedColdPropMask == kAllColdPropMask) {
                     return;
                 }
             }
@@ -630,15 +805,13 @@ bool PruneUnreachableStdlibMir(
         }
         for (const auto& fn : mod.functions) {
             markFuncId(fn.symbolId);
-            if (referencedColdPropMask != kAllColdPropMask) {
-                for (const auto& bb : fn.blocks) {
-                    for (const auto& inst : bb.instructions) {
-                        if (!inst.stringImmediate.empty()) {
-                            collectTokensFromString(inst.stringImmediate);
-                        }
-                        if (!inst.symbolName.empty()) {
-                            collectTokensFromString(inst.symbolName);
-                        }
+            for (const auto& bb : fn.blocks) {
+                for (const auto& inst : bb.instructions) {
+                    if (!inst.stringImmediate.empty()) {
+                        collectTokensFromString(inst.stringImmediate, true);
+                    }
+                    if (!inst.symbolName.empty() && referencedColdPropMask != kAllColdPropMask) {
+                        collectTokensFromString(inst.symbolName, false);
                     }
                 }
             }
@@ -696,6 +869,17 @@ bool PruneUnreachableStdlibMir(
             }
             const rs_sem::TypeSymbol& type = *tIt->second;
 
+            if (type.moduleName == "Aero.UI") {
+                if (type.name == "XamlReader") {
+                    activateXamlReaderConservativeMode();
+                } else if (type.name == "RichText") {
+                    markReferencedAeroUiProp("Text");
+                } else if (type.name == "PopupService") {
+                    markFuncByName("Aero.UI::PopupService.SetOverlayHost");
+                    markFuncByName("PopupService.SetOverlayHost");
+                }
+            }
+
             if (!workbenchFactoriesSeeded &&
                 (type.name == "XamlReader" || isWorkbenchControlName(type.name))) {
                 workbenchFactoriesSeeded = true;
@@ -729,29 +913,32 @@ bool PruneUnreachableStdlibMir(
                 for (const auto& ctor : type.constructors) {
                     markFuncId(ctor.id);
                 }
-                auto isDeclaredInAeroUi = [&](SymbolId accId) noexcept -> bool {
-                    if (type.moduleName == "Aero.UI") return true;
-                    if (accId == 0u) return false;
-                    const auto dIt = funcIdToDeclaringTypeId.find(accId);
-                    if (dIt == funcIdToDeclaringTypeId.end()) return false;
-                    const auto tIt = typeById.find(dIt->second);
-                    return tIt != typeById.end() && tIt->second->moduleName == "Aero.UI";
-                };
                 for (const auto& prop : type.properties) {
                     const bool aeroUiProp =
-                        (prop.getter.has_value() && isDeclaredInAeroUi(prop.getter->id)) ||
-                        (prop.setter.has_value() && isDeclaredInAeroUi(prop.setter->id)) ||
+                        (prop.getter.has_value() && isFuncDeclaredInAeroUi(type, prop.getter->id)) ||
+                        (prop.setter.has_value() && isFuncDeclaredInAeroUi(type, prop.setter->id)) ||
                         (type.moduleName == "Aero.UI");
-                    if (aeroUiProp &&
-                        (prop.accessibility != rs_sem::Accessibility::Public ||
-                         StartsWith(prop.name, "_") ||
-                         IsOptionalUiElementPropertyName(prop.name, referencedColdPropMask))) {
+                    if (!aeroUiProp) {
+                        if (prop.getter.has_value()) {
+                            markFuncId(prop.getter->id);
+                        }
+                        if (prop.setter.has_value()) {
+                            markFuncId(prop.setter->id);
+                        }
                         continue;
                     }
-                    if (prop.getter.has_value()) {
+                    if (prop.accessibility != rs_sem::Accessibility::Public ||
+                        prop.name.empty() || prop.name[0] == '_') {
+                        continue;
+                    }
+                    if (prop.getter.has_value() &&
+                        ShouldRetainAeroUiAccessor(
+                            prop.name, true, xamlReaderLive, referencedAeroUiProps, referencedColdPropMask)) {
                         markFuncId(prop.getter->id);
                     }
-                    if (prop.setter.has_value()) {
+                    if (prop.setter.has_value() &&
+                        ShouldRetainAeroUiAccessor(
+                            prop.name, false, xamlReaderLive, referencedAeroUiProps, referencedColdPropMask)) {
                         markFuncId(prop.setter->id);
                     }
                 }
@@ -759,7 +946,9 @@ bool PruneUnreachableStdlibMir(
             for (const auto& method : type.methods) {
                 const bool isDelegateInvoke = (type.delegateType && method.name == "Invoke");
                 if ((isInstantiated &&
-                     IsHostRootMethod(type, method, typeById, funcIdToDeclaringTypeId, referencedColdPropMask)) ||
+                     IsHostRootMethod(
+                         type, method, typeById, funcIdToDeclaringTypeId,
+                         xamlReaderLive, referencedAeroUiProps, referencedColdPropMask)) ||
                     isDelegateInvoke) {
                     markFuncId(method.id);
                 }
@@ -793,6 +982,10 @@ bool PruneUnreachableStdlibMir(
                 continue;
             }
             const rs_mir::Function& fn = *fIt->second;
+
+            if (StartsWith(fn.name, "XamlReader.")) {
+                activateXamlReaderConservativeMode();
+            }
 
             if (const auto dtIt = funcIdToDeclaringTypeId.find(fid); dtIt != funcIdToDeclaringTypeId.end()) {
                 if (EndsWith(fn.name, "..ctor")) {
@@ -896,7 +1089,9 @@ bool PruneUnreachableStdlibMir(
                     t.methods.end(),
                     [&](const rs_sem::FunctionSymbol& m) {
                         return !ShouldRetainMethodOnType(
-                            t, m, liveFuncIds, slotIds, isInstantiatedOwner, typeById, funcIdToDeclaringTypeId, referencedColdPropMask);
+                            t, m, liveFuncIds, slotIds, isInstantiatedOwner,
+                            typeById, funcIdToDeclaringTypeId,
+                            xamlReaderLive, referencedAeroUiProps, referencedColdPropMask);
                     }),
                 t.methods.end());
             t.constructors.erase(

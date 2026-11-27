@@ -69,6 +69,12 @@ struct AeroStencilJitStats {
     std::size_t machineCodeBytes = 0;
     std::uint64_t invokeHits = 0;
     std::uint64_t fallbackHits = 0;
+    bool simActive = false;
+    std::size_t simTrackedFunctions = 0;
+    std::size_t simNativeFunctions = 0;
+    std::size_t simMachineCodeBytes = 0;
+    std::uint64_t uiInvokeHits = 0;
+    std::uint64_t simInvokeHits = 0;
 };
 
 #ifdef AERO_HAS_COMPILER_V3
@@ -286,6 +292,8 @@ private:
     void FlushBindings();
     void FlushBindingsPostLayout();
     void StepFrameInternal(float dtSeconds, bool forceRenderSync, bool skipScriptFrameCallbacks);
+    void SetupStencilJitIfEnabled();
+    void EnsureSimStencilJit() const;
     [[nodiscard]] Interpreter* EnsureSimInterpreter() const;
     bool DispatchPendingCanvasDraws();
     [[nodiscard]] bool InvokeSymbol(
@@ -323,6 +331,7 @@ private:
 
     std::shared_ptr<const ProgramImage> programImage_;
     std::shared_ptr<void> uiStencilModule_;
+    mutable std::shared_ptr<void> simStencilModule_;
     std::unique_ptr<Interpreter> interpreter_;
     mutable std::unique_ptr<Interpreter> simInterpreter_;
 

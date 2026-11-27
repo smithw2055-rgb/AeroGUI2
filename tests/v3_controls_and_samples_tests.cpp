@@ -693,6 +693,82 @@ void TestSample05DualDomainSimHud(aero::rs_comp::CompilerSession& session) {
         "05 Track-B HUD mutation did not alter rendered framebuffer pixels");
 }
 
+void TestSample05DualDomainStencilJit(aero::rs_comp::CompilerSession& session) {
+    std::cout << "[Test] 05_DualDomainSimHud with Dual-Domain StencilJIT...\n";
+    aero::AeroAppHostConfig hc;
+    hc.viewportWidth = 860u;
+    hc.viewportHeight = 560u;
+    hc.headless = true;
+    hc.preferSoftwareRasterizer = true;
+    hc.enableStencilJit = true;
+    hc.stencilJitHotnessThreshold = 2u;
+
+    aero::AeroAppHost host(hc);
+    std::string err;
+    Require(host.CompileAndLoad(BuildSampleCompileInput("05_DualDomainSimHud", session), &err),
+        "05_DualDomainSimHud StencilJIT CompileAndLoad failed: " + err);
+    if (!host.RootVisualNode().IsValid()) {
+        return;
+    }
+
+    const aero::ObjectRef rootObj = host.RootScriptObject();
+    const aero::ObjectRef simObj = host.SimScriptObject();
+    Require(rootObj.valid() && host.Domains().heapForObject(rootObj) == &host.Domains().uiHeap(),
+        "05 JIT: MainWindow must reside on UiHeap");
+    Require(simObj.valid() && host.Domains().heapForObject(simObj) == &host.Domains().simHeap(),
+        "05 JIT: SimTelemetryState must reside on SimHeap");
+
+    float boostX = 0.0f, boostY = 0.0f;
+    float shieldX = 0.0f, shieldY = 0.0f;
+    Require(RequireNodeCenter(host, "BoostBtn", boostX, boostY), "05 JIT: BoostBtn missing");
+    Require(RequireNodeCenter(host, "ShieldBtn", shieldX, shieldY), "05 JIT: ShieldBtn missing");
+
+    float thrustBefore = 0.0f;
+    float headingBefore = 0.0f;
+    Require(ReadFloatMember(host, simObj, "Thrust", thrustBefore), "05 JIT: read initial Thrust failed");
+    Require(ReadFloatMember(host, simObj, "HeadingDeg", headingBefore), "05 JIT: read initial HeadingDeg failed");
+
+    for (int f = 0; f < 10; ++f) {
+        if (f < 4) {
+            host.InjectClick(boostX, boostY);
+        } else if (f < 7) {
+            host.InjectClick(shieldX, shieldY);
+        }
+        host.StepFrame(0.05f, f == 9);
+    }
+
+    float thrustAfter = 0.0f;
+    float headingAfter = 0.0f;
+    std::int64_t cmdCount = 0;
+    Require(ReadFloatMember(host, simObj, "Thrust", thrustAfter) && thrustAfter > thrustBefore + 80.0f,
+        "05 JIT: [SimCommand] ApplyAfterburner native promotion failed to update Thrust");
+    Require(ReadFloatMember(host, simObj, "HeadingDeg", headingAfter) && headingAfter > headingBefore + 50.0f,
+        "05 JIT: Sim AdvanceTick + ApplyAfterburner failed to advance HeadingDeg");
+    Require(ReadIntMember(host, simObj, "CommandCount", cmdCount) && cmdCount == 7,
+        "05 JIT: expected CommandCount == 7, got " + std::to_string(cmdCount));
+
+    std::vector<std::uint8_t> jitFrame;
+    Require(host.RenderHeadlessRgba(860u, 560u, jitFrame), "05 JIT: RenderHeadlessRgba failed");
+    Require(CountDistinctColors(jitFrame) >= 8u, "05 JIT: rendered HUD frame blank/uniform");
+
+    const aero::AeroStencilJitStats jitStats = host.StencilJitStats();
+    if (jitStats.nativeBackendActive) {
+        Require(jitStats.active && jitStats.simActive,
+            "05 JIT: both UiPresentation and SimDeterministic StencilModules must be active");
+        Require(jitStats.nativeFunctions >= 2u && jitStats.simNativeFunctions >= 1u,
+            "05 JIT: hot functions in both UI and Sim domains must promote to native machine code");
+        Require(jitStats.machineCodeBytes > 0u && jitStats.simMachineCodeBytes > 0u,
+            "05 JIT: both UI and Sim StencilModules must emit machine code");
+        Require(jitStats.invokeHits > 0u && jitStats.uiInvokeHits > 0u && jitStats.simInvokeHits > 0u,
+            "05 JIT: DesktopJitInvoker must record invoke hits in both UI and Sim domains");
+    }
+
+    host.Shutdown();
+    const aero::AeroStencilJitStats resetStats = host.StencilJitStats();
+    Require(!resetStats.active && !resetStats.simActive && resetStats.nativeFunctions == 0u,
+        "05 JIT: Shutdown must tear down both UI and Sim StencilModules");
+}
+
 void TestRegressionsFixed(aero::rs_comp::CompilerSession& session) {
     std::cout << "[Test] RegressionsFixed (ManagedAnim / SVG / TextBlock / XamlReader / Lifecycle)...\n";
 
@@ -2348,6 +2424,7 @@ int main() {
     TestSample03ControlGallery(sharedSession);
     TestSample04VectorAndCanvas(sharedSession);
     TestSample05DualDomainSimHud(sharedSession);
+    TestSample05DualDomainStencilJit(sharedSession);
     TestRegressionsFixed(sharedSession);
     TestGalleryEngineRuntimeFixes(sharedSession);
     TestPhase1OptimizationRegressions(sharedSession);

@@ -465,8 +465,9 @@ namespace {
                     return true;
                 }
             }
-            if (slot->getterSymbolId != 0u && interp) {
-                const auto exec = interp->invoke(slot->getterSymbolId, {UnifiedValue{obj}});
+            if (slot->getterSymbolId != 0u && (interp || domains.hasDesktopJitInvoker())) {
+                const UnifiedValue arg0{obj};
+                const auto exec = domains.invokeMethod(domains.activeDomain(), interp, slot->getterSymbolId, &arg0, 1u);
                 if (exec.succeeded) {
                     outValue = exec.value;
                     return true;
@@ -487,8 +488,9 @@ namespace {
         }
         const SymbolId getterSym = FindBytecodeClassMethod(
             *image, typeId, "get_" + std::string(memberName), 0u);
-        if (getterSym != 0u && interp) {
-            const auto exec = interp->invoke(getterSym, {UnifiedValue{obj}});
+        if (getterSym != 0u && (interp || domains.hasDesktopJitInvoker())) {
+            const UnifiedValue arg0{obj};
+            const auto exec = domains.invokeMethod(domains.activeDomain(), interp, getterSym, &arg0, 1u);
             if (exec.succeeded) {
                 outValue = exec.value;
                 return true;
@@ -972,6 +974,7 @@ void AeroAppHost::ResetLoadedProgramState() noexcept {
     desktopHost_.SetStateFlags(false, false, false, false);
 
     domains_.clearDesktopJitInvoker();
+    simStencilModule_.reset();
     uiStencilModule_.reset();
 
     if (simInterpreter_) {
@@ -1157,65 +1160,10 @@ bool AeroAppHost::LoadProgramImageInternal(
     }
 
     interpreter_->setBindingRegistry(bindings_);
+    SetupStencilJitIfEnabled();
     if (domains_.hasSimStateTypes() || domains_.hasSimCommands()) {
         (void)EnsureSimInterpreter();
     }
-
-#ifdef AERO_HAS_STENCIL_JIT
-    if (config_.enableStencilJit && realscript::jit::StencilJit::nativeAvailable()) {
-        const bool isLazyProgram = (programImage_->totalLazyFunctionCount() > 0u);
-        const realscript::jit::StencilJit jitCompiler;
-        realscript::jit::StencilJitOptions jitOpts{};
-        jitOpts.enableNativeCodegen = true;
-        jitOpts.enableThreadedFallback = !isLazyProgram;
-        jitOpts.hotnessThreshold = isLazyProgram
-            ? std::max<std::uint32_t>(1u, config_.stencilJitHotnessThreshold)
-            : config_.stencilJitHotnessThreshold;
-        auto compileRes = jitCompiler.compile(programImage_, jitOpts);
-        if (compileRes.succeeded() &&
-            compileRes.module &&
-            compileRes.module->valid() &&
-            (isLazyProgram ||
-             jitOpts.hotnessThreshold > 0u ||
-             compileRes.nativeFunctionCount > 0u ||
-             compileRes.threadedFunctionCount > 0u)) {
-            auto stencilMod = compileRes.module;
-            stencilMod->setHeap(domains_.uiHeapPtr());
-            stencilMod->setBindingRegistry(bindings_);
-            uiStencilModule_ = stencilMod;
-            domains_.resetDesktopJitCounters();
-            domains_.setDesktopJitInvoker(
-                [stencilMod, policy = domains_.executionPolicy(DomainKind::UiPresentation)](
-                    DomainKind domain,
-                    SymbolId functionId,
-                    const UnifiedValue* arguments,
-                    std::size_t argumentCount,
-                    bool& outSucceeded,
-                    UnifiedValue& outResult,
-                    rs_rt::RuntimeError& outError) -> bool {
-                    if (domain != DomainKind::UiPresentation) {
-                        return false;
-                    }
-                    rs_rt::ExecutionOptions execOpts{};
-                    execOpts.limits.instructionBudget = 128'000'000u;
-                    execOpts.limits.gcWorkBudget = 0u;
-                    execOpts.executionPolicy = policy;
-                    rs_rt::ExecutionResult exec{};
-                    if (!stencilMod->tryInvokeSpan(
-                            functionId,
-                            rs_rt::ValueSpan(arguments, argumentCount),
-                            std::move(execOpts),
-                            exec)) {
-                        return false;
-                    }
-                    outSucceeded = exec.succeeded;
-                    outResult = std::move(exec.value);
-                    outError = std::move(exec.error);
-                    return true;
-                });
-        }
-    }
-#endif
 
     ResolveDispatchSymbols();
     logTrace("LoadProgramImage: bindings & symbols ready");
@@ -1375,6 +1323,118 @@ bool AeroAppHost::LoadAotProgram(
     return true;
 }
 
+void AeroAppHost::SetupStencilJitIfEnabled() {
+    uiStencilModule_.reset();
+    simStencilModule_.reset();
+    domains_.resetDesktopJitCounters();
+#ifdef AERO_HAS_STENCIL_JIT
+    if (!config_.enableStencilJit || !programImage_ || !realscript::jit::StencilJit::nativeAvailable()) {
+        return;
+    }
+    const bool isLazyProgram = (programImage_->totalLazyFunctionCount() > 0u);
+    const realscript::jit::StencilJit jitCompiler;
+    realscript::jit::StencilJitOptions jitOpts{};
+    jitOpts.enableNativeCodegen = true;
+    jitOpts.enableThreadedFallback = !isLazyProgram;
+    jitOpts.hotnessThreshold = isLazyProgram
+        ? std::max<std::uint32_t>(1u, config_.stencilJitHotnessThreshold)
+        : config_.stencilJitHotnessThreshold;
+    auto compileRes = jitCompiler.compile(programImage_, jitOpts);
+    if (!compileRes.succeeded() ||
+        !compileRes.module ||
+        !compileRes.module->valid() ||
+        !(isLazyProgram ||
+          jitOpts.hotnessThreshold > 0u ||
+          compileRes.nativeFunctionCount > 0u ||
+          compileRes.threadedFunctionCount > 0u)) {
+        return;
+    }
+    auto uiMod = compileRes.module;
+    uiMod->setHeap(domains_.uiHeapPtr());
+    uiMod->setBindingRegistry(bindings_);
+    uiStencilModule_ = uiMod;
+    if (simInterpreter_) {
+        EnsureSimStencilJit();
+    }
+    domains_.setDesktopJitInvoker(
+        [this](
+            DomainKind domain,
+            SymbolId functionId,
+            const UnifiedValue* arguments,
+            std::size_t argumentCount,
+            bool& outSucceeded,
+            UnifiedValue& outResult,
+            rs_rt::RuntimeError& outError) -> bool {
+            const realscript::jit::StencilModule* targetMod = nullptr;
+            if (domain == DomainKind::UiPresentation) {
+                targetMod = static_cast<const realscript::jit::StencilModule*>(uiStencilModule_.get());
+            } else if (domain == DomainKind::SimDeterministic) {
+                if (!simStencilModule_) {
+                    EnsureSimStencilJit();
+                }
+                targetMod = static_cast<const realscript::jit::StencilModule*>(simStencilModule_.get());
+            } else {
+                return false;
+            }
+            if (!targetMod || !targetMod->valid()) {
+                return false;
+            }
+            rs_rt::ExecutionOptions execOpts{};
+            execOpts.limits.instructionBudget = 128'000'000u;
+            execOpts.limits.gcWorkBudget = 0u;
+            execOpts.executionPolicy = domains_.executionPolicy(domain);
+            rs_rt::ExecutionResult exec{};
+            if (!targetMod->tryInvokeSpan(
+                    functionId,
+                    rs_rt::ValueSpan(arguments, argumentCount),
+                    std::move(execOpts),
+                    exec)) {
+                return false;
+            }
+            outSucceeded = exec.succeeded;
+            outResult = std::move(exec.value);
+            outError = std::move(exec.error);
+            return true;
+        });
+#endif
+}
+
+void AeroAppHost::EnsureSimStencilJit() const {
+#ifdef AERO_HAS_STENCIL_JIT
+    if (simStencilModule_ || !config_.enableStencilJit || !programImage_ ||
+        !realscript::jit::StencilJit::nativeAvailable()) {
+        return;
+    }
+    const bool isLazyProgram = (programImage_->totalLazyFunctionCount() > 0u);
+    const realscript::jit::StencilJit jitCompiler;
+    realscript::jit::StencilJitOptions jitOpts{};
+    jitOpts.enableNativeCodegen = true;
+    jitOpts.enableThreadedFallback = !isLazyProgram;
+    jitOpts.hotnessThreshold = isLazyProgram
+        ? std::max<std::uint32_t>(1u, config_.stencilJitHotnessThreshold)
+        : config_.stencilJitHotnessThreshold;
+    auto compileRes = jitCompiler.compile(programImage_, jitOpts);
+    if (compileRes.succeeded() &&
+        compileRes.module &&
+        compileRes.module->valid() &&
+        (isLazyProgram ||
+         jitOpts.hotnessThreshold > 0u ||
+         compileRes.nativeFunctionCount > 0u ||
+         compileRes.threadedFunctionCount > 0u)) {
+        auto simMod = compileRes.module;
+        simMod->setHeap(domains_.simHeapPtr());
+        simMod->setBindingRegistry(bindings_);
+        simStencilModule_ = simMod;
+        if (uiStencilModule_) {
+            const auto uiMod = std::static_pointer_cast<const realscript::jit::StencilModule>(uiStencilModule_);
+            if (uiMod && uiMod->valid()) {
+                uiMod->attachToProgramImage(*programImage_);
+            }
+        }
+    }
+#endif
+}
+
 Interpreter* AeroAppHost::EnsureSimInterpreter() const {
     if (!simInterpreter_ && programImage_) {
         simInterpreter_ = std::make_unique<Interpreter>(programImage_, domains_.simHeapPtr());
@@ -1382,6 +1442,7 @@ Interpreter* AeroAppHost::EnsureSimInterpreter() const {
         if (bindings_) {
             simInterpreter_->setBindingRegistry(bindings_);
         }
+        EnsureSimStencilJit();
     }
     return simInterpreter_.get();
 }
@@ -3417,6 +3478,8 @@ VisualNodeId AeroAppHost::FindVisualByOwnerName(std::string_view elementName) co
 AeroStencilJitStats AeroAppHost::StencilJitStats() const noexcept {
     AeroStencilJitStats stats{};
     stats.invokeHits = domains_.desktopJitInvokeHits();
+    stats.uiInvokeHits = domains_.desktopJitInvokeHits(DomainKind::UiPresentation);
+    stats.simInvokeHits = domains_.desktopJitInvokeHits(DomainKind::SimDeterministic);
     stats.fallbackHits = domains_.desktopJitFallbackHits();
 #ifdef AERO_HAS_STENCIL_JIT
     if (uiStencilModule_) {
@@ -3424,11 +3487,27 @@ AeroStencilJitStats AeroAppHost::StencilJitStats() const noexcept {
         if (mod && mod->valid()) {
             stats.active = true;
             stats.nativeBackendActive = mod->nativeBackendActive();
-            stats.trackedFunctions = mod->totalFunctionCount();
-            stats.nativeFunctions = mod->nativeFunctionCount();
-            stats.threadedFunctions = mod->threadedFunctionCount();
-            stats.fallbackFunctions = mod->fallbackFunctionCount();
-            stats.machineCodeBytes = mod->machineCodeBytes();
+            stats.trackedFunctions += mod->totalFunctionCount();
+            stats.nativeFunctions += mod->nativeFunctionCount();
+            stats.threadedFunctions += mod->threadedFunctionCount();
+            stats.fallbackFunctions += mod->fallbackFunctionCount();
+            stats.machineCodeBytes += mod->machineCodeBytes();
+        }
+    }
+    if (simStencilModule_) {
+        const auto simMod = std::static_pointer_cast<const realscript::jit::StencilModule>(simStencilModule_);
+        if (simMod && simMod->valid()) {
+            stats.active = true;
+            stats.simActive = true;
+            stats.nativeBackendActive = stats.nativeBackendActive || simMod->nativeBackendActive();
+            stats.simTrackedFunctions = simMod->totalFunctionCount();
+            stats.simNativeFunctions = simMod->nativeFunctionCount();
+            stats.simMachineCodeBytes = simMod->machineCodeBytes();
+            stats.trackedFunctions += simMod->totalFunctionCount();
+            stats.nativeFunctions += simMod->nativeFunctionCount();
+            stats.threadedFunctions += simMod->threadedFunctionCount();
+            stats.fallbackFunctions += simMod->fallbackFunctionCount();
+            stats.machineCodeBytes += simMod->machineCodeBytes();
         }
     }
 #endif
