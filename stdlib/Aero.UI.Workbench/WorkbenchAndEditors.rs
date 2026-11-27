@@ -5418,6 +5418,7 @@ public static void __RegisterWorkbenchXamlFactories() {
     XamlElementFactoryRegistry.Register("NumericScrubber", () => { return new NumericScrubber(); });
     XamlElementFactoryRegistry.Register("Vector2Field", () => { return new Vector2Field(); });
     XamlElementFactoryRegistry.Register("Vector3Field", () => { return new Vector3Field(); });
+    XamlElementFactoryRegistry.Register("ColorPicker", () => { return new ColorPicker(); });
     XamlElementFactoryRegistry.Register("ViewportSurface", () => { return new ViewportSurface(); });
     XamlElementFactoryRegistry.Register("DockPane", () => { return new DockPane(); });
     XamlElementFactoryRegistry.Register("DockTabGroup", () => { return new DockTabGroup(); });

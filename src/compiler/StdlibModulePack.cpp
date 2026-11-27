@@ -218,6 +218,17 @@ std::uint32_t InferRequiredStdlibPackages(const AeroV3CompileInput& input) noexc
         }
         if (hasAny({
                 "PropertyGrid",
+                "ColorPicker",
+                "NumericScrubber",
+                "Vector2Field",
+                "Vector3Field",
+                "ViewportSurface",
+                "DockPane",
+                "DockTabGroup",
+                "DockSplitNode",
+                "DockingWorkspace",
+                "CodeEditorView",
+                "NodeGraphCanvas",
                 "DataGrid",
                 "InspectorPanel",
                 "CodeEditor",

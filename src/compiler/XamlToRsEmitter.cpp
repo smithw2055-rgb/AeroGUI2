@@ -1116,7 +1116,7 @@ struct XamlNode final {
         "TabItem", "MenuBase", "Menu", "ContextMenu", "MenuItem", "ToolBar",
         "StatusBar", "StatusBarItem", "TreeView", "TreeViewItem", "GridViewColumnHeader",
         "DateTimeControl", "RiveControl",
-        "NumericScrubber", "Vector2Field", "Vector3Field", "ViewportSurface",
+        "NumericScrubber", "Vector2Field", "Vector3Field", "ColorPicker", "ViewportSurface",
         "DockPane", "DockTabGroup", "DockSplitNode", "DockingWorkspace",
         "CodeEditorView", "PropertyGrid", "NodeGraphCanvas"
     };
@@ -1731,10 +1731,11 @@ void ExpandControlHierarchy(std::unordered_set<std::string>& usedTypes) {
             changed |= add("TextBlock");
             changed |= add("Thumb");
         }
-        if (has("PropertyGrid") || has("Vector3Field") || has("Vector2Field") || has("NumericScrubber")) {
+        if (has("PropertyGrid") || has("ColorPicker") || has("Vector3Field") || has("Vector2Field") || has("NumericScrubber")) {
             changed |= add("NumericScrubber");
             changed |= add("Vector2Field");
             changed |= add("Vector3Field");
+            changed |= add("ColorPicker");
             changed |= add("Control");
             changed |= add("Grid");
             changed |= add("Border");
