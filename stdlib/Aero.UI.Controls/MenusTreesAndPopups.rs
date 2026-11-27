@@ -53,10 +53,17 @@ public static class PopupService {
         if (_openPopups != null) {
             for (int i = _openPopups.Length - 1; i >= 0; i -= 1) {
                 Popup p = _openPopups[i];
-                bool dead = p == null || p._isDisposedTree ||
-                    (p.PlacementTarget != null && p.PlacementTarget._isDisposedTree);
+                bool ownerDead = (p != null) &&
+                    ((p.PlacementTarget != null && p.PlacementTarget._isDisposedTree) ||
+                     (p.TemplatedParent != null && p.TemplatedParent._isDisposedTree));
+                bool dead = p == null || p._isDisposedTree || ownerDead;
                 if (dead) {
-                    if (p != null) { p.ForceCloseDisposed(); }
+                    if (p != null) {
+                        p.ForceCloseDisposed();
+                        if (ownerDead && !p._isDisposedTree) {
+                            p.DisposeSubtree();
+                        }
+                    }
                     if (i < _openPopups.Length && _openPopups[i] == p) {
                         _openPopups.RemoveAt(i);
                     }
@@ -1789,7 +1796,9 @@ public class TreeViewItem : HeaderedItemsControl {
         base.RefreshItems();
         PropagateOwnerToChildren();
         SyncExpandedState();
-        UpdateTriggersAndStates();
+        if (IsTemplateApplied() || _appliedStyle != null) {
+            UpdateTriggersAndStates();
+        }
     }
 
     protected override void OnVisualStatePropertyChanged() {
@@ -1857,6 +1866,7 @@ public class TreeViewItem : HeaderedItemsControl {
 }
 
 public class TreeView : ItemsControl {
+    internal override int FastPropEpochCategory() { return 11; }
     private TreeViewItem _selectedItem;
 
     public event EventHandler SelectedItemChanged;
@@ -1891,6 +1901,7 @@ public class TreeView : ItemsControl {
         if (_selectedItem != null) { _selectedItem.SetSelectedSilent(false); }
         _selectedItem = item;
         if (_selectedItem != null) { _selectedItem.IsSelected = true; }
+        BumpPropEpoch();
         BindingEngine.MarkFlushDirty();
         BindingEngine.NotifyTargetPropertyChanged(this, "SelectedItem", DependencyObject.BoxObject(SelectedItem));
         SelectedItemChanged(this, EventArgs.Empty());
@@ -1916,20 +1927,18 @@ public class TreeView : ItemsControl {
 
     private static DependencyObject ReadHierarchicalItemsSource(object raw, string path) {
         if (raw == null || path == null || path.Length == 0) { return null; }
+        if (raw is TransformGroup && path == "Children") {
+            return (raw as TransformGroup).ChildrenBox();
+        }
+        if (raw is Panel && path == "Children") {
+            return (raw as Panel).GetPropertyValue("Children");
+        }
         DependencyObject subSrc = BindingEngine.ReadPathBox(raw, path);
         if (subSrc != null) {
             object unboxed = DependencyObject.Unbox(subSrc);
             if (subSrc is ICollectionNotifier || unboxed is ICollectionNotifier) {
                 return subSrc;
             }
-        }
-        if (raw is TransformGroup && path == "Children") {
-            Transform[] arr = (raw as TransformGroup).Children();
-            var box = new ArrayCollectionBox();
-            if (arr != null) {
-                for (int i = 0; i < arr.Length; i += 1) { box.AddBox(arr[i]); }
-            }
-            return box;
         }
         if (raw is UIElement && (path == "Children" || path == "LogicalChildren")) {
             UIElement[] arr = (raw as UIElement).Children();

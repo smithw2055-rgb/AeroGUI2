@@ -1192,6 +1192,7 @@ public static class ParseUtil {
 // ============================================================================
 
 public class DependencyObject {
+    internal virtual int DepPropEpoch() { return 1; }
     public virtual object UnboxObject() { return this; }
     public virtual string ToDisplayString() { return ""; }
     public virtual string ImplicitDataTypeKey() { return ""; }
@@ -2121,6 +2122,8 @@ public class TransformData : DependencyObject {
 }
 
 public class Transform : DependencyObject {
+    internal int _depPropEpoch = 1;
+    internal override int DepPropEpoch() { return _depPropEpoch; }
     private string[] _attachedKeys;
     private DependencyObject[] _attachedVals;
 
@@ -2128,6 +2131,7 @@ public class Transform : DependencyObject {
 
     public void SetAttachedValue(string key, DependencyObject val) {
         if (key == null || key.Length == 0) { return; }
+        _depPropEpoch += 1;
         if (_attachedKeys == null) {
             _attachedKeys = new string[0];
             _attachedVals = new DependencyObject[0];
@@ -2260,10 +2264,22 @@ public class SkewTransform : Transform {
 public class TransformGroup : Transform {
     public override string ImplicitDataTypeKey() { return "TransformGroup"; }
     private Transform[] _children;
+    private ArrayCollectionBox _childrenBoxCache;
     public TransformGroup() { _children = new Transform[0]; }
     public Transform[] Children() { return _children; }
-    public void Add(Transform t) { if (t != null) { _children.Push(t); } }
-    public void Clear() { _children.Clear(); }
+    public DependencyObject ChildrenBox() {
+        if (_childrenBoxCache != null) { return _childrenBoxCache; }
+        var box = new ArrayCollectionBox();
+        for (int i = 0; i < _children.Length; i += 1) { box.AddBox(_children[i]); }
+        _childrenBoxCache = box;
+        return box;
+    }
+    internal override DependencyObject GetBindingPropertyValue(string propName) {
+        if (propName == "Children") { return ChildrenBox(); }
+        return base.GetBindingPropertyValue(propName);
+    }
+    public void Add(Transform t) { if (t != null) { _children.Push(t); _childrenBoxCache = null; _depPropEpoch += 1; } }
+    public void Clear() { _children.Clear(); _childrenBoxCache = null; _depPropEpoch += 1; }
     public override void Accumulate(TransformData acc) {
         for (int i = 0; i < _children.Length; i += 1) {
             _children[i].Accumulate(acc);
@@ -2945,6 +2961,8 @@ internal class UIElementRareData {
     internal int DdLastElemEpoch = -1;
     internal bool DdInitialized = false;
     internal UIElementTransform3DData Transform3DData;
+    internal Dictionary<string, UIElement> TemplateNameMap;
+    internal UIElement TemplateNameOwner;
 
     internal UIElementTransform3DData Ensure3D() {
         if (Transform3DData == null) { Transform3DData = new UIElementTransform3DData(); }
@@ -2955,6 +2973,8 @@ internal class UIElementRareData {
 internal class ResourceScopeCache {
     public int MutEpoch;
     public int ChainEpoch;
+    public int AmbDepth = -1;
+    public ResourceDictionary AmbTop;
     public int NextSlot;
     public string K0; public DependencyObject V0;
     public string K1; public DependencyObject V1;
@@ -2967,6 +2987,7 @@ internal class ResourceScopeCache {
 public partial class UIElement : DependencyObject {
     internal int _propEpoch = 1;
     internal int _ancestorChainEpoch = 1;
+    internal int _childrenMutEpoch = 0;
     internal static int _disposeEpoch = 1;
     internal static int _treeParentEpoch = 1;
     internal static int _visibilityEpoch = 1;
@@ -3613,7 +3634,6 @@ public partial class UIElement : DependencyObject {
             UIElementRareData r = EnsureRare();
             if (r.Resources == null) {
                 r.Resources = new ResourceDictionary();
-                ResourceDictionary.BumpGlobalMutationEpoch();
             }
             return r.Resources;
         }
@@ -3629,24 +3649,35 @@ public partial class UIElement : DependencyObject {
     public ResourceDictionary AmbientResources {
         get { return _rare != null ? _rare.AmbientResources : null; }
         set {
-            if (value == null && (_rare == null || _rare.AmbientResources == null)) { return; }
-            EnsureRare().AmbientResources = value;
-            ResourceDictionary.BumpGlobalMutationEpoch();
+            if (_rare == null && value == null) { return; }
+            if (_rare != null && _rare.AmbientResources == value) { return; }
+            UIElementRareData r = EnsureRare();
+            r.AmbientResources = value;
+            r.ResCache = null;
+            r.DynResMutEpoch = -1;
+            if (_children != null && _children.Length > 0) {
+                BumpSubtreeAncestorEpoch();
+            }
         }
     }
 
     public Style Style {
         get { return _style; }
         set {
-            if (_style == value && (_appliedStyle == value || _closedPopupBuildDepth > 0)) { return; }
+            if (_style == value && (_appliedStyle == value || _closedPopupBuildDepth > 0 || (_xamlBuildDepth > 0 && !HasUiFlag(32)))) { return; }
             Style prev = _style;
             _style = value;
             _appliedStyle = null;
             if ((prev != null && !prev.HasNoStyleResourcesFast()) ||
                 (value != null && !value.HasNoStyleResourcesFast())) {
-                ResourceDictionary.BumpGlobalMutationEpoch();
+                if (_children != null && _children.Length > 0) {
+                    ResourceDictionary.BumpGlobalMutationEpoch();
+                } else if (_rare != null) {
+                    _rare.ResCache = null;
+                    _rare.DynResMutEpoch = -1;
+                }
             }
-            if (_closedPopupBuildDepth > 0) { return; }
+            if (_closedPopupBuildDepth > 0 || (_xamlBuildDepth > 0 && !HasUiFlag(32))) { return; }
             ApplyStyleInternal();
         }
     }
@@ -3688,14 +3719,19 @@ public partial class UIElement : DependencyObject {
         for (int i = 0; i < r.DynResProps.Length; i += 1) {
             if (r.DynResProps[i] == propName) {
                 r.DynResKeys[i] = resourceKey;
-                ApplyDynamicResourceAt(i);
+                r.DynResMutEpoch = -1;
+                if (_xamlBuildDepth == 0 || HasUiFlag(32) || propName == "Style") {
+                    ApplyDynamicResourceAt(i);
+                }
                 return;
             }
         }
         r.DynResProps.Push(propName);
         r.DynResKeys.Push(resourceKey);
         r.DynResMutEpoch = -1;
-        ApplyDynamicResourceAt(r.DynResProps.Length - 1);
+        if (_xamlBuildDepth == 0 || HasUiFlag(32) || propName == "Style") {
+            ApplyDynamicResourceAt(r.DynResProps.Length - 1);
+        }
     }
 
     public string GetResourceReferenceKey(string propName) {
@@ -3784,7 +3820,12 @@ public partial class UIElement : DependencyObject {
                 _appliedStyle = active;
                 if ((prevApplied != null && !prevApplied.HasNoStyleResourcesFast()) ||
                     !active.HasNoStyleResourcesFast()) {
-                    ResourceDictionary.BumpGlobalMutationEpoch();
+                    if (_children != null && _children.Length > 0) {
+                        ResourceDictionary.BumpGlobalMutationEpoch();
+                    } else if (_rare != null) {
+                        _rare.ResCache = null;
+                        _rare.DynResMutEpoch = -1;
+                    }
                 }
                 active.ApplyTo(this);
                 OnStyleApplied(active);
@@ -3808,6 +3849,13 @@ public partial class UIElement : DependencyObject {
             UIElement prevTpl = (cur is Control) ? (cur as Control).TemplateRoot() : null;
             if (cur._style == null || cur._style != cur._appliedStyle) {
                 cur.ApplyStyleInternal();
+            }
+            if (!cur._isDisposedTree && cur is Control) {
+                Control ctrl = cur as Control;
+                if (!ctrl.IsTemplateApplied() && !ctrl.ShouldDeferTemplateExpansion() &&
+                    (ctrl.Template != null || ctrl.TemplatedParent != null)) {
+                    ctrl.ApplyTemplate();
+                }
             }
             if (cur._isDisposedTree) { continue; }
             UIElement nextTpl = (cur is Control) ? (cur as Control).TemplateRoot() : null;
@@ -3843,7 +3891,7 @@ public partial class UIElement : DependencyObject {
             if (cur._isDisposedTree) { continue; }
             if (cur is Control) {
                 Control ctrl = cur as Control;
-                if (!ctrl.IsTemplateApplied()) { ctrl.ApplyTemplate(); }
+                if (!ctrl.IsTemplateApplied() && !ctrl.ShouldDeferTemplateExpansion()) { ctrl.ApplyTemplate(); }
             }
             if (cur._isDisposedTree) { continue; }
             if (cur != this && cur.IsClosedPopupBoundary()) { continue; }
@@ -4005,10 +4053,12 @@ public partial class UIElement : DependencyObject {
         get { return _visibility; }
         set {
             if (_visibility == value) { return; }
-            bool wasCollapsed = (_visibility == Visibility.Collapsed);
+            Visibility oldVis = _visibility;
+            bool wasCollapsed = (oldVis == Visibility.Collapsed);
             _visibility = value;
             BumpVisibilityEpoch();
             if (_hasNative) { Visual_SetVisibility(__nativeHandle, EnumConvert.ToInt(value)); }
+            OnVisibilityChanged(oldVis, _visibility);
             OnVisualStatePropertyChanged();
             UpdateTriggersAndStates();
             if (wasCollapsed && _visibility != Visibility.Collapsed && _xamlBuildDepth == 0 &&
@@ -4783,6 +4833,8 @@ public partial class UIElement : DependencyObject {
         child._parent = this; child.BumpSubtreeAncestorEpoch();
         if (_children == null) { _children = new UIElement[0]; }
         _children.Push(child);
+        _childrenMutEpoch += 1;
+        if (_rare != null) { _rare.TemplateNameMap = null; }
         if (_hasNative && child._hasNative) {
             Visual_AddChild(__nativeHandle, child.__nativeHandle);
         }
@@ -4796,6 +4848,8 @@ public partial class UIElement : DependencyObject {
         int idx = index < 0 ? 0 : (index > _children.Length ? _children.Length : index);
         child._parent = this; child.BumpSubtreeAncestorEpoch();
         _children.Insert(idx, child);
+        _childrenMutEpoch += 1;
+        if (_rare != null) { _rare.TemplateNameMap = null; }
         if (_hasNative && child._hasNative) {
             Visual_InsertChild(__nativeHandle, idx, child.__nativeHandle);
         }
@@ -4848,6 +4902,8 @@ public partial class UIElement : DependencyObject {
         }
         if (idx < 0) { return; }
         _children.RemoveAt(idx);
+        _childrenMutEpoch += 1;
+        if (_rare != null) { _rare.TemplateNameMap = null; }
         child._parent = null; child.BumpSubtreeAncestorEpoch();
         if (child._effectiveHitTestVisible != child._isHitTestVisible) {
             child.SyncInteractiveFlagsSubtree();
@@ -4869,6 +4925,8 @@ public partial class UIElement : DependencyObject {
                 ch.NotifyUnloadedSubtree();
             }
             _children.Clear();
+            _childrenMutEpoch += 1;
+            if (_rare != null) { _rare.TemplateNameMap = null; }
         }
         if (_hasNative) {
             Visual_ClearChildren(__nativeHandle);
@@ -4881,7 +4939,7 @@ public partial class UIElement : DependencyObject {
     private int _keyboardTabIndex = 0;
     public int TabIndex {
         get { return _keyboardTabIndex; }
-        set { _keyboardTabIndex = value; }
+        set { if (_keyboardTabIndex != value) { _keyboardTabIndex = value; BumpPropEpoch(); } }
     }
 
     internal bool HasLoadedFired() { return HasUiFlag(32); }
@@ -5068,7 +5126,12 @@ public partial class UIElement : DependencyObject {
                 cr.RoutedEventNames = null;
                 cr.RoutedEventSubs = null;
                 cr.DetachedLogicalChildren = null;
+                cr.TemplateNameMap = null;
+                cr.TemplateNameOwner = null;
                 cr.ResCache = null;
+                if (cr.Resources != null) {
+                    cr.Resources.CollectOwnedUIElements(q);
+                }
                 cr.Resources = null;
                 cr.AmbientResources = null;
                 cr.Effect = null;
@@ -5123,7 +5186,14 @@ public partial class UIElement : DependencyObject {
 
     public UIElement FindName(string name) {
         if (name == null || name.Length == 0) { return null; }
+        if (this._name == name) { return this; }
         UIElement rootTp = this._templatedParent;
+        if (_children != null) {
+            for (int i = 0; i < _children.Length; i += 1) {
+                UIElement ch = _children[i];
+                if (ch != null && ch._templatedParent == rootTp && ch._name == name) { return ch; }
+            }
+        }
         for (int pass = 0; pass < 2; pass += 1) {
             bool scoped = (pass == 0);
             var stack = new UIElement[0];
@@ -5183,6 +5253,52 @@ public partial class UIElement : DependencyObject {
 
     internal UIElement FindTemplateChildName(string name, UIElement owner) {
         if (name == null || name.Length == 0) { return null; }
+        if (owner != null && _templatedParent == owner) {
+            Dictionary<string, UIElement> cachedMap = (_rare != null && _rare.TemplateNameOwner == owner) ? _rare.TemplateNameMap : null;
+            if (cachedMap == null) {
+                cachedMap = new Dictionary<string, UIElement>();
+                var bq = new UIElement[0];
+                bq.Push(this);
+                int bi = 0;
+                while (bi < bq.Length) {
+                    UIElement cur = bq[bi];
+                    bi += 1;
+                    if (cur == null) { continue; }
+                    if (cur._name != null && cur._name.Length > 0) {
+                        if (cur._templatedParent == owner) {
+                            if (!cachedMap.ContainsKey(cur._name) || cachedMap[cur._name]._templatedParent != owner) {
+                                cachedMap[cur._name] = cur;
+                            }
+                        } else if (cur._templatedParent == null) {
+                            if (!cachedMap.ContainsKey(cur._name)) {
+                                cachedMap[cur._name] = cur;
+                            }
+                        }
+                    }
+                    if ((cur is ContentPresenter || cur.IsItemsPresenterBoundary()) && cur._templatedParent == owner) { continue; }
+                    if (cur._templatedParent != null && !cur.IsInTemplateOf(owner)) { continue; }
+                    UIElement[] cd = cur._rare != null ? cur._rare.DetachedLogicalChildren : null;
+                    if (cd != null) {
+                        for (int d = 0; d < cd.Length; d += 1) {
+                            bq.Push(cd[d]);
+                        }
+                    }
+                    if (cur._children != null) {
+                        for (int i = 0; i < cur._children.Length; i += 1) {
+                            bq.Push(cur._children[i]);
+                        }
+                    }
+                }
+                UIElementRareData rr = EnsureRare();
+                rr.TemplateNameOwner = owner;
+                rr.TemplateNameMap = cachedMap;
+            }
+            if (cachedMap.ContainsKey(name)) {
+                UIElement hit = cachedMap[name];
+                if (hit != null && !hit._isDisposedTree) { return hit; }
+            }
+            return null;
+        }
         UIElement fallback = null;
         var q = new UIElement[0];
         q.Push(this);
@@ -5276,8 +5392,11 @@ public partial class UIElement : DependencyObject {
         }
         int mutEp = ResourceDictionary._globalMutationEpoch;
         int chainEp = anchor._ancestorChainEpoch;
+        int ambDepth = ResourceDictionary.CurrentAmbientDepth();
+        ResourceDictionary ambTop = ResourceDictionary.CurrentAmbientTop();
         ResourceScopeCache rc = anchor._rare != null ? anchor._rare.ResCache : null;
-        if (rc != null && rc.MutEpoch == mutEp && rc.ChainEpoch == chainEp) {
+        if (rc != null && rc.MutEpoch == mutEp && rc.ChainEpoch == chainEp &&
+            rc.AmbDepth == ambDepth && rc.AmbTop == ambTop) {
             if (rc.K0 == key) { return rc.V0; }
             if (rc.K1 == key) { return rc.V1; }
             if (rc.K2 == key) { return rc.V2; }
@@ -5292,9 +5411,12 @@ public partial class UIElement : DependencyObject {
             rc = new ResourceScopeCache();
             anchor.EnsureRare().ResCache = rc;
         }
-        if (rc.MutEpoch != mutEp || rc.ChainEpoch != chainEp) {
+        if (rc.MutEpoch != mutEp || rc.ChainEpoch != chainEp ||
+            rc.AmbDepth != ambDepth || rc.AmbTop != ambTop) {
             rc.MutEpoch = mutEp;
             rc.ChainEpoch = chainEp;
+            rc.AmbDepth = ambDepth;
+            rc.AmbTop = ambTop;
             rc.NextSlot = 0;
             rc.K0 = null; rc.V0 = null;
             rc.K1 = null; rc.V1 = null;
@@ -6387,6 +6509,10 @@ public partial class UIElement : DependencyObject {
 
     protected virtual void UpdateTriggersAndStates() {
         BumpPropEpoch();
+        if (_xamlBuildDepth > 0 && !HasUiFlag(32) && _appliedStyle == null &&
+            (!(this is Control) || !(this as Control).IsTemplateApplied())) {
+            return;
+        }
         Style activeStyle = _style != null ? _style : _appliedStyle;
         if (activeStyle != null) { activeStyle.EvaluateTriggers(this); }
         OnVisualStatePropertyChanged();
@@ -6411,6 +6537,7 @@ public partial class UIElement : DependencyObject {
     }
 
     protected virtual void OnVisualStatePropertyChanged() {}
+    protected virtual void OnVisibilityChanged(Visibility oldVal, Visibility newVal) {}
     protected virtual void OnLoaded() {
         if (_background != null && _background.NeedsLoadedRefresh()) { SyncBoxStyleToNative(); }
     }

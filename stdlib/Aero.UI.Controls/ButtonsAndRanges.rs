@@ -959,7 +959,6 @@ public class Track : FrameworkElement {
         if (ParseUtil.IsValidHandle(__nativeHandle)) {
             Visual_SetLayoutMode(__nativeHandle, EnumConvert.ToInt(LayoutMode.Grid), 0.0f, 0.0f, 0, 0);
         }
-        UpdateTrackVisuals();
     }
     public override string GetTypeName() { return "Track"; }
 
@@ -2152,6 +2151,32 @@ public class ScrollBar : RangeBase {
 
     public override string GetTypeName() { return "ScrollBar"; }
 
+    internal override bool ShouldDeferTemplateExpansion() {
+        if (IsTemplateApplied()) { return false; }
+        if (Visibility == Visibility.Collapsed) { return true; }
+        if (TemplatedParent is ScrollViewer) {
+            ScrollViewer sv = TemplatedParent as ScrollViewer;
+            bool isHoriz = (Name == "PART_HorizontalScrollBar") ||
+                           (_orientation == Orientation.Horizontal && Name != "PART_VerticalScrollBar");
+            if (isHoriz) {
+                return sv.ComputedHorizontalScrollBarVisibility == Visibility.Collapsed;
+            }
+            return sv.ComputedVerticalScrollBarVisibility == Visibility.Collapsed;
+        }
+        return false;
+    }
+
+    protected override void OnVisibilityChanged(Visibility oldVal, Visibility newVal) {
+        base.OnVisibilityChanged(oldVal, newVal);
+        if (newVal != Visibility.Collapsed && !IsTemplateApplied() && !_isDisposedTree &&
+            UIElement._xamlBuildDepth == 0 && !IsInsideClosedPopup()) {
+            if (_appliedStyle == null || (Style != null && Style != _appliedStyle)) {
+                ApplyStyleInternal();
+            }
+            ApplyTemplate();
+        }
+    }
+
     public Orientation Orientation {
         get { return _orientation; }
         set { _orientation = value; BumpPropEpoch(); OnRangeUpdated(); }
@@ -2501,7 +2526,7 @@ public class ScrollViewer : ContentControl {
 
     public bool CanContentScroll {
         get { return _canContentScroll; }
-        set { _canContentScroll = value; }
+        set { if (_canContentScroll != value) { _canContentScroll = value; BumpPropEpoch(); } }
     }
     public float HorizontalOffset {
         get { return _offsetX; }
@@ -2513,11 +2538,11 @@ public class ScrollViewer : ContentControl {
     }
     public ScrollBarVisibility HorizontalScrollBarVisibility {
         get { return _hVis; }
-        set { _hVis = value; SyncScrollBarVisibility(); }
+        set { if (_hVis != value) { _hVis = value; BumpPropEpoch(); SyncScrollBarVisibility(); } }
     }
     public ScrollBarVisibility VerticalScrollBarVisibility {
         get { return _vVis; }
-        set { _vVis = value; SyncScrollBarVisibility(); }
+        set { if (_vVis != value) { _vVis = value; BumpPropEpoch(); SyncScrollBarVisibility(); } }
     }
 
     public float ExtentWidth { get { return _viewport != null ? _viewport.ScrollExtentWidth : ScrollExtentWidth; } }

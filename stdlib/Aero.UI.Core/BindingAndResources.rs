@@ -217,11 +217,18 @@ public class ResourceDictionary : DependencyObject {
         _globalMutationEpoch = _globalMutationEpoch >= 1000000000 ? 1 : (_globalMutationEpoch + 1);
     }
 
+    internal static int CurrentAmbientDepth() {
+        return _ambientStack != null ? _ambientStack.Length : 0;
+    }
+
+    internal static ResourceDictionary CurrentAmbientTop() {
+        return (_ambientStack != null && _ambientStack.Length > 0) ? _ambientStack[_ambientStack.Length - 1] : null;
+    }
+
     public static void PushAmbient(ResourceDictionary rd) {
         if (rd == null) { return; }
         if (_ambientStack == null) { _ambientStack = new ResourceDictionary[0]; }
         _ambientStack.Push(rd);
-        BumpGlobalMutationEpoch();
     }
 
     public static void PopAmbient(ResourceDictionary rd) {
@@ -229,7 +236,6 @@ public class ResourceDictionary : DependencyObject {
         for (int i = _ambientStack.Length - 1; i >= 0; i -= 1) {
             if (_ambientStack[i] == rd) {
                 _ambientStack.RemoveAt(i);
-                BumpGlobalMutationEpoch();
                 return;
             }
         }
@@ -314,6 +320,7 @@ public class ResourceDictionary : DependencyObject {
 
     public static void RegisterLocSource(string sourceName, ResourceDictionary dict) {
         if (sourceName == null || dict == null) { return; }
+        dict._isSharedDict = true;
         if (_locSources == null) { _locSources = new Dictionary<string, ResourceDictionary>(); }
         string k = NormalizeLocKey(sourceName);
         if (k.Length == 0) { return; }
@@ -353,8 +360,22 @@ public class ResourceDictionary : DependencyObject {
 
     private Dictionary<string, int> _keyIndex;
     private DependencyObject[] _vals;
+    private bool _hasBeenQueried = false;
+    internal bool _isSharedDict = false;
 
     public int Count() { return _keys.Length; }
+
+    internal void CollectOwnedUIElements(UIElement[] q) {
+        if (_isSharedDict || this == _appResources || q == null || _vals == null) { return; }
+        for (int i = 0; i < _vals.Length; i += 1) {
+            if (_vals[i] is UIElement) {
+                UIElement el = _vals[i] as UIElement;
+                if (!el._isDisposedTree && el.Parent == null) {
+                    q.Push(el);
+                }
+            }
+        }
+    }
 
     private int FindKeyIndex(string key) {
         if (_keyIndex != null) {
@@ -369,6 +390,7 @@ public class ResourceDictionary : DependencyObject {
     public static ResourceDictionary GlobalApplicationResources() {
         if (_appResources == null) {
             _appResources = new ResourceDictionary();
+            _appResources._isSharedDict = true;
         }
         return _appResources;
     }
@@ -396,13 +418,19 @@ public class ResourceDictionary : DependencyObject {
         } else {
             _vals[fbIdx] = box;
         }
+        bool addedNewStyleKey = false;
         if (box is Style || DependencyObject.Unbox(box) is Style) {
             if (_registeredStyleKeys == null) {
                 _registeredStyleKeys = new Dictionary<string, int>();
             }
-            _registeredStyleKeys[key] = 1;
+            if (!_registeredStyleKeys.ContainsKey(key)) {
+                _registeredStyleKeys[key] = 1;
+                addedNewStyleKey = true;
+            }
         }
-        BumpGlobalMutationEpoch();
+        if (_hasBeenQueried || this == _appResources || addedNewStyleKey) {
+            BumpGlobalMutationEpoch();
+        }
     }
 
     public void Set(string key, object val) { SetBox(key, DependencyObject.BoxObject(val)); }
@@ -412,6 +440,7 @@ public class ResourceDictionary : DependencyObject {
     public void Set(string key, bool val) { SetBox(key, DependencyObject.BoxBool(val)); }
 
     public DependencyObject TryGetLocalBox(string key) {
+        _hasBeenQueried = true;
         if (key == null || _keys.Length == 0) { return null; }
         int idx = FindKeyIndex(key);
         return (idx >= 0 && idx < _vals.Length) ? _vals[idx] : null;
@@ -464,6 +493,7 @@ public class ResourceDictionary : DependencyObject {
 
     public void Merge(ResourceDictionary other) {
         if (other == null || other._keys.Length == 0) { return; }
+        other._isSharedDict = true;
         for (int i = 0; i < other._keys.Length; i += 1) {
             SetBox(other._keys[i], other._vals[i]);
         }
@@ -524,6 +554,11 @@ public class Setter : DependencyObject {
     public int BindingMode = 0;
     public bool BindingHasFallback = false;
     private DependencyObject _bindingFallbackBox;
+    private int _propId = -2;
+    private int _srcPropId = -2;
+    private string[] _cachedSegs;
+    private bool _cachedSingleHop = true;
+    private bool _bindPrepReady = false;
 
     public Setter() {}
     public Setter(string property, object value) {
@@ -648,18 +683,35 @@ public class Setter : DependencyObject {
             if (!dest.HasUiFlag(256) && TargetName.Length == 0 && dest.HasLocalProperty(Property)) {
                 return;
             }
+            if (_propId == -2) {
+                _propId = Property.Length > 0 ? AeroPropId.Resolve(Property) : 0;
+            }
             if (DynamicResourceKey.Length > 0) {
                 dest.SetResourceReference(Property, DynamicResourceKey);
             } else if (BindingElementName.Length > 0) {
                 dest.ClearResourceReference(Property);
-                BindingEngine.BindElementEx(
-                    dest, Property, BindingElementName, BindingPath, BindingMode,
+                if (!_bindPrepReady) {
+                    _bindPrepReady = true;
+                    _srcPropId = BindingPath.Length > 0 ? AeroPropId.Resolve(BindingPath) : 0;
+                    _cachedSegs = BindingEngine.PreparePathSegments(BindingPath);
+                    _cachedSingleHop = (_cachedSegs == null || _cachedSegs.Length == 1);
+                }
+                BindingEngine.BindElementPrepared(
+                    dest, _propId, Property, BindingElementName, _srcPropId, BindingPath,
+                    _cachedSegs, _cachedSingleHop, BindingMode,
                     BindingConverter, BindingConverterKey, BindingConverterParam, BindingStringFormat,
-                    BindingHasFallback, _bindingFallbackBox);
+                    BindingHasFallback, _bindingFallbackBox, false, null);
             } else if (BindingPath.Length > 0) {
                 dest.ClearResourceReference(Property);
-                BindingEngine.BindPathEx(
-                    dest, Property, null, BindingPath, BindingMode,
+                if (!_bindPrepReady) {
+                    _bindPrepReady = true;
+                    _srcPropId = BindingPath.Length > 0 ? AeroPropId.Resolve(BindingPath) : 0;
+                    _cachedSegs = BindingEngine.PreparePathSegments(BindingPath);
+                    _cachedSingleHop = (_cachedSegs == null || _cachedSegs.Length == 1);
+                }
+                BindingEngine.BindPathPrepared(
+                    dest, _propId, Property, null, _srcPropId, BindingPath,
+                    _cachedSegs, _cachedSingleHop, BindingMode,
                     BindingConverter, BindingConverterKey, BindingConverterParam, BindingStringFormat,
                     BindingHasFallback, _bindingFallbackBox, false, null,
                     BindingRelativeMode, BindingAncestorType);
@@ -668,7 +720,11 @@ public class Setter : DependencyObject {
                 if (Property == "ContextMenu" && _valueBox is UIElement) {
                     (_valueBox as UIElement).SetUiFlag(4096, true);
                 }
-                dest.SetPropertyValue(Property, _valueBox);
+                if (_propId > 0) {
+                    dest.SetPropertyById(_propId, Property, _valueBox);
+                } else {
+                    dest.SetPropertyValue(Property, _valueBox);
+                }
             }
             return;
         }
@@ -1109,7 +1165,7 @@ public class TriggerBase : DependencyObject {
                 TriggerBase tr = triggers[i];
                 if (tr != null && tr.IsMatched(target)) {
                     if (!tr.WasActiveFor(target)) { changed = true; }
-                    tr.ApplyIfMatched(target, owningStyle);
+                    tr.ApplyMatchedCore(target, owningStyle);
                 }
             }
             if (!changed) { break; }
@@ -1126,6 +1182,8 @@ public class TriggerBase : DependencyObject {
 
 public class Trigger : TriggerBase {
     private DependencyObject _valueBox;
+    private int _propId = -2;
+    private string _propIdName = "";
     public string Property { get; set; } = "";
     public string SourceName { get; set; } = "";
 
@@ -1172,6 +1230,7 @@ public class Trigger : TriggerBase {
 
     internal static UIElement ResolveTemplateOrNamedElement(UIElement target, string name) {
         if (target == null || name == null || name.Length == 0) { return null; }
+        if (target.Name == name) { return target; }
         if (target.GetTemplateRootInternal() != null) {
             UIElement tc = target.GetTemplateChildInternal(name);
             if (tc != null) { return tc; }
@@ -1231,7 +1290,11 @@ public class Trigger : TriggerBase {
         if (target == null || Property.Length == 0) { return false; }
         UIElement src = SourceName.Length > 0 ? ResolveTemplateOrNamedElement(target, SourceName) : target;
         if (src == null) { return false; }
-        DependencyObject actual = src.GetPropertyValue(Property);
+        if (_propId == -2 || _propIdName != Property) {
+            _propIdName = Property;
+            _propId = AeroPropId.Resolve(Property);
+        }
+        DependencyObject actual = _propId > 0 ? src.GetPropertyById(_propId, Property) : src.GetPropertyValue(Property);
         return BoxEqualsForProperty(Property, actual, _valueBox);
     }
 
@@ -1378,6 +1441,9 @@ public class Trigger : TriggerBase {
         if (a is BoxedInt && b is BoxedInt) {
             return (a as BoxedInt).Value == (b as BoxedInt).Value;
         }
+        if (a is BoxedFloat && b is BoxedFloat) {
+            return (a as BoxedFloat).Value == (b as BoxedFloat).Value;
+        }
         string sa = DependencyObject.UnboxString(a, "");
         string sb = DependencyObject.UnboxString(b, "");
         return sa == sb;
@@ -1386,6 +1452,8 @@ public class Trigger : TriggerBase {
 
 public class DataTrigger : TriggerBase {
     private DependencyObject _valueBox;
+    private bool _hasExactFloatVal = false;
+    private float _exactFloatVal = 0.0f;
     private UIElement[] _hookedTargets;
     private UIElement[] _hookedSources;
     private static DataTrigger[] _reactiveTriggers;
@@ -1418,14 +1486,37 @@ public class DataTrigger : TriggerBase {
         set { BindingPath = value == null ? "" : value; }
     }
 
+    private void SyncExactFloatVal() {
+        _hasExactFloatVal = false;
+        _exactFloatVal = 0.0f;
+        if (_valueBox is BoxedFloat) {
+            float fv = (_valueBox as BoxedFloat).Value;
+            if (ParseUtil.IsFinite(fv)) { _hasExactFloatVal = true; _exactFloatVal = fv; }
+        } else if (_valueBox is BoxedInt && !(_valueBox is BoxedEnum)) {
+            _hasExactFloatVal = true;
+            _exactFloatVal = 1.0f * (_valueBox as BoxedInt).Value;
+        } else if (_valueBox is BoxedString) {
+            string s = (_valueBox as BoxedString).Value;
+            if (s != null && s.Length > 0 && s.Length <= 9) {
+                float parsed = ParseUtil.ParseFloat(s, ParseUtil.NaN());
+                if (ParseUtil.IsFinite(parsed) && ("" + (int)parsed) == s) {
+                    _hasExactFloatVal = true;
+                    _exactFloatVal = parsed;
+                }
+            }
+        }
+    }
+
     public DataTrigger() : base() {}
     public DataTrigger(string bindingPath, object value) : base() {
         BindingPath = bindingPath == null ? "" : bindingPath;
         _valueBox = DependencyObject.BoxObject(value);
+        SyncExactFloatVal();
     }
     public DataTrigger(string bindingPath, string value) : base() {
         BindingPath = bindingPath == null ? "" : bindingPath;
         _valueBox = DependencyObject.BoxString(value);
+        SyncExactFloatVal();
     }
     public DataTrigger(string bindingPath, bool value) : base() {
         BindingPath = bindingPath == null ? "" : bindingPath;
@@ -1434,15 +1525,18 @@ public class DataTrigger : TriggerBase {
     public DataTrigger(string bindingPath, int value) : base() {
         BindingPath = bindingPath == null ? "" : bindingPath;
         _valueBox = DependencyObject.BoxInt(value);
+        SyncExactFloatVal();
     }
     public DataTrigger(string bindingPath, float value) : base() {
         BindingPath = bindingPath == null ? "" : bindingPath;
         _valueBox = DependencyObject.BoxFloat(value);
+        SyncExactFloatVal();
     }
     public static DataTrigger CreateBox(string bindingPath, DependencyObject valueBox, string relMode = "", string ancestorType = "") {
         var dt = new DataTrigger();
         dt.BindingPath = bindingPath == null ? "" : bindingPath;
         dt._valueBox = valueBox;
+        dt.SyncExactFloatVal();
         dt.RelativeSourceMode = relMode == null ? "" : relMode;
         dt.RelativeSourceAncestorType = ancestorType == null ? "" : ancestorType;
         return dt;
@@ -1468,7 +1562,7 @@ public class DataTrigger : TriggerBase {
 
     public object Value {
         get { return DependencyObject.Unbox(_valueBox); }
-        set { _valueBox = DependencyObject.BoxObject(value); }
+        set { _valueBox = DependencyObject.BoxObject(value); SyncExactFloatVal(); }
     }
 
     private bool HasHooked(UIElement target, UIElement src) {
@@ -1552,6 +1646,8 @@ public class DataTrigger : TriggerBase {
         }
     }
 
+    internal static bool _attachingFreshTemplate = false;
+
     private static void RegisterReactive(DataTrigger dt, UIElement target) {
         if (dt == null || target == null) { return; }
         if (_reactiveTriggers == null) {
@@ -1569,8 +1665,12 @@ public class DataTrigger : TriggerBase {
             BindingEngine.AddPreFlushHook(() => { DataTrigger.FlushReactive(); });
             UIElement.RegisterDisposeHook(() => { DataTrigger.CleanupDisposedReactive(); });
         }
-        for (int i = 0; i < _reactiveTriggers.Length; i += 1) {
-            if (_reactiveTriggers[i] == dt && _reactiveTargets[i] == target) { return; }
+        if (!_attachingFreshTemplate && target.HasUiFlag(32768)) {
+            for (int i = 0; i < _reactiveTriggers.Length; i += 1) {
+                if (_reactiveTriggers[i] == dt && _reactiveTargets[i] == target) { return; }
+            }
+        } else {
+            target.SetUiFlag(32768, true);
         }
         _reactiveTriggers.Push(dt);
         _reactiveTargets.Push(target);
@@ -1859,6 +1959,25 @@ public class DataTrigger : TriggerBase {
         }
     }
 
+    private int _dtPropId = -2;
+    private string _dtPropIdName = "";
+
+    private DependencyObject ReadUiTriggerPropFast(UIElement el) {
+        if (_dtPropId == -2 || _dtPropIdName != BindingPath) {
+            _dtPropIdName = BindingPath;
+            _dtPropId = AeroPropId.Resolve(BindingPath);
+        }
+        if (_dtPropId > 0) {
+            DependencyObject v = el.GetPropertyById(_dtPropId, BindingPath);
+            if (v != null || BindingEntry.IsGuaranteedUIElementProperty(el, BindingPath) || el.IsExplicitNullProperty(BindingPath)) {
+                return v;
+            }
+        }
+        DependencyObject dv = el.GetPropertyValue(BindingPath);
+        if (dv != null || el.IsExplicitNullProperty(BindingPath)) { return dv; }
+        return BindingEngine.ReadPathBox(el, BindingPath);
+    }
+
     public override bool IsMatched(UIElement target) {
         if (target == null) { return false; }
         if (_multiBindingBox != null && _evalMultiHook != null) {
@@ -1874,17 +1993,14 @@ public class DataTrigger : TriggerBase {
         if (ElementName.Length > 0) {
             UIElement se = Trigger.ResolveTemplateOrNamedElement(target, ElementName);
             if (se != null) {
-                actual = se.GetPropertyValue(BindingPath);
-                if (actual == null) { actual = BindingEngine.ReadPathBox(se, BindingPath); }
+                actual = ReadUiTriggerPropFast(se);
             }
         } else if (RelativeSourceMode == "Self") {
-            actual = target.GetPropertyValue(BindingPath);
-            if (actual == null) { actual = BindingEngine.ReadPathBox(target, BindingPath); }
+            actual = ReadUiTriggerPropFast(target);
         } else if (RelativeSourceMode == "TemplatedParent") {
             UIElement tp = target.TemplatedParent;
             if (tp == null) { return false; }
-            actual = tp.GetPropertyValue(BindingPath);
-            if (actual == null) { actual = BindingEngine.ReadPathBox(tp, BindingPath); }
+            actual = ReadUiTriggerPropFast(tp);
         } else if (RelativeSourceMode == "FindAncestor" || RelativeSourceMode == "AncestorType" ||
                    RelativeSourceAncestorType.Length > 0) {
             UIElement anc = target;
@@ -1892,12 +2008,25 @@ public class DataTrigger : TriggerBase {
                 anc = BindingEntry.StepAncestor(anc);
             }
             if (anc == null) { return false; }
-            actual = anc.GetPropertyValue(BindingPath);
-            if (actual == null) { actual = BindingEngine.ReadPathBox(anc, BindingPath); }
+            actual = ReadUiTriggerPropFast(anc);
         } else {
-            object dc = target.DataContext;
-            if (dc == null) { return _valueBox == null; }
-            actual = BindingEngine.ReadPathBox(dc, BindingPath);
+            DependencyObject dcBox = target.EffectiveDataContextBox();
+            if (dcBox == null) { return _valueBox == null; }
+            if (dcBox is UIElement && !BindingPath.Contains(".")) {
+                actual = ReadUiTriggerPropFast(dcBox as UIElement);
+            } else {
+                object dc = DependencyObject.Unbox(dcBox);
+                if (dc == null) { return _valueBox == null; }
+                actual = BindingEngine.ReadPathBox(dc, BindingPath);
+            }
+        }
+        if (_hasExactFloatVal && actual != null) {
+            if (actual is BoxedFloat) {
+                return (actual as BoxedFloat).Value == _exactFloatVal;
+            }
+            if (actual is BoxedInt && !(actual is BoxedEnum)) {
+                return (1.0f * (actual as BoxedInt).Value) == _exactFloatVal;
+            }
         }
         return Trigger.BoxEqualsForProperty(BindingPath, actual, _valueBox);
     }
@@ -1909,6 +2038,8 @@ public class TriggerCondition : DependencyObject {
     public string RelativeSourceMode { get; set; } = "";
     public string RelativeSourceAncestorType { get; set; } = "";
     public DependencyObject ValueBox { get; set; }
+    private int _condPropId = -2;
+    private string _condPropIdName = "";
 
     public TriggerCondition() {}
     public TriggerCondition(
@@ -1941,23 +2072,38 @@ public class TriggerCondition : DependencyObject {
         return null;
     }
 
+    private DependencyObject ReadCondUiPropFast(UIElement el) {
+        if (_condPropId == -2 || _condPropIdName != BindingPath) {
+            _condPropIdName = BindingPath;
+            _condPropId = AeroPropId.Resolve(BindingPath);
+        }
+        if (_condPropId > 0) {
+            DependencyObject v = el.GetPropertyById(_condPropId, BindingPath);
+            if (v != null || BindingEntry.IsGuaranteedUIElementProperty(el, BindingPath) || el.IsExplicitNullProperty(BindingPath)) {
+                return v;
+            }
+        }
+        DependencyObject dv = el.GetPropertyValue(BindingPath);
+        if (dv != null || el.IsExplicitNullProperty(BindingPath)) { return dv; }
+        return BindingEngine.ReadPathBox(el, BindingPath);
+    }
+
     public bool Evaluate(UIElement target) {
         if (target == null || BindingPath.Length == 0) { return false; }
         DependencyObject actual = null;
         if (ElementName.Length > 0) {
             UIElement se = ResolveElementSource(target);
             if (se == null) { return false; }
-            actual = se.GetPropertyValue(BindingPath);
-            if (actual == null) { actual = BindingEngine.ReadPathBox(se, BindingPath); }
-            if (actual == null && se.DataContext != null) { actual = BindingEngine.ReadPathBox(se.DataContext, BindingPath); }
+            actual = ReadCondUiPropFast(se);
+            if (actual == null && !BindingEntry.IsGuaranteedUIElementProperty(se, BindingPath) && se.DataContext != null) {
+                actual = BindingEngine.ReadPathBox(se.DataContext, BindingPath);
+            }
         } else if (RelativeSourceMode == "Self") {
-            actual = target.GetPropertyValue(BindingPath);
-            if (actual == null) { actual = BindingEngine.ReadPathBox(target, BindingPath); }
+            actual = ReadCondUiPropFast(target);
         } else if (RelativeSourceMode == "TemplatedParent") {
             UIElement tp = target.TemplatedParent;
             if (tp == null) { return false; }
-            actual = tp.GetPropertyValue(BindingPath);
-            if (actual == null) { actual = BindingEngine.ReadPathBox(tp, BindingPath); }
+            actual = ReadCondUiPropFast(tp);
         } else if (RelativeSourceMode == "FindAncestor" || RelativeSourceMode == "AncestorType" ||
                    RelativeSourceAncestorType.Length > 0) {
             UIElement anc = target;
@@ -1965,12 +2111,17 @@ public class TriggerCondition : DependencyObject {
                 anc = BindingEntry.StepAncestor(anc);
             }
             if (anc == null) { return false; }
-            actual = anc.GetPropertyValue(BindingPath);
-            if (actual == null) { actual = BindingEngine.ReadPathBox(anc, BindingPath); }
+            actual = ReadCondUiPropFast(anc);
         } else {
-            object dc = target.DataContext;
-            if (dc == null) { return ValueBox == null; }
-            actual = BindingEngine.ReadPathBox(dc, BindingPath);
+            DependencyObject dcBox = target.EffectiveDataContextBox();
+            if (dcBox == null) { return ValueBox == null; }
+            if (dcBox is UIElement && !BindingPath.Contains(".")) {
+                actual = ReadCondUiPropFast(dcBox as UIElement);
+            } else {
+                object dc = DependencyObject.Unbox(dcBox);
+                if (dc == null) { return ValueBox == null; }
+                actual = BindingEngine.ReadPathBox(dc, BindingPath);
+            }
         }
         return Trigger.BoxEqualsForProperty(BindingPath, actual, ValueBox);
     }
@@ -2134,9 +2285,14 @@ public interface IBehaviorTrigger {
 public class Style : DependencyObject {
     public string TargetType { get; set; } = "";
     private Style _basedOn;
+    private static int _styleChainVersion = 1;
+    private Style[] _cachedChain;
+    private int _cachedChainVer = -1;
+    private int _cachedHasTrigVer = -1;
+    private bool _cachedHasTrigVal = false;
     public Style BasedOn {
         get { return _basedOn; }
-        set { _basedOn = value; _cachedResVer = -1; ResourceDictionary.BumpGlobalMutationEpoch(); }
+        set { _basedOn = value; _cachedResVer = -1; _styleChainVersion += 1; ResourceDictionary.BumpGlobalMutationEpoch(); }
     }
     private ResourceDictionary _resources;
     private static int _styleResourcesVersion = 0;
@@ -2146,7 +2302,6 @@ public class Style : DependencyObject {
         get {
             if (_resources == null) {
                 _resources = new ResourceDictionary();
-                ResourceDictionary.BumpGlobalMutationEpoch();
             }
             _styleResourcesVersion += 1;
             return _resources;
@@ -2196,7 +2351,7 @@ public class Style : DependencyObject {
         _setters.Push(Setter.FromBox(propName, valueBox, targetName));
     }
 
-    public void AddTrigger(TriggerBase trigger) { if (trigger != null) { if (_triggers == null) { _triggers = new TriggerBase[0]; } _triggers.Push(trigger); } }
+    public void AddTrigger(TriggerBase trigger) { if (trigger != null) { if (_triggers == null) { _triggers = new TriggerBase[0]; } _triggers.Push(trigger); _styleChainVersion += 1; } }
     public void AddDataTrigger(DataTrigger trigger) { AddTrigger(trigger); }
     public void AddEventTrigger(EventTrigger trigger) { AddTrigger(trigger); }
     public void AddBehaviorTrigger(IBehaviorTrigger trigger) {
@@ -2207,12 +2362,18 @@ public class Style : DependencyObject {
     }
 
     private static Style[] CollectChain(Style leaf) {
+        if (leaf == null) { return new Style[0]; }
+        if (leaf._cachedChain != null && leaf._cachedChainVer == _styleChainVersion) {
+            return leaf._cachedChain;
+        }
         var chain = new Style[0];
         Style cur = leaf;
         while (cur != null && chain.Length < 32) {
             chain.Push(cur);
             cur = cur.BasedOn;
         }
+        leaf._cachedChain = chain;
+        leaf._cachedChainVer = _styleChainVersion;
         return chain;
     }
 
@@ -2310,14 +2471,18 @@ public class Style : DependencyObject {
     }
 
     public bool HasAnyTriggers() {
+        if (_cachedHasTrigVer == _styleChainVersion) { return _cachedHasTrigVal; }
         Style cur = this;
         int guard = 0;
+        bool any = false;
         while (cur != null && guard < 16) {
-            if (cur._triggers != null && cur._triggers.Length > 0) { return true; }
+            if (cur._triggers != null && cur._triggers.Length > 0) { any = true; break; }
             cur = cur.BasedOn;
             guard += 1;
         }
-        return false;
+        _cachedHasTrigVal = any;
+        _cachedHasTrigVer = _styleChainVersion;
+        return any;
     }
 
     public void EvaluateTriggers(UIElement target) {
@@ -2353,6 +2518,7 @@ public class Style : DependencyObject {
 
 public class ControlTemplate : DependencyObject {
     public string TargetType { get; set; } = "";
+    internal int _knownVsmState = -1;
     private Func<Control, UIElement> _factory;
     private TriggerBase[] _triggers;
     private UIElement[] _evaluatingOwners;
@@ -2361,7 +2527,6 @@ public class ControlTemplate : DependencyObject {
         get {
             if (_resources == null) {
                 _resources = new ResourceDictionary();
-                ResourceDictionary.BumpGlobalMutationEpoch();
             }
             return _resources;
         }
@@ -2399,7 +2564,8 @@ public class ControlTemplate : DependencyObject {
     public UIElement Instantiate(Control owner) {
         if (_factory == null) { return null; }
         bool hasLocalRes = HasResources();
-        ResourceDictionary.PushAmbient(AmbientResources);
+        bool pushAmb = AmbientResources != null && ResourceDictionary.CurrentAmbientTop() != AmbientResources;
+        if (pushAmb) { ResourceDictionary.PushAmbient(AmbientResources); }
         if (hasLocalRes) { ResourceDictionary.PushAmbient(_resources); }
         UIElement._xamlBuildDepth += 1;
         UIElement root = _factory(owner);
@@ -2408,10 +2574,13 @@ public class ControlTemplate : DependencyObject {
             if (AmbientResources != null && root.AmbientResources == null) {
                 root.AmbientResources = AmbientResources;
             }
-            if (hasLocalRes) {
+            if (hasLocalRes && (owner == null || owner.Template != this)) {
                 root.Resources.Merge(_resources);
             }
-            MarkTemplatedParentSubtree(root, owner);
+            UIElement ownerEl = owner;
+            if (ownerEl != null && root.TemplatedParent != ownerEl) {
+                MarkTemplatedParentSubtree(root, ownerEl);
+            }
             if (UIElement._xamlBuildDepth == 0) {
                 root.ApplyStyleSubtree();
                 root.RefreshDynamicResourcesRecursive();
@@ -2419,7 +2588,7 @@ public class ControlTemplate : DependencyObject {
             }
         }
         if (hasLocalRes) { ResourceDictionary.PopAmbient(_resources); }
-        ResourceDictionary.PopAmbient(AmbientResources);
+        if (pushAmb) { ResourceDictionary.PopAmbient(AmbientResources); }
         return root;
     }
 
@@ -2507,7 +2676,6 @@ public class DataTemplate : DependencyObject {
         get {
             if (_resources == null) {
                 _resources = new ResourceDictionary();
-                ResourceDictionary.BumpGlobalMutationEpoch();
             }
             return _resources;
         }
@@ -2535,7 +2703,23 @@ public class DataTemplate : DependencyObject {
         get { return _factory; }
         set { _factory = value; }
     }
-    public void AddTrigger(TriggerBase trigger) { if (trigger != null) { _triggers.Push(trigger); } }
+    private bool _hasAncestorTriggers = false;
+    public void AddTrigger(TriggerBase trigger) {
+        if (trigger != null) {
+            _triggers.Push(trigger);
+            if (trigger is DataTrigger && (trigger as DataTrigger).RelativeSourceAncestorType.Length > 0) {
+                _hasAncestorTriggers = true;
+            } else if (trigger is MultiDataTrigger) {
+                TriggerCondition[] cs = (trigger as MultiDataTrigger).Conditions();
+                for (int i = 0; i < cs.Length; i += 1) {
+                    if (cs[i] != null && cs[i].RelativeSourceAncestorType.Length > 0) {
+                        _hasAncestorTriggers = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
 
     public static string InferImplicitDataTypeKey(object raw) {
         if (raw == null) { return ""; }
@@ -2557,7 +2741,8 @@ public class DataTemplate : DependencyObject {
     public virtual UIElement Instantiate(object item) {
         if (_factory == null) { return null; }
         bool hasLocalRes = HasResources();
-        ResourceDictionary.PushAmbient(AmbientResources);
+        bool pushAmb = AmbientResources != null && ResourceDictionary.CurrentAmbientTop() != AmbientResources;
+        if (pushAmb) { ResourceDictionary.PushAmbient(AmbientResources); }
         if (hasLocalRes) { ResourceDictionary.PushAmbient(_resources); }
         UIElement._xamlBuildDepth += 1;
         UIElement root = _factory(item);
@@ -2569,7 +2754,7 @@ public class DataTemplate : DependencyObject {
             if (hasLocalRes) {
                 root.Resources.Merge(_resources);
             }
-            if (item != null) {
+            if (item != null && root.EffectiveDataContextBox() == null) {
                 root.DataContext = item;
             }
             if (UIElement._xamlBuildDepth == 0) {
@@ -2581,7 +2766,7 @@ public class DataTemplate : DependencyObject {
             }
         }
         if (hasLocalRes) { ResourceDictionary.PopAmbient(_resources); }
-        ResourceDictionary.PopAmbient(AmbientResources);
+        if (pushAmb) { ResourceDictionary.PopAmbient(AmbientResources); }
         return root;
     }
 
@@ -2634,23 +2819,24 @@ public class DataTemplate : DependencyObject {
 
     private void AttachTriggers(UIElement root) {
         TriggerBase[] list = _triggers;
+        bool prevFresh = DataTrigger._attachingFreshTemplate;
+        DataTrigger._attachingFreshTemplate = true;
         for (int i = 0; i < list.Length; i += 1) {
             list[i].Attach(root);
         }
-        var hookedAncestors = new UIElement[0];
-        DataTemplate.HookTemplateAncestors(list, root, hookedAncestors);
-        TriggerBase.EvaluateGroup(list, root, null);
-        root.Loaded += (object s, RoutedEventArgs e) => {
+        DataTrigger._attachingFreshTemplate = prevFresh;
+        if (_hasAncestorTriggers) {
+            var hookedAncestors = new UIElement[0];
             DataTemplate.HookTemplateAncestors(list, root, hookedAncestors);
             TriggerBase.EvaluateGroup(list, root, null);
-        };
+            root.Loaded += (object s, RoutedEventArgs e) => {
+                DataTemplate.HookTemplateAncestors(list, root, hookedAncestors);
+                TriggerBase.EvaluateGroup(list, root, null);
+            };
+        } else {
+            TriggerBase.EvaluateGroup(list, root, null);
+        }
         root.DataContextChanged += (object s, DependencyPropertyChangedEventArgs e) => {
-            TriggerBase.EvaluateGroup(list, root, null);
-        };
-        root.GotFocus += (object s, RoutedEventArgs e) => {
-            TriggerBase.EvaluateGroup(list, root, null);
-        };
-        root.LostFocus += (object s, RoutedEventArgs e) => {
             TriggerBase.EvaluateGroup(list, root, null);
         };
     }
@@ -4577,6 +4763,11 @@ public class Binding : DependencyObject {
     public string Path { get; set; } = "";
     public string ElementName { get; set; } = "";
     private DependencyObject _sourceBox;
+    internal int _cachedSrcPropId = -2;
+    internal string[] _cachedSegs;
+    internal bool _cachedSingleHop = true;
+    internal bool _prepReady = false;
+    internal string _prepPath = "";
     public BindingMode Mode { get; set; } = BindingMode.OneWay;
     public IValueConverter Converter { get; set; }
     public string ConverterKey { get; set; } = "";
@@ -4759,7 +4950,7 @@ internal class BindingEntry : DependencyObject {
         if (Target == null && TargetInline == null && TargetEffect == null) { return true; }
         if (Mode == 2 && OneTimeDone) { return true; }
         if (!OneTimeDone) { return false; }
-        if (Target != null && Target.HasActiveTriggerProps()) {
+        if (Target != null && Target.HasActiveTriggerProp(TargetProp)) {
             return false;
         }
         if (_fastKind1VmClean && (Kind == 1 || Kind == 5)) {
@@ -4785,6 +4976,15 @@ internal class BindingEntry : DependencyObject {
         return false;
     }
 
+    internal static bool IsLayoutDependentElementProp(string prop) {
+        return prop == "ActualWidth" || prop == "ActualHeight" ||
+               prop == "ViewportWidth" || prop == "ViewportHeight" ||
+               prop == "ExtentWidth" || prop == "ExtentHeight" ||
+               prop == "ScrollableWidth" || prop == "ScrollableHeight" ||
+               prop == "ComputedVerticalScrollBarVisibility" ||
+               prop == "ComputedHorizontalScrollBarVisibility";
+    }
+
     internal static bool CanUseFastElementPropEpoch(UIElement el, string prop) {
         if (el == null || prop == null || prop.Length == 0) {
             return false;
@@ -4805,14 +5005,20 @@ internal class BindingEntry : DependencyObject {
             prop == "HorizontalContentAlignment" || prop == "VerticalContentAlignment" ||
             prop == "Visibility" || prop == "Opacity" ||
             prop == "IsEnabled" || prop == "IsHitTestVisible" ||
-            prop == "Focusable" || prop == "IsTabStop" ||
+            prop == "Focusable" || prop == "IsTabStop" || prop == "TabIndex" ||
             prop == "IsFocused" || prop == "IsKeyboardFocused" || prop == "IsKeyboardFocusWithin" ||
             prop == "IsMouseOver" || prop == "IsPressed" ||
             prop == "Content" || prop == "Header" || prop == "Tag" ||
             prop == "AlternationIndex" || prop == "ItemsControl.AlternationIndex" ||
             prop == "ZIndex" || prop == "ClipToBounds" ||
             prop == "RenderTransform" || prop == "LayoutTransform" || prop == "RenderTransformOrigin" ||
-            prop == "OpacityMask" || prop == "Effect") {
+            prop == "OpacityMask" || prop == "Effect" ||
+            prop == "CanContentScroll" || prop == "VerticalOffset" || prop == "HorizontalOffset" ||
+            prop == "HorizontalScrollBarVisibility" || prop == "VerticalScrollBarVisibility" ||
+            prop == "ViewportWidth" || prop == "ViewportHeight" ||
+            prop == "ExtentWidth" || prop == "ExtentHeight" ||
+            prop == "ScrollableWidth" || prop == "ScrollableHeight" ||
+            prop == "ComputedVerticalScrollBarVisibility" || prop == "ComputedHorizontalScrollBarVisibility") {
             return true;
         }
         if ((prop == "Text" || prop == "Placeholder" || prop == "PlaceholderText") &&
@@ -4832,20 +5038,32 @@ internal class BindingEntry : DependencyObject {
             cat == 4) {
             return true;
         }
-        if ((prop == "SelectedIndex" || prop == "SelectedItem") && (cat == 5 || cat == 6)) {
+        if ((prop == "SelectedIndex" || prop == "SelectedItem") && (cat == 5 || cat == 6 || cat == 11)) {
             return true;
         }
         if ((prop == "IsDropDownOpen" || prop == "IsEditable") && cat == 6) { return true; }
         if (prop == "IsExpanded" && (cat == 7 || cat == 9)) { return true; }
         if (prop == "IsSelected" && (cat == 8 || cat == 9)) { return true; }
         if (prop == "IsSubmenuOpen" && cat == 10) { return true; }
+        if (prop == "Children" && (el is Panel)) { return true; }
         if (UIElement.IsAttachedElementPropPath(prop)) { return true; }
         return false;
     }
 
+    internal static bool IsGuaranteedUIElementProperty(UIElement el, string prop) {
+        if (el == null || prop == null || prop.Length == 0) { return false; }
+        if (prop == "Content") { return (el is ContentControl) || (el is ContentPresenter); }
+        if (prop == "Header") { return (el is HeaderedContentControl) || el.IsItemsControlBoundary(); }
+        return CanUseFastElementPropEpoch(el, prop);
+    }
+
     internal static int GetFastElementEpoch(UIElement el, string prop) {
         if (el == null) { return -1; }
-        if (prop == "ActualWidth" || prop == "ActualHeight") {
+        if (prop == "Children" && (el is Panel)) {
+            int cep = (el._propEpoch % 100000) * 4099 + (el._childrenMutEpoch % 4099) + 1;
+            return cep <= 0 ? 1 : cep;
+        }
+        if (IsLayoutDependentElementProp(prop)) {
             int ep = (el._propEpoch % 100000) * 4099 + (BindingEngine._curLayoutSizeEpoch % 4099) + 1;
             return ep <= 0 ? 1 : ep;
         }
@@ -4858,13 +5076,19 @@ internal class BindingEntry : DependencyObject {
         if (cat == 0) { return -1; }
         if (_fastPropCatCache != cat) {
             _fastPropCatCache = cat;
-            if (CanUseFastElementPropEpoch(el, SourcePath)) {
-                _fastPropKindCache = (SourcePath == "ActualWidth" || SourcePath == "ActualHeight") ? 2 : 1;
+            if (SourcePath == "Children" && (el is Panel)) {
+                _fastPropKindCache = 3;
+            } else if (CanUseFastElementPropEpoch(el, SourcePath)) {
+                _fastPropKindCache = IsLayoutDependentElementProp(SourcePath) ? 2 : 1;
             } else {
                 _fastPropKindCache = -1;
             }
         }
         if (_fastPropKindCache <= 0) { return -1; }
+        if (_fastPropKindCache == 3) {
+            int cep = (el._propEpoch % 100000) * 4099 + (el._childrenMutEpoch % 4099) + 1;
+            return cep <= 0 ? 1 : cep;
+        }
         if (_fastPropKindCache == 2) {
             int ep = (el._propEpoch % 100000) * 4099 + (BindingEngine._curLayoutSizeEpoch % 4099) + 1;
             return ep <= 0 ? 1 : ep;
@@ -5430,7 +5654,7 @@ internal class BindingEntry : DependencyObject {
         if (Target == null && TargetInline == null && TargetEffect == null) { return; }
         if (Mode == 2 && OneTimeDone) { return; }
         if (BindingEngine._inFlushPass && !BindingEngine._inSubtreeFlush && !BindingEngine._inPushWave && OneTimeDone &&
-            (Target == null || !Target.HasActiveTriggerProps())) {
+            (Target == null || !Target.HasActiveTriggerProp(TargetProp))) {
             if (_fastKind1VmClean && (Kind == 1 || Kind == 5) &&
                 BindingEngine._curNativeVmEpoch == _fastNativeVmEp &&
                 BindingEngine._curManagedVmEpoch == _fastManagedVmEp &&
@@ -5519,7 +5743,8 @@ internal class BindingEntry : DependencyObject {
                 DependencyObject selfVal = canFastElem
                     ? (SourcePropId > 0 ? SourceElement.GetPropertyById(SourcePropId, SourcePath) : SourceElement.GetPropertyValue(SourcePath))
                     : null;
-                bool explicitNull = (selfVal == null) && SourceElement.IsExplicitNullProperty(SourcePath);
+                bool explicitNull = (selfVal == null) &&
+                    (IsGuaranteedUIElementProperty(SourceElement, SourcePath) || SourceElement.IsExplicitNullProperty(SourcePath));
                 _elemPropResolvedOnSelf = canFastElem && (selfVal != null || explicitNull || SourceElement.DataContext == null);
                 DependencyObject ev = (selfVal != null || explicitNull)
                     ? selfVal
@@ -5585,8 +5810,8 @@ internal class BindingEntry : DependencyObject {
             DependencyObject tv = SourcePropId > 0
                 ? SourceElement.GetPropertyById(SourcePropId, SourcePath)
                 : SourceElement.GetPropertyValue(SourcePath);
-            bool explicitNull = (tv == null) && SourceElement.IsExplicitNullProperty(SourcePath);
-            _elemPropResolvedOnSelf = canFastTp && (tv != null || explicitNull || SourceElement.DataContext == null);
+            bool explicitNull = (tv == null) && (canFastTp || SourceElement.IsExplicitNullProperty(SourcePath));
+            _elemPropResolvedOnSelf = canFastTp;
             if (tv == null && !explicitNull) {
                 tv = BindingEngine.ReadPathBox(SourceElement, SourcePath);
             }
@@ -5777,21 +6002,24 @@ internal class BindingEntry : DependencyObject {
                 return;
             }
             bool srcIsUi = srcObj is UIElement;
+            bool srcIsNonUiDep = !srcIsUi && (srcObj is DependencyObject);
             int dm = -1;
             if (srcIsUi) {
                 dm = TryGetCachedFastElementEpoch(srcObj as UIElement);
+            } else if (srcIsNonUiDep) {
+                dm = (srcObj as DependencyObject).DepPropEpoch();
             } else if (ParseUtil.IsNativeReady()) {
                 dm = Reflect_GetDirtyMask(srcObj);
             }
             bool sameSrc = DependencyObject.SameValueBox(srcBox, _lastSrcBox);
             if (OneTimeDone && sameSrc && dm >= 0 && dm == LastDirtyMask) {
                 if (IsSingleHopPath) {
-                    if (!srcIsUi) {
+                    if (!srcIsUi && !srcIsNonUiDep) {
                         MarkVmFastClean(snapNativeVmEp, snapManagedVmEp, snapDcEp, snapTreeEp, snapVisEp, snapDispEp);
                         if (_subscribedVmToken == 0 || _subscribedMidVmToken != 0 || _subscribedUiSrc != null) {
                             UpdateKind1Subscriptions(true, false, srcObj);
                         }
-                    } else if (_elemPropResolvedOnSelf) {
+                    } else if (srcIsUi && _elemPropResolvedOnSelf) {
                         MarkElemFastClean(snapUiPropEp, snapLayoutEp, snapTreeEp, snapDcEp, snapVisEp, snapDispEp);
                         if (_subscribedUiSrc != (srcObj as UIElement) || _subscribedVmToken != 0 || _subscribedMidVmToken != 0) {
                             UpdateKind1Subscriptions(false, true, srcObj);
@@ -5811,7 +6039,7 @@ internal class BindingEntry : DependencyObject {
                         midDm = Reflect_GetDirtyMask(cachedMid);
                     }
                     if (midDm >= 0 && midDm == _lastMidDirtyMask) {
-                        if (!srcIsUi && cachedMid != null && !(cachedMid is UIElement)) {
+                        if (!srcIsUi && !srcIsNonUiDep && cachedMid != null && !(cachedMid is UIElement)) {
                             MarkVmFastClean(snapNativeVmEp, snapManagedVmEp, snapDcEp, snapTreeEp, snapVisEp, snapDispEp);
                             if (_subscribedVmToken == 0 || _subscribedMidVmToken == 0 || _subscribedUiSrc != null) {
                                 int tok0 = ParseUtil.IsNativeReady() ? Reflect_GetObjectToken(srcObj) : 0;
@@ -5829,7 +6057,8 @@ internal class BindingEntry : DependencyObject {
             if (srcIsUi && IsSingleHopPath) {
                 UIElement srcEl = srcObj as UIElement;
                 valBox = SourcePropId > 0 ? srcEl.GetPropertyById(SourcePropId, SourcePath) : srcEl.GetPropertyValue(SourcePath);
-                explicitNull = (valBox == null) && srcEl.IsExplicitNullProperty(SourcePath);
+                explicitNull = (valBox == null) &&
+                    (IsGuaranteedUIElementProperty(srcEl, SourcePath) || srcEl.IsExplicitNullProperty(SourcePath));
                 _elemPropResolvedOnSelf = (dm >= 0) && (valBox != null || explicitNull || srcEl.DataContext == null);
             } else {
                 _elemPropResolvedOnSelf = false;
@@ -6062,7 +6291,7 @@ public static class BindingEngine {
     private static Action[] _postFlushHooks;
     private static Action[] _postLayoutHooks;
     private static FrameTickHook[] _frameTickHooks;
-    private static int _batchDepth = 0;
+    internal static int _batchDepth = 0;
     private static BindingEntry[] _batchPending;
     private static bool _flushPassDirty = false;
     private static bool _inPostFlush = false;
@@ -6317,12 +6546,29 @@ public static class BindingEngine {
         }
     }
 
-    private static void RegisterEntry(BindingEntry entry) {
+    internal static string[] PreparePathSegments(string path) {
+        if (path != null && path.Length > 0 && path != ".") {
+            if (!path.Contains(".")) { return null; }
+            if (UIElement.IsAttachedElementPropPath(path)) {
+                var one = new string[1];
+                one[0] = path;
+                return one;
+            }
+            return SplitBindingPath(path);
+        }
+        return null;
+    }
+
+    private static void RegisterEntryWithIds(BindingEntry entry, int targetPropId, int srcPropId) {
         EnsureInit();
         BumpStructEpoch();
         if (entry != null) {
-            entry.TargetPropId = (entry.Target != null && entry.TargetProp != null) ? AeroPropId.Resolve(entry.TargetProp) : 0;
-            entry.SourcePropId = (entry.SourcePath != null) ? AeroPropId.Resolve(entry.SourcePath) : 0;
+            entry.TargetPropId = targetPropId != -2
+                ? targetPropId
+                : ((entry.Target != null && entry.TargetProp != null) ? AeroPropId.Resolve(entry.TargetProp) : 0);
+            entry.SourcePropId = srcPropId != -2
+                ? srcPropId
+                : ((entry.SourcePath != null) ? AeroPropId.Resolve(entry.SourcePath) : 0);
         }
         _entries.Push(entry);
         if (entry != null && entry.Target != null) {
@@ -6359,6 +6605,131 @@ public static class BindingEngine {
             return;
         }
         entry.Evaluate();
+    }
+
+    private static void RegisterEntry(BindingEntry entry) {
+        RegisterEntryWithIds(entry, -2, -2);
+    }
+
+    internal static void BindPathPrepared(
+        UIElement target, int targetPropId, string targetProp, DependencyObject explicitSourceBox,
+        int srcPropId, string path, string[] segs, bool singleHop,
+        int mode, IValueConverter converter, string converterKey, string converterParam, string stringFormat,
+        bool hasFallback, DependencyObject fallbackBox,
+        bool hasTargetNull, DependencyObject targetNullBox,
+        string relativeMode, string ancestorType) {
+        if (target == null || targetProp == null) { return; }
+        bool isTrigBind = target.HasUiFlag(256);
+        if (isTrigBind) { UnbindTriggerProperty(target, targetProp); }
+        var e = new BindingEntry();
+        e._isTriggerBinding = isTrigBind;
+        e.Target = target;
+        e.TargetProp = targetProp;
+        e.Kind = 1;
+        e.Mode = mode;
+        e.ExplicitSourceBox = explicitSourceBox;
+        e.SourcePath = path == null ? "" : path;
+        e.PathSegments = segs;
+        e.IsSingleHopPath = singleHop;
+        e.Converter = converter;
+        e.ConverterKey = converterKey == null ? "" : converterKey;
+        e.ConverterParam = converterParam == null ? "" : converterParam;
+        e.StringFormat = stringFormat == null ? "" : stringFormat;
+        e.HasFallback = hasFallback;
+        e.FallbackBox = fallbackBox;
+        e.HasTargetNull = hasTargetNull;
+        e.TargetNullBox = targetNullBox;
+        e.RelativeSourceMode = relativeMode == null ? "" : relativeMode;
+        e.RelativeSourceAncestorType = ancestorType == null ? "" : ancestorType;
+        RegisterEntryWithIds(e, targetPropId, srcPropId);
+    }
+
+    internal static void BindElementPrepared(
+        UIElement target, int targetPropId, string targetProp, string elementName,
+        int srcPropId, string sourceProp, string[] segs, bool singleHop,
+        int mode, IValueConverter converter, string converterKey, string converterParam, string stringFormat,
+        bool hasFallback, DependencyObject fallbackBox,
+        bool hasTargetNull, DependencyObject targetNullBox) {
+        if (target == null || targetProp == null) { return; }
+        bool isTrigBind = target.HasUiFlag(256);
+        if (isTrigBind) { UnbindTriggerProperty(target, targetProp); }
+        var e = new BindingEntry();
+        e._isTriggerBinding = isTrigBind;
+        e.Target = target;
+        e.TargetProp = targetProp;
+        e.Kind = 2;
+        e.Mode = mode;
+        e.ElementName = elementName == null ? "" : elementName;
+        e.SourcePath = sourceProp == null ? "" : sourceProp;
+        e.PathSegments = segs;
+        e.IsSingleHopPath = singleHop;
+        e.Converter = converter;
+        e.ConverterKey = converterKey == null ? "" : converterKey;
+        e.ConverterParam = converterParam == null ? "" : converterParam;
+        e.StringFormat = stringFormat == null ? "" : stringFormat;
+        e.HasFallback = hasFallback;
+        e.FallbackBox = fallbackBox;
+        e.HasTargetNull = hasTargetNull;
+        e.TargetNullBox = targetNullBox;
+        RegisterEntryWithIds(e, targetPropId, srcPropId);
+    }
+
+    internal static void BindTemplateParentPrepared(
+        UIElement target, int targetPropId, string targetProp, Control templatedParent,
+        int srcPropId, string sourceProp, string[] segs, bool singleHop,
+        IValueConverter converter, string converterKey, string converterParam, string stringFormat,
+        bool hasFallback, DependencyObject fallbackBox,
+        bool hasTargetNull, DependencyObject targetNullBox, int mode) {
+        if (target == null || targetProp == null) { return; }
+        target.ClearResourceReference(targetProp);
+        var e = new BindingEntry();
+        e.Target = target;
+        e.TargetProp = targetProp;
+        e.Kind = 3;
+        e.Mode = mode;
+        e.SourceElement = templatedParent;
+        e.SourcePath = sourceProp == null ? "" : sourceProp;
+        e.PathSegments = segs;
+        e.IsSingleHopPath = singleHop;
+        e.Converter = converter;
+        e.ConverterKey = converterKey == null ? "" : converterKey;
+        e.ConverterParam = converterParam == null ? "" : converterParam;
+        e.StringFormat = stringFormat == null ? "" : stringFormat;
+        e.HasFallback = hasFallback;
+        e.FallbackBox = fallbackBox;
+        e.HasTargetNull = hasTargetNull;
+        e.TargetNullBox = targetNullBox;
+        RegisterEntryWithIds(e, targetPropId, srcPropId);
+    }
+
+    private static int _textPropIdCache = -2;
+
+    internal static void BindTextFromBindingFast(UIElement target, Binding b) {
+        if (target == null || b == null) { return; }
+        if (_textPropIdCache == -2) { _textPropIdCache = AeroPropId.Resolve("Text"); }
+        string bp = b.Path == null ? "" : b.Path;
+        if (!b._prepReady || b._prepPath != bp) {
+            b._prepReady = true;
+            b._prepPath = bp;
+            b._cachedSrcPropId = bp.Length > 0 ? AeroPropId.Resolve(bp) : 0;
+            b._cachedSegs = PreparePathSegments(bp);
+            b._cachedSingleHop = (b._cachedSegs == null || b._cachedSegs.Length == 1);
+        }
+        int modeInt = b.Mode == BindingMode.TwoWay ? 1 : (b.Mode == BindingMode.OneTime ? 2 : (b.Mode == BindingMode.OneWayToSource ? 3 : 0));
+        if (b.ElementName.Length > 0) {
+            BindElementPrepared(
+                target, _textPropIdCache, "Text", b.ElementName, b._cachedSrcPropId, bp,
+                b._cachedSegs, b._cachedSingleHop, modeInt,
+                b.Converter, b.ConverterKey, b.ConverterParameter, b.StringFormat,
+                b.HasFallbackValue, b.FallbackBox, b.HasTargetNullValue, b.TargetNullBox);
+        } else {
+            BindPathPrepared(
+                target, _textPropIdCache, "Text", b.SourceBox, b._cachedSrcPropId, bp,
+                b._cachedSegs, b._cachedSingleHop, modeInt,
+                b.Converter, b.ConverterKey, b.ConverterParameter, b.StringFormat,
+                b.HasFallbackValue, b.FallbackBox, b.HasTargetNullValue, b.TargetNullBox,
+                b.RelativeSourceMode, b.RelativeSourceAncestorType);
+        }
     }
 
     public static void ClearBindings(UIElement target, string propertyName) {
@@ -6787,7 +7158,6 @@ public static class BindingEngine {
             }
         }
         _inSubtreeFlush = prevSub;
-        BumpStructEpoch();
     }
 
     private static void FlushCleanupOnly() {
@@ -7113,10 +7483,7 @@ public static class BindingEngine {
             DependencyObject att = trObj.GetAttachedValue(cleanLeaf);
             if (att != null) { return att; }
             if (cur is TransformGroup && cleanLeaf == "Children") {
-                Transform[] kids = (cur as TransformGroup).Children();
-                var col = new ArrayCollectionBox();
-                for (int k = 0; k < kids.Length; k += 1) { col.AddBox(kids[k]); }
-                return col;
+                return (cur as TransformGroup).ChildrenBox();
             }
             if (cur is RotateTransform && cleanLeaf == "Angle") { return DependencyObject.BoxFloat((cur as RotateTransform).Angle); }
             if (cur is ScaleTransform && cleanLeaf == "ScaleX") { return DependencyObject.BoxFloat((cur as ScaleTransform).ScaleX); }

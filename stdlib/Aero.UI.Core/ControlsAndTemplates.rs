@@ -211,17 +211,22 @@ public class Control : FrameworkElement {
         get { return _template; }
         set {
             MarkLocalProperty("Template");
-            if (_template == value && (_templateApplied || UIElement._closedPopupBuildDepth > 0)) { return; }
+            if (_template == value && (_templateApplied || UIElement._closedPopupBuildDepth > 0 || UIElement._xamlBuildDepth > 0)) { return; }
             if (_template != null && _templateApplied) {
                 _template.ResetTriggers(this);
             }
+            bool prevHasTplRes = _hasTemplateResources;
+            bool prevHasTplAmb = _hasTemplateAmbientResources;
             _template = value;
             _hasTemplateResources = (_template != null && (_template.HasResources() || _template.RawResourcesOrNull() != null));
             _hasTemplateAmbientResources = (_template != null && _template.AmbientResources != null);
-            ResourceDictionary.BumpGlobalMutationEpoch();
+            if (_rare != null && (prevHasTplRes || prevHasTplAmb || _hasTemplateResources || _hasTemplateAmbientResources)) {
+                _rare.ResCache = null;
+                _rare.DynResMutEpoch = -1;
+            }
             _templateApplied = false;
             _templateHasVsm = false;
-            if (UIElement._closedPopupBuildDepth > 0) { return; }
+            if (UIElement._closedPopupBuildDepth > 0 || UIElement._xamlBuildDepth > 0 || ShouldDeferTemplateExpansion()) { return; }
             ApplyTemplate();
         }
     }
@@ -336,6 +341,8 @@ public class Control : FrameworkElement {
         return false;
     }
 
+    internal virtual bool ShouldDeferTemplateExpansion() { return false; }
+
     private static void ExpandNestedTemplateControls(UIElement rootNode, UIElement owner) {
         if (rootNode == null) { return; }
         var q = new UIElement[0];
@@ -352,7 +359,7 @@ public class Control : FrameworkElement {
                 if (subCtrl._appliedStyle == null || (subCtrl.Style != null && subCtrl.Style != subCtrl._appliedStyle)) {
                     subCtrl.ApplyStyleInternal();
                 }
-                if (!subCtrl.IsTemplateApplied() && subCtrl.TemplateRoot() == null) {
+                if (!subCtrl.IsTemplateApplied() && subCtrl.TemplateRoot() == null && !subCtrl.ShouldDeferTemplateExpansion()) {
                     subCtrl.ApplyTemplate();
                 }
             }
@@ -364,8 +371,7 @@ public class Control : FrameworkElement {
         }
     }
 
-    private void PropagateTypography(UIElement rootNode) {
-        PropagateTypographyToSubtree();
+    private void SyncTemplatePresentersOnly(UIElement rootNode) {
         if (rootNode == null) { return; }
         UIElement self = this;
         var q = new UIElement[0];
@@ -389,6 +395,11 @@ public class Control : FrameworkElement {
                 }
             }
         }
+    }
+
+    private void PropagateTypography(UIElement rootNode) {
+        PropagateTypographyToSubtree();
+        SyncTemplatePresentersOnly(rootNode);
     }
 
     public UIElement GetTemplateChild(string name) {
@@ -478,6 +489,7 @@ public class Control : FrameworkElement {
             _templateRoot = null;
         }
         UIElement nextRoot = null;
+        BindingEngine.BeginBatch();
         if (_template != null) {
             UIElement._xamlBuildDepth += 1;
             nextRoot = _template.Instantiate(this);
@@ -488,8 +500,9 @@ public class Control : FrameworkElement {
         _templateRoot = nextRoot;
         _hasTemplateResources = (_template != null && (_template.HasResources() || _template.RawResourcesOrNull() != null));
         _hasTemplateAmbientResources = (_template != null && _template.AmbientResources != null);
-        if (prevHasTplRes || prevHasTplAmb || _hasTemplateResources || _hasTemplateAmbientResources) {
-            ResourceDictionary.BumpGlobalMutationEpoch();
+        if (_rare != null && (prevHasTplRes || prevHasTplAmb || _hasTemplateResources || _hasTemplateAmbientResources)) {
+            _rare.ResCache = null;
+            _rare.DynResMutEpoch = -1;
         }
         _templateApplied = true;
         SyncBoxStyleToNative();
@@ -499,7 +512,6 @@ public class Control : FrameworkElement {
             if (_template == null || _templateRoot.TemplatedParent != self) {
                 MarkTemplateOwner(_templateRoot, this);
             }
-            BindingEngine.BeginBatch();
             bool prevSuppress = _suppressChildAutoLoaded;
             bool prevSuppressStyle = _suppressChildAutoStyle;
             _suppressChildAutoLoaded = true;
@@ -509,10 +521,13 @@ public class Control : FrameworkElement {
             _suppressChildAutoLoaded = prevSuppress;
             _templateRoot.ApplyStyleSubtree();
             _templateRoot.RefreshDynamicResourcesRecursive();
-            ExpandNestedTemplateControls(_templateRoot, self);
-            SyncTemplatePresenters();
+            SyncTemplatePresentersOnly(_templateRoot);
             BindingEngine.EndBatch();
-            BindingEngine.FlushSubtree(_templateRoot);
+            if (BindingEngine._batchDepth == 0) {
+                BindingEngine.FlushSubtree(_templateRoot);
+            }
+        } else {
+            BindingEngine.EndBatch();
         }
         if (_templateRoot != null && _template != null) {
             _template.AttachNonEventTriggers(this);
@@ -525,7 +540,11 @@ public class Control : FrameworkElement {
         if (_templateRoot != null && HasLoadedFired() && !_loadingSelf) {
             _templateRoot.EnsureLoadedSubtree();
         }
-        _templateHasVsm = (_templateRoot != null) && Control.SubtreeHasVsm(_templateRoot, this);
+        if (_template != null && _template._knownVsmState >= 0) {
+            _templateHasVsm = (_template._knownVsmState == 1);
+        } else {
+            _templateHasVsm = (_templateRoot != null) && Control.SubtreeHasVsm(_templateRoot, this);
+        }
         UpdateVisualStates(false);
         return _templateRoot != null;
     }
@@ -572,7 +591,7 @@ public class Control : FrameworkElement {
     }
 
     protected override void OnLoaded() {
-        if (!_templateApplied) {
+        if (!_templateApplied && !ShouldDeferTemplateExpansion()) {
             ApplyTemplate();
         }
     }
@@ -721,6 +740,13 @@ public class ContentPresenter : FrameworkElement {
 
     public void SetContentBox(DependencyObject box) {
         if (box == null && _contentBox == null && _contentTemplate == null) { return; }
+        if (box != null && ChildCount() > 0) {
+            if (_contentBox == box) { return; }
+            if ((box is BoxedString) && (_contentBox is BoxedString) &&
+                (box as BoxedString).Value == (_contentBox as BoxedString).Value) {
+                return;
+            }
+        }
         _contentBox = box;
         BumpPropEpoch();
         RebuildContentVisual();
@@ -737,7 +763,13 @@ public class ContentPresenter : FrameworkElement {
     }
 
     public void SetContentAndTemplate(DependencyObject box, DataTemplate tpl) {
-        if (_contentBox == box && _contentTemplate == tpl && ChildCount() > 0) { return; }
+        if (_contentTemplate == tpl && ChildCount() > 0) {
+            if (_contentBox == box) { return; }
+            if (box != null && (box is BoxedString) && (_contentBox is BoxedString) &&
+                (box as BoxedString).Value == (_contentBox as BoxedString).Value) {
+                return;
+            }
+        }
         _contentBox = box;
         _contentTemplate = tpl;
         BumpPropEpoch();
@@ -929,12 +961,16 @@ public class ContentPresenter : FrameworkElement {
             DisposeTextViewIfAny();
             UIElement el = _contentBox as UIElement;
             if (ChildCount() == 1 && ChildAt(0) == el) {
-                BindingEngine.FlushSubtree(el);
+                if (UIElement._xamlBuildDepth == 0 && BindingEngine._batchDepth == 0) {
+                    BindingEngine.FlushSubtree(el);
+                }
                 return;
             }
             ClearChildren();
             AddChild(el);
-            BindingEngine.FlushSubtree(el);
+            if (UIElement._xamlBuildDepth == 0 && BindingEngine._batchDepth == 0) {
+                BindingEngine.FlushSubtree(el);
+            }
             return;
         }
         DataTemplate effTemplate = _contentTemplate;
@@ -1189,7 +1225,7 @@ public class ContentControl : Control {
             } else if (node != rootNode && node is Control) {
                 Control subCtrl = node as Control;
                 subCtrl.ApplyStyleInternal();
-                if (subCtrl.TemplateRoot() == null) {
+                if (subCtrl.TemplateRoot() == null && !subCtrl.ShouldDeferTemplateExpansion()) {
                     subCtrl.ApplyTemplate();
                 }
             }

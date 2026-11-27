@@ -123,6 +123,8 @@ public class LayoutScaler : Viewbox {
 
 public class Panel : FrameworkElement {
     public bool IsItemsHost { get; set; } = false;
+    private ArrayCollectionBox _childrenBoxCache;
+    private int _childrenBoxEpoch = -1;
 
     public Panel() : base(VisualKind.Box) {
         SyncInteractiveFlags();
@@ -131,6 +133,12 @@ public class Panel : FrameworkElement {
 
     protected override bool IsSelfHitTestSolid() {
         return Background != null;
+    }
+
+    protected override void CollectExtraDisposeTargets(UIElement[] q) {
+        base.CollectExtraDisposeTargets(q);
+        _childrenBoxCache = null;
+        _childrenBoxEpoch = -1;
     }
 
     public void Add(UIElement child) { AddChild(child); }
@@ -152,11 +160,16 @@ public class Panel : FrameworkElement {
     public override DependencyObject GetPropertyValue(string propName) {
         if (propName == "IsItemsHost") { return DependencyObject.BoxBool(IsItemsHost); }
         if (propName == "Children") {
+            if (_childrenBoxCache != null && _childrenBoxEpoch == _childrenMutEpoch) {
+                return _childrenBoxCache;
+            }
             var col = new ArrayCollectionBox();
             UIElement[] kids = Children();
             for (int i = 0; i < kids.Length; i += 1) {
                 col.AddBox(kids[i]);
             }
+            _childrenBoxCache = col;
+            _childrenBoxEpoch = _childrenMutEpoch;
             return col;
         }
         return base.GetPropertyValue(propName);
@@ -747,6 +760,9 @@ public class Grid : Panel {
         var def = new ColumnDefinition(value, unit);
         if (name != null && name.Length > 0) { def.Name = name; }
         ColumnDefinitions.Add(def);
+    }
+    public void AddColumnDefinitionNoSync(GridUnitType unit, float value = 1.0f) {
+        ColumnDefinitions.AddNoSync(new ColumnDefinition(value, unit));
     }
     public void ClearRowDefinitions() { if (_rowDefs != null) { _rowDefs.Clear(); } }
     public void ClearColumnDefinitions() { if (_colDefs != null) { _colDefs.Clear(); } }

@@ -148,6 +148,7 @@ public class ItemsControl : Control {
     protected bool _deferredItemsPending = false;
     protected bool _virtScrollHooked = false;
     private Action _collectionChangedHook;
+    private int _lastNotifiedItemCount = -1;
 
     public ItemsControl() : base() {
     }
@@ -167,29 +168,56 @@ public class ItemsControl : Control {
 
     public DataTemplate ItemTemplate {
         get { return _itemTemplate; }
-        set { if (_itemTemplate == value) { return; } _itemTemplate = value; RecycleActiveContainers(); RefreshItems(); }
+        set {
+            if (_itemTemplate == value) { return; }
+            _itemTemplate = value;
+            if (_activeContainers != null && _activeContainers.Length > 0) { RecycleActiveContainers(); }
+            if (UIElement._xamlBuildDepth > 0) { _itemsRefreshDeferred = true; return; }
+            RefreshItems();
+        }
     }
     public Style ItemContainerStyle {
         get { return _itemContainerStyle; }
-        set { if (_itemContainerStyle == value) { return; } _itemContainerStyle = value; RecycleActiveContainers(); RefreshItems(); }
+        set {
+            if (_itemContainerStyle == value) { return; }
+            _itemContainerStyle = value;
+            if (_activeContainers != null && _activeContainers.Length > 0) { RecycleActiveContainers(); }
+            if (UIElement._xamlBuildDepth > 0) { _itemsRefreshDeferred = true; return; }
+            RefreshItems();
+        }
     }
     public Func<Panel> ItemsPanel {
         get { return _itemsPanelFactory; }
         set {
+            if (_itemsPanelFactory == value) { return; }
             _itemsPanelFactory = value;
             if (_itemsPresenter != null) { _itemsPresenter.PanelFactory = value; }
-            RecycleActiveContainers();
+            if (_activeContainers != null && _activeContainers.Length > 0) { RecycleActiveContainers(); }
+            if (UIElement._xamlBuildDepth > 0) { _itemsRefreshDeferred = true; return; }
             RefreshItems();
         }
     }
     public Func<Panel> ItemsPanelFactory() { return _itemsPanelFactory; }
     public string DisplayMemberPath {
         get { return _displayMemberPath; }
-        set { _displayMemberPath = value == null ? "" : value; RecycleActiveContainers(); RefreshItems(); }
+        set {
+            string next = value == null ? "" : value;
+            if (_displayMemberPath == next) { return; }
+            _displayMemberPath = next;
+            if (_activeContainers != null && _activeContainers.Length > 0) { RecycleActiveContainers(); }
+            if (UIElement._xamlBuildDepth > 0) { _itemsRefreshDeferred = true; return; }
+            RefreshItems();
+        }
     }
     public int AlternationCount {
         get { return _alternationCount; }
-        set { _alternationCount = value >= 0 ? value : 0; RefreshItems(); }
+        set {
+            int next = value >= 0 ? value : 0;
+            if (_alternationCount == next) { return; }
+            _alternationCount = next;
+            if (UIElement._xamlBuildDepth > 0) { _itemsRefreshDeferred = true; return; }
+            RefreshItems();
+        }
     }
     public bool IsVirtualizing {
         get { return _virtualizing; }
@@ -340,7 +368,10 @@ public class ItemsControl : Control {
     public void AddItemBox(DependencyObject box) {
         if (_manualItems == null) { _manualItems = new DependencyObject[0]; }
         _manualItems.Push(box);
-        if (_itemsSourceBox == null) { RefreshItems(); }
+        if (_itemsSourceBox == null) {
+            if (UIElement._xamlBuildDepth > 0) { _itemsRefreshDeferred = true; }
+            else { RefreshItems(); }
+        }
     }
     public void AddItem(object item) { AddItemBox(DependencyObject.BoxObject(item)); }
     public void AddItem(string item) { AddItemBox(DependencyObject.BoxString(item)); }
@@ -359,6 +390,7 @@ public class ItemsControl : Control {
     }
 
     public void SetItemsSourceBox(DependencyObject newSource) {
+        if (_itemsSourceBox == newSource) { return; }
         if (_itemsSourceBox != null && _collectionChangedHook != null) {
             object oldObj = DependencyObject.Unbox(_itemsSourceBox);
             CollectionChangeHub.Unsubscribe(oldObj, _collectionChangedHook);
@@ -627,7 +659,10 @@ public class ItemsControl : Control {
 
     public virtual void RefreshItems() {
         int total = ItemCount();
-        BindingEngine.NotifyTargetPropertyChanged(this, "Items.Count", DependencyObject.BoxInt(total));
+        if (total != _lastNotifiedItemCount) {
+            _lastNotifiedItemCount = total;
+            BindingEngine.NotifyTargetPropertyChanged(this, "Items.Count", DependencyObject.BoxInt(total));
+        }
         if (ShouldDeferItemsMaterialization()) {
             _deferredItemsPending = true;
             return;
@@ -771,7 +806,6 @@ public class ItemsControl : Control {
         _activeContainers = nextContainers;
         _activeBoxes = nextBoxes;
         UIElement._xamlBuildDepth -= 1;
-        BindingEngine.EndBatch();
         if (UIElement._xamlBuildDepth == 0 && newlyAdded.Length > 0) {
             bool hostLoaded = host != null && host.HasLoadedFired();
             for (int na = 0; na < newlyAdded.Length; na += 1) {
@@ -781,7 +815,15 @@ public class ItemsControl : Control {
                 nc.RefreshDynamicResourcesRecursive();
                 nc.ApplyTemplateSubtree();
                 if (hostLoaded) { nc.EnsureLoadedSubtree(); }
-                BindingEngine.FlushSubtree(nc);
+            }
+        }
+        BindingEngine.EndBatch();
+        if (UIElement._xamlBuildDepth == 0 && BindingEngine._batchDepth == 0 && newlyAdded.Length > 0) {
+            for (int na = 0; na < newlyAdded.Length; na += 1) {
+                UIElement nc = newlyAdded[na];
+                if (nc != null && !nc._isDisposedTree) {
+                    BindingEngine.FlushSubtree(nc);
+                }
             }
         }
         OnContainersRebuilt();
@@ -809,7 +851,7 @@ public class ItemsControl : Control {
             if (node != rootNode && node is Control) {
                 Control subCtrl = node as Control;
                 subCtrl.ApplyStyleInternal();
-                if (subCtrl.TemplateRoot() == null) {
+                if (subCtrl.TemplateRoot() == null && !subCtrl.ShouldDeferTemplateExpansion()) {
                     subCtrl.ApplyTemplate();
                 }
             }
@@ -842,7 +884,7 @@ public class ItemsControl : Control {
             if (node != rootNode && node is Control) {
                 Control subCtrl = node as Control;
                 subCtrl.ApplyStyleInternal();
-                if (subCtrl.TemplateRoot() == null) {
+                if (subCtrl.TemplateRoot() == null && !subCtrl.ShouldDeferTemplateExpansion()) {
                     subCtrl.ApplyTemplate();
                 }
             }
@@ -1507,6 +1549,7 @@ public class GridViewColumnHeader : ButtonBase {
 
 public class GridView : DependencyObject {
     private GridViewColumn[] _columns;
+    private ArrayCollectionBox _columnsBoxCache;
     public bool AllowsColumnReorder { get; set; } = true;
     public Style ColumnHeaderContainerStyle { get; set; }
     public DataTemplate ColumnHeaderTemplate { get; set; }
@@ -1519,15 +1562,19 @@ public class GridView : DependencyObject {
         return base.GetBindingPropertyValue(propName);
     }
 
+    internal int _depPropEpoch = 1;
+    internal override int DepPropEpoch() { return _depPropEpoch; }
     public GridView() { _columns = new GridViewColumn[0]; }
     public GridViewColumn[] Columns() { return _columns; }
     public DependencyObject ColumnsBox() {
+        if (_columnsBoxCache != null) { return _columnsBoxCache; }
         var box = new ArrayCollectionBox();
         for (int i = 0; i < _columns.Length; i += 1) { box.AddBox(_columns[i]); }
+        _columnsBoxCache = box;
         return box;
     }
-    public void AddColumn(GridViewColumn col) { if (col != null) { _columns.Push(col); } }
-    public void ClearColumns() { _columns.Clear(); }
+    public void AddColumn(GridViewColumn col) { if (col != null) { _columns.Push(col); _columnsBoxCache = null; _depPropEpoch += 1; } }
+    public void ClearColumns() { _columns.Clear(); _columnsBoxCache = null; _depPropEpoch += 1; }
 }
 
 public class GridViewHeaderRowPresenter : FrameworkElement {
@@ -1536,9 +1583,25 @@ public class GridViewHeaderRowPresenter : FrameworkElement {
     private DependencyObject _toolTipBox;
     private DependencyObject _columnsBox;
     private Grid _rowGrid;
+    private Style _colHeaderContainerStyle;
+    private DataTemplate _colHeaderTemplate;
     public bool AllowsColumnReorder { get; set; } = true;
-    public Style ColumnHeaderContainerStyle { get; set; }
-    public DataTemplate ColumnHeaderTemplate { get; set; }
+    public Style ColumnHeaderContainerStyle {
+        get { return _colHeaderContainerStyle; }
+        set {
+            if (_colHeaderContainerStyle == value) { return; }
+            _colHeaderContainerStyle = value;
+            if (UIElement._xamlBuildDepth == 0 && _rowGrid != null) { RebuildHeaders(); }
+        }
+    }
+    public DataTemplate ColumnHeaderTemplate {
+        get { return _colHeaderTemplate; }
+        set {
+            if (_colHeaderTemplate == value) { return; }
+            _colHeaderTemplate = value;
+            if (UIElement._xamlBuildDepth == 0 && _rowGrid != null) { RebuildHeaders(); }
+        }
+    }
 
     public object ColumnHeaderContextMenu {
         get { return DependencyObject.Unbox(_contextMenuBox); }
@@ -1554,7 +1617,12 @@ public class GridViewHeaderRowPresenter : FrameworkElement {
     }
     public object Columns {
         get { return DependencyObject.Unbox(_columnsBox); }
-        set { _columnsBox = DependencyObject.BoxObject(value); RebuildHeaders(); }
+        set {
+            DependencyObject next = DependencyObject.BoxObject(value);
+            if (_columnsBox == next) { return; }
+            _columnsBox = next;
+            if (UIElement._xamlBuildDepth == 0) { RebuildHeaders(); }
+        }
     }
 
     public GridViewHeaderRowPresenter() : base(VisualKind.Box) {}
@@ -1562,7 +1630,9 @@ public class GridViewHeaderRowPresenter : FrameworkElement {
 
     protected override void OnLoaded() {
         base.OnLoaded();
-        RebuildHeaders();
+        if (_rowGrid == null) {
+            RebuildHeaders();
+        }
     }
 
     private GridView ResolveGridView() {
@@ -1588,15 +1658,22 @@ public class GridViewHeaderRowPresenter : FrameworkElement {
         return gv != null ? gv.Columns() : new GridViewColumn[0];
     }
 
+    private DependencyObject _builtColsKey;
+    private Style _builtHeaderStyle;
+    private DataTemplate _builtHeaderTemplate;
+
     protected override void CollectExtraDisposeTargets(UIElement[] q) {
         if (_rowGrid != null) {
             if (!_rowGrid._isDisposedTree) { q.Push(_rowGrid); }
             _rowGrid = null;
         }
         _columnsBox = null;
+        _builtColsKey = null;
         _toolTipBox = null;
-        ColumnHeaderContainerStyle = null;
-        ColumnHeaderTemplate = null;
+        _colHeaderContainerStyle = null;
+        _builtHeaderStyle = null;
+        _colHeaderTemplate = null;
+        _builtHeaderTemplate = null;
     }
 
     public void RebuildHeaders() {
@@ -1608,24 +1685,30 @@ public class GridViewHeaderRowPresenter : FrameworkElement {
             _rowGrid = null;
         }
         ClearChildren();
+        GridView gv = ResolveGridView();
         GridViewColumn[] cols = ExtractColumns();
         if (cols.Length == 0) {
+            _builtColsKey = null;
             return;
         }
+        UIElement._xamlBuildDepth += 1;
+        BindingEngine.BeginBatch();
         _rowGrid = new Grid();
         _rowGrid.HorizontalAlignment = HorizontalAlignment.Stretch;
-        GridView gv = ResolveGridView();
-        Style sharedStyle = ColumnHeaderContainerStyle != null
-            ? ColumnHeaderContainerStyle
+        Style sharedStyle = _colHeaderContainerStyle != null
+            ? _colHeaderContainerStyle
             : (gv != null ? gv.ColumnHeaderContainerStyle : null);
-        DataTemplate sharedTpl = ColumnHeaderTemplate != null
-            ? ColumnHeaderTemplate
+        DataTemplate sharedTpl = _colHeaderTemplate != null
+            ? _colHeaderTemplate
             : (gv != null ? gv.ColumnHeaderTemplate : null);
+        _builtColsKey = _columnsBox != null ? _columnsBox : (gv != null ? gv.ColumnsBox() : null);
+        _builtHeaderStyle = sharedStyle;
+        _builtHeaderTemplate = sharedTpl;
 
         for (int i = 0; i < cols.Length; i += 1) {
             GridViewColumn col = cols[i];
             float w = (ParseUtil.IsFinite(col.Width) && col.Width > 0.0f) ? col.Width : 100.0f;
-            _rowGrid.AddColumnDefinition(GridUnitType.Pixel, w);
+            _rowGrid.AddColumnDefinitionNoSync(GridUnitType.Pixel, w);
             var hdr = new GridViewColumnHeader();
             hdr.Role = "Normal";
             Style colStyle = col.HeaderContainerStyle != null ? col.HeaderContainerStyle : sharedStyle;
@@ -1636,26 +1719,56 @@ public class GridViewHeaderRowPresenter : FrameworkElement {
             UIElement.SetGridColumn(hdr, i);
             _rowGrid.AddChild(hdr);
         }
-        _rowGrid.AddColumnDefinition(GridUnitType.Star, 1.0f);
+        _rowGrid.AddColumnDefinitionNoSync(GridUnitType.Star, 1.0f);
+        _rowGrid.SyncGridTracks();
         var padHdr = new GridViewColumnHeader();
         padHdr.Role = "Padding";
         if (sharedStyle != null) { padHdr.Style = sharedStyle; }
         UIElement.SetGridColumn(padHdr, cols.Length);
         _rowGrid.AddChild(padHdr);
+        UIElement._xamlBuildDepth -= 1;
+        bool prevSuppStyle = _suppressChildAutoStyle;
+        _suppressChildAutoStyle = true;
         AddChild(_rowGrid);
-        BindingEngine.FlushSubtree(_rowGrid);
+        _suppressChildAutoStyle = prevSuppStyle;
+        _rowGrid.ApplyStyleSubtree();
+        _rowGrid.RefreshDynamicResourcesRecursive();
+        if (HasLoadedFired()) { _rowGrid.EnsureLoadedSubtree(); }
+        BindingEngine.EndBatch();
+        if (BindingEngine._batchDepth == 0) {
+            BindingEngine.FlushSubtree(_rowGrid);
+        }
     }
 
     public override bool SetPropertyValue(string propName, DependencyObject value) {
-        if (propName == "Columns") { _columnsBox = value; RebuildHeaders(); return true; }
+        if (propName == "Columns") {
+            if (_columnsBox == value) { return true; }
+            _columnsBox = value;
+            if (UIElement._xamlBuildDepth == 0 && (_rowGrid == null || value != _builtColsKey)) {
+                RebuildHeaders();
+            }
+            return true;
+        }
         if (propName == "ColumnHeaderContainerStyle") {
-            ColumnHeaderContainerStyle = value as Style;
-            RebuildHeaders();
+            Style nextStyle = value as Style;
+            if (_colHeaderContainerStyle == nextStyle) { return true; }
+            _colHeaderContainerStyle = nextStyle;
+            GridView gv = ResolveGridView();
+            Style effStyle = _colHeaderContainerStyle != null ? _colHeaderContainerStyle : (gv != null ? gv.ColumnHeaderContainerStyle : null);
+            if (UIElement._xamlBuildDepth == 0 && _rowGrid != null && effStyle != _builtHeaderStyle) {
+                RebuildHeaders();
+            }
             return true;
         }
         if (propName == "ColumnHeaderTemplate") {
-            ColumnHeaderTemplate = value as DataTemplate;
-            RebuildHeaders();
+            DataTemplate nextTpl = value as DataTemplate;
+            if (_colHeaderTemplate == nextTpl) { return true; }
+            _colHeaderTemplate = nextTpl;
+            GridView gv = ResolveGridView();
+            DataTemplate effTpl = _colHeaderTemplate != null ? _colHeaderTemplate : (gv != null ? gv.ColumnHeaderTemplate : null);
+            if (UIElement._xamlBuildDepth == 0 && _rowGrid != null && effTpl != _builtHeaderTemplate) {
+                RebuildHeaders();
+            }
             return true;
         }
         if (propName == "AllowsColumnReorder") { AllowsColumnReorder = DependencyObject.UnboxBool(value, true); return true; }
@@ -1674,6 +1787,8 @@ public class GridViewHeaderRowPresenter : FrameworkElement {
 public class GridViewRowPresenter : FrameworkElement {
     private DependencyObject _contentBox;
     private DependencyObject _columnsBox;
+    private DependencyObject _builtItemBox;
+    private DependencyObject _builtColsKey;
     private Grid _rowGrid;
 
     public object Content {
@@ -1698,7 +1813,10 @@ public class GridViewRowPresenter : FrameworkElement {
     protected override void OnDataContextChanged(object oldDc, object newDc) {
         base.OnDataContextChanged(oldDc, newDc);
         if (HasLoadedFired()) {
-            RebuildCells();
+            DependencyObject effItem = _contentBox != null ? _contentBox : EffectiveDataContextBox();
+            if (_rowGrid == null || effItem != _builtItemBox) {
+                RebuildCells();
+            }
         }
     }
 
@@ -1709,6 +1827,8 @@ public class GridViewRowPresenter : FrameworkElement {
         }
         _contentBox = null;
         _columnsBox = null;
+        _builtItemBox = null;
+        _builtColsKey = null;
     }
 
     private GridView ResolveGridView() {
@@ -1746,11 +1866,22 @@ public class GridViewRowPresenter : FrameworkElement {
             _rowGrid = null;
         }
         ClearChildren();
+        GridView gv = ResolveGridView();
         GridViewColumn[] cols = ExtractColumns();
-        if (cols.Length == 0) { return; }
+        if (cols.Length == 0) {
+            _builtItemBox = null;
+            _builtColsKey = null;
+            return;
+        }
         DependencyObject itemBox = _contentBox != null ? _contentBox : EffectiveDataContextBox();
         object rawData = DependencyObject.Unbox(itemBox);
-        if (rawData == null && itemBox == null) { return; }
+        if (rawData == null && itemBox == null) {
+            _builtItemBox = null;
+            _builtColsKey = null;
+            return;
+        }
+        _builtItemBox = itemBox;
+        _builtColsKey = _columnsBox != null ? _columnsBox : (gv != null ? gv.ColumnsBox() : null);
 
         UIElement._xamlBuildDepth += 1;
         BindingEngine.BeginBatch();
@@ -1767,7 +1898,7 @@ public class GridViewRowPresenter : FrameworkElement {
         for (int i = 0; i < cols.Length; i += 1) {
             GridViewColumn col = cols[i];
             float w = (ParseUtil.IsFinite(col.Width) && col.Width > 0.0f) ? col.Width : 100.0f;
-            _rowGrid.AddColumnDefinition(GridUnitType.Pixel, w);
+            _rowGrid.AddColumnDefinitionNoSync(GridUnitType.Pixel, w);
             UIElement cellEl = null;
             if (col.CellTemplate != null) {
                 hasCellTemplate = true;
@@ -1782,20 +1913,7 @@ public class GridViewRowPresenter : FrameworkElement {
                     tb.DataContextBox = itemBox;
                 }
                 if (col.DisplayMemberBinding != null) {
-                    Binding b = col.DisplayMemberBinding;
-                    int modeInt = b.Mode == BindingMode.TwoWay ? 1 : (b.Mode == BindingMode.OneTime ? 2 : (b.Mode == BindingMode.OneWayToSource ? 3 : 0));
-                    if (b.ElementName.Length > 0) {
-                        BindingEngine.BindElementEx(
-                            tb, "Text", b.ElementName, b.Path, modeInt,
-                            b.Converter, b.ConverterKey, b.ConverterParameter, b.StringFormat,
-                            b.HasFallbackValue, b.FallbackBox, b.HasTargetNullValue, b.TargetNullBox);
-                    } else {
-                        BindingEngine.BindPathEx(
-                            tb, "Text", b.Source, b.Path, modeInt,
-                            b.Converter, b.ConverterKey, b.ConverterParameter, b.StringFormat,
-                            b.HasFallbackValue, b.FallbackBox, b.HasTargetNullValue, b.TargetNullBox,
-                            b.RelativeSourceMode, b.RelativeSourceAncestorType);
-                    }
+                    BindingEngine.BindTextFromBindingFast(tb, col.DisplayMemberBinding);
                 } else {
                     tb.Text = DependencyObject.UnboxString(itemBox, "");
                 }
@@ -1806,22 +1924,42 @@ public class GridViewRowPresenter : FrameworkElement {
                 _rowGrid.AddChild(cellEl);
             }
         }
+        _rowGrid.SyncGridTracks();
 
         _rowGrid._suppressChildAutoStyle = prevSuppressGrid;
         UIElement._xamlBuildDepth -= 1;
-        BindingEngine.EndBatch();
         if (UIElement._xamlBuildDepth == 0) {
             _rowGrid.ApplyStyleSubtree();
             _rowGrid.RefreshDynamicResourcesRecursive();
-            _rowGrid.ApplyTemplateSubtree();
+            if (hasCellTemplate) { _rowGrid.ApplyTemplateSubtree(); }
             if (HasLoadedFired()) { _rowGrid.EnsureLoadedSubtree(); }
+        }
+        BindingEngine.EndBatch();
+        if (UIElement._xamlBuildDepth == 0 && BindingEngine._batchDepth == 0) {
             BindingEngine.FlushSubtree(_rowGrid);
         }
     }
 
     public override bool SetPropertyValue(string propName, DependencyObject value) {
-        if (propName == "Content") { _contentBox = value; if (HasLoadedFired()) { RebuildCells(); } return true; }
-        if (propName == "Columns") { _columnsBox = value; if (HasLoadedFired()) { RebuildCells(); } return true; }
+        if (propName == "Content") {
+            if (_contentBox == value) { return true; }
+            _contentBox = value;
+            if (HasLoadedFired()) {
+                DependencyObject effItem = _contentBox != null ? _contentBox : EffectiveDataContextBox();
+                if (_rowGrid == null || effItem != _builtItemBox) {
+                    RebuildCells();
+                }
+            }
+            return true;
+        }
+        if (propName == "Columns") {
+            if (_columnsBox == value) { return true; }
+            _columnsBox = value;
+            if (HasLoadedFired() && (_rowGrid == null || value != _builtColsKey)) {
+                RebuildCells();
+            }
+            return true;
+        }
         return base.SetPropertyValue(propName, value);
     }
 
@@ -2316,6 +2454,7 @@ public class ComboBox : Selector {
             if (!(dsv is ScrollViewer)) { dsv = GetTemplateChild("PART_ScrollViewer"); }
             if (dsv is ScrollViewer) { _dropScroll = dsv as ScrollViewer; }
             UIElement pop = GetTemplateChild("PART_Popup");
+            if (!(pop is Popup)) { pop = GetTemplateChild("Popup"); }
             if (pop is Popup) {
                 _dropdownPopup = pop as Popup;
                 _dropdownPopup.PlacementTarget = this;

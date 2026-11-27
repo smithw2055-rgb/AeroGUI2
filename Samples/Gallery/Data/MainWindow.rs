@@ -285,10 +285,12 @@ public partial class MainWindow : Window
     private ResourceDictionary _sampleThemeResources = null;
     private string _appliedThemeKey = "";
     private int _sidebarMode = 1;
+    private bool _windowLoaded = false;
 
     public MainWindow()
     {
         this.InitializeComponent();
+        this.Loaded += (object s, RoutedEventArgs e) => { this._windowLoaded = true; };
 
         this._lastLoadSucceeded = false;
         this.ViewModel = new ViewModel(this);
@@ -427,6 +429,8 @@ public partial class MainWindow : Window
             return false;
         }
 
+        PopupService.CloseAll();
+
         if (this.SampleContainer1 != null)
         {
             UIElement old1 = this.SampleContainer1.Content as UIElement;
@@ -446,14 +450,6 @@ public partial class MainWindow : Window
             }
         }
 
-        ResourceDictionary sampleRes = this._sampleThemeResources != null ? this._sampleThemeResources : this.Resources;
-        UIElement preview = XamlReader.LoadUri(xamlUri, sampleRes);
-        bool loadedReal = (preview != null);
-        if (preview == null)
-        {
-            preview = this.BuildLoadErrorFallback(xamlUri);
-        }
-
         bool useFirst = (this.ActiveContainerIndex != 1);
 
         if (this.WelcomeScreen != null)
@@ -468,12 +464,26 @@ public partial class MainWindow : Window
         {
             inactiveContainer.Visibility = Visibility.Collapsed;
         }
-        if (activeContainer != null)
+
+        ResourceDictionary sampleRes = this._sampleThemeResources != null ? this._sampleThemeResources : this.Resources;
+        UIElement preview = (activeContainer != null && this._windowLoaded)
+            ? XamlReader.LoadUriInto(activeContainer, xamlUri, sampleRes)
+            : XamlReader.LoadUri(xamlUri, sampleRes);
+        bool loadedReal = (preview != null);
+        if (preview == null)
+        {
+            preview = this.BuildLoadErrorFallback(xamlUri);
+            if (activeContainer != null)
+            {
+                activeContainer.Visibility = Visibility.Visible;
+                activeContainer.SetContent(preview);
+            }
+        }
+        else if (activeContainer != null && !this._windowLoaded)
         {
             activeContainer.Visibility = Visibility.Visible;
             activeContainer.SetContent(preview);
             preview.ApplyTemplateSubtree();
-            BindingEngine.FlushSubtree(preview);
             preview.EnsureLoadedSubtree();
         }
 
