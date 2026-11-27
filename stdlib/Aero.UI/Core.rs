@@ -4092,6 +4092,11 @@ public partial class UIElement : DependencyObject {
         if (_hasNative) {
             bool effHit = _effectiveHitTestVisible && IsSelfHitTestSolid();
             Visual_SetInteractiveFlags(__nativeHandle, _isEnabled, effHit, _focusable);
+            bool borderOnly = effHit && _visualKind == VisualKind.Box && _background == null;
+            if (borderOnly != HasUiFlag(8192)) {
+                SetUiFlag(8192, borderOnly);
+                Visual_SetHitTestBorderOnly(__nativeHandle, borderOnly);
+            }
         }
     }
     public void SyncInteractiveFlagsSubtree() {

@@ -5766,6 +5766,154 @@ void TestRound3All18Fixes(aero::rs_comp::CompilerSession& session) {
             }
             Require(foundBurlySelection,
                 "Gallery #13 read-only TextBox must resolve BurlyWood with SelectionOpacity=0.5 (non-black)");
+
+            // Multiline TextBox: mouse wheel scrolling + ScrollBar button clicks + Thumb drag
+            aero::VisualNodeId multiTbId{};
+            for (aero::VisualNodeId bid : boxes) {
+                const aero::VisualNode* bn = host.World().GetNode(bid);
+                std::string txt;
+                if (bn && ReadStringMember(host, bn->scriptOwner, "Text", txt) &&
+                    txt.find("Lorem ipsum") != std::string::npos) {
+                    multiTbId = bid;
+                    break;
+                }
+            }
+            Require(multiTbId.IsValid(), "Gallery #13 multiline TextBox missing");
+            if (multiTbId.IsValid()) {
+                std::vector<aero::VisualNodeId> outerSvs;
+                CollectDescendantsByTypeName(host, cid, "ScrollViewer", outerSvs);
+                const aero::VisualNode* multiNode = host.World().GetNode(multiTbId);
+                aero::Rect multiVp = multiNode ? NodeViewportBounds(*multiNode) : aero::Rect{};
+                if (!outerSvs.empty() && (multiVp.y < 70.0f || multiVp.y + multiVp.height > 760.0f)) {
+                    const aero::VisualNode* outerSvNode = host.World().GetNode(outerSvs[0]);
+                    float outerCur = 0.0f;
+                    (void)ReadFloatMember(host, outerSvNode->scriptOwner, "VerticalOffset", outerCur);
+                    const float nextOuter = std::max(0.0f, outerCur + (multiVp.y - 180.0f));
+                    (void)host.InvokeScriptMethod(
+                        outerSvNode->scriptOwner,
+                        "ScrollToVerticalOffset",
+                        {aero::UnifiedValue{aero::FloatValue{nextOuter}}});
+                    for (int f = 0; f < 4; ++f) { host.StepFrame(1.0f / 60.0f, f == 3); }
+                    multiNode = host.World().GetNode(multiTbId);
+                    multiVp = multiNode ? NodeViewportBounds(*multiNode) : aero::Rect{};
+                }
+
+                const aero::VisualNodeId hostSvId = FindDescendantByOwnerName(host, multiTbId, "PART_ContentHost");
+                const aero::VisualNode* hostSvNode = hostSvId.IsValid() ? host.World().GetNode(hostSvId) : nullptr;
+                Require(hostSvNode != nullptr && hostSvNode->scriptOwner.valid(),
+                    "Gallery #13 multiline TextBox PART_ContentHost missing");
+
+                float scrollableH = 0.0f;
+                Require(hostSvNode && ReadFloatMember(host, hostSvNode->scriptOwner, "ScrollableHeight", scrollableH) &&
+                        scrollableH > 10.0f,
+                    "Gallery #13 multiline TextBox ScrollableHeight must be > 10 (got " +
+                    std::to_string(scrollableH) + ")");
+
+                const aero::VisualNodeId vBarId = FindDescendantByOwnerName(host, hostSvId, "PART_VerticalScrollBar");
+                const aero::VisualNode* vBarNode = vBarId.IsValid() ? host.World().GetNode(vBarId) : nullptr;
+                const aero::Rect vBarVp = vBarNode ? NodeViewportBounds(*vBarNode) : aero::Rect{};
+                Require(vBarNode != nullptr &&
+                        vBarNode->layout.visibility == aero::Visibility::Visible &&
+                        vBarVp.width >= 8.0f && vBarVp.height >= 40.0f,
+                    "Gallery #13 multiline TextBox PART_VerticalScrollBar must be visible");
+
+                float outerOff0 = 0.0f;
+                if (!outerSvs.empty()) {
+                    (void)ReadFloatMember(host, host.World().GetNode(outerSvs[0])->scriptOwner, "VerticalOffset", outerOff0);
+                }
+                float tbOff0 = -1.0f;
+                (void)ReadFloatMember(host, hostSvNode->scriptOwner, "VerticalOffset", tbOff0);
+                Require(std::abs(tbOff0) < 0.5f, "Gallery #13 multiline TextBox should start at VerticalOffset 0");
+
+                // 1) MouseWheel down inside multiline TextBox should scroll PART_ContentHost without scrolling outer page
+                const float tbCx = multiVp.x + multiVp.width * 0.4f;
+                const float tbCy = multiVp.y + multiVp.height * 0.5f;
+                host.InjectPointerMove(tbCx, tbCy);
+                host.InjectMouseWheel(tbCx, tbCy, 0.0f, -120.0f);
+                for (int f = 0; f < 4; ++f) { host.StepFrame(1.0f / 60.0f, f == 3); }
+
+                float tbOffWheelDown = 0.0f;
+                (void)ReadFloatMember(host, hostSvNode->scriptOwner, "VerticalOffset", tbOffWheelDown);
+                float outerOff1 = outerOff0;
+                if (!outerSvs.empty()) {
+                    (void)ReadFloatMember(host, host.World().GetNode(outerSvs[0])->scriptOwner, "VerticalOffset", outerOff1);
+                }
+                Require(tbOffWheelDown > 10.0f,
+                    "Gallery #13 multiline TextBox mouse wheel down must increase VerticalOffset (got " +
+                    std::to_string(tbOffWheelDown) + ")");
+                Require(std::abs(outerOff1 - outerOff0) < 0.5f,
+                    "Gallery #13 multiline TextBox mouse wheel must not leak to outer Gallery ScrollViewer");
+
+                // 2) MouseWheel up returns VerticalOffset back down
+                host.InjectMouseWheel(tbCx, tbCy, 0.0f, 120.0f);
+                for (int f = 0; f < 4; ++f) { host.StepFrame(1.0f / 60.0f, f == 3); }
+                float tbOffWheelUp = -1.0f;
+                (void)ReadFloatMember(host, hostSvNode->scriptOwner, "VerticalOffset", tbOffWheelUp);
+                Require(tbOffWheelUp < tbOffWheelDown - 5.0f,
+                    "Gallery #13 multiline TextBox mouse wheel up must decrease VerticalOffset (got " +
+                    std::to_string(tbOffWheelUp) + ")");
+
+                // 3) Hover ScrollBar to expand it, then click LineDownButton & LineUpButton
+                host.InjectPointerMove(vBarVp.x + vBarVp.width * 0.5f, vBarVp.y + vBarVp.height * 0.5f);
+                for (int f = 0; f < 22; ++f) { host.StepFrame(1.0f / 60.0f, f == 21); }
+
+                const aero::VisualNodeId lineDownId = FindDescendantByOwnerName(host, vBarId, "LineDownButton");
+                const aero::VisualNodeId lineUpId = FindDescendantByOwnerName(host, vBarId, "LineUpButton");
+                Require(lineDownId.IsValid() && lineUpId.IsValid(),
+                    "Gallery #13 multiline TextBox ScrollBar LineUpButton/LineDownButton missing");
+                if (lineDownId.IsValid() && lineUpId.IsValid()) {
+                    const aero::Rect ldVp = NodeViewportBounds(*host.World().GetNode(lineDownId));
+                    host.InjectClick(ldVp.x + ldVp.width * 0.5f, ldVp.y + ldVp.height * 0.5f);
+                    for (int f = 0; f < 4; ++f) { host.StepFrame(1.0f / 60.0f, f == 3); }
+                    float tbOffLineDown = 0.0f;
+                    (void)ReadFloatMember(host, hostSvNode->scriptOwner, "VerticalOffset", tbOffLineDown);
+                    Require(tbOffLineDown > tbOffWheelUp + 5.0f,
+                        "Gallery #13 ScrollBar LineDownButton click must scroll down (got " +
+                        std::to_string(tbOffLineDown) + ")");
+
+                    const aero::Rect luVp = NodeViewportBounds(*host.World().GetNode(lineUpId));
+                    host.InjectClick(luVp.x + luVp.width * 0.5f, luVp.y + luVp.height * 0.5f);
+                    for (int f = 0; f < 4; ++f) { host.StepFrame(1.0f / 60.0f, f == 3); }
+                    float tbOffLineUp = tbOffLineDown;
+                    (void)ReadFloatMember(host, hostSvNode->scriptOwner, "VerticalOffset", tbOffLineUp);
+                    Require(tbOffLineUp < tbOffLineDown - 5.0f,
+                        "Gallery #13 ScrollBar LineUpButton click must scroll up (got " +
+                        std::to_string(tbOffLineUp) + ")");
+                }
+
+                // 4) Drag ScrollBar Thumb downward
+                const aero::VisualNodeId trackId = FindDescendantByOwnerName(host, vBarId, "PART_Track");
+                const aero::VisualNodeId thumbId = trackId.IsValid()
+                    ? FindDescendantByTypeName(host, trackId, "Thumb")
+                    : aero::VisualNodeId{};
+                const aero::VisualNode* thumbNode = thumbId.IsValid() ? host.World().GetNode(thumbId) : nullptr;
+                Require(thumbNode != nullptr, "Gallery #13 multiline TextBox ScrollBar Thumb missing");
+                if (thumbNode) {
+                    const aero::Rect thumbVp = NodeViewportBounds(*thumbNode);
+                    const float dragStartX = thumbVp.x + thumbVp.width * 0.5f;
+                    const float dragStartY = thumbVp.y + thumbVp.height * 0.5f;
+                    float tbOffBeforeDrag = 0.0f;
+                    (void)ReadFloatMember(host, hostSvNode->scriptOwner, "VerticalOffset", tbOffBeforeDrag);
+
+                    host.InjectPointerMove(dragStartX, dragStartY);
+                    host.StepFrame(1.0f / 60.0f, true);
+                    host.InjectPointerButton(dragStartX, dragStartY, aero::PointerButton::Left, true);
+                    host.StepFrame(1.0f / 60.0f, true);
+                    host.InjectPointerMove(dragStartX, dragStartY + 28.0f);
+                    host.StepFrame(1.0f / 60.0f, true);
+                    host.InjectPointerButton(dragStartX, dragStartY + 28.0f, aero::PointerButton::Left, false);
+                    for (int f = 0; f < 4; ++f) { host.StepFrame(1.0f / 60.0f, f == 3); }
+
+                    float tbOffAfterDrag = 0.0f;
+                    (void)ReadFloatMember(host, hostSvNode->scriptOwner, "VerticalOffset", tbOffAfterDrag);
+                    Require(tbOffAfterDrag > tbOffBeforeDrag + 15.0f,
+                        "Gallery #13 ScrollBar Thumb drag must advance VerticalOffset (before=" +
+                        std::to_string(tbOffBeforeDrag) + ", after=" + std::to_string(tbOffAfterDrag) + ")");
+                }
+
+                host.InjectPointerMove(5.0f, 5.0f);
+                host.StepFrame(1.0f / 60.0f, false);
+            }
         }
 
         // #14 ListBox SelectionMode binding (Multiple allows multi-selection)

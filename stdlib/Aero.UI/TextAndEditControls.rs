@@ -101,9 +101,17 @@ public class TextBoxBase : Control {
         get { return _isReadOnly; }
         set { _isReadOnly = value; BumpPropEpoch(); RefreshTextVisual(); SyncImeState(); }
     }
+    protected virtual bool IsMultilineLayout() { return _acceptsReturn; }
+
+    protected void SyncTextVisualAlignment() {
+        if (_textVisual != null) {
+            _textVisual.VerticalAlignment = IsMultilineLayout() ? VerticalAlignment.Top : VerticalAlignment.Center;
+        }
+    }
+
     public bool AcceptsReturn {
         get { return _acceptsReturn; }
-        set { _acceptsReturn = value; BumpPropEpoch(); }
+        set { _acceptsReturn = value; BumpPropEpoch(); SyncTextVisualAlignment(); }
     }
     public int MaxLength {
         get { return _maxLength; }
@@ -442,7 +450,7 @@ public class TextBoxBase : Control {
 
     public override void OnMouseLeftButtonDown(MouseButtonEventArgs e) {
         base.OnMouseLeftButtonDown(e);
-        if (!IsEnabled) { return; }
+        if (e.Handled || !IsEnabled) { return; }
         Focus();
         if (_textVisual != null && ParseUtil.IsValidHandle(_textVisual.__nativeHandle)) {
             float lx = Visual_ScreenToLocal(_textVisual.__nativeHandle, e.X, e.Y, 0);
@@ -473,6 +481,19 @@ public class TextBoxBase : Control {
         }
     }
 
+    public override void OnMouseWheel(MouseWheelEventArgs e) {
+        base.OnMouseWheel(e);
+        if (e.Handled || !IsEnabled) { return; }
+        UIElement host = GetTemplateChild("PART_ContentHost");
+        if (host is ScrollViewer) {
+            ScrollViewer sv = host as ScrollViewer;
+            UIElement src = e.Source as UIElement;
+            if (src == null || (src != host && !host.IsAncestorOf(src))) {
+                sv.OnMouseWheel(e);
+            }
+        }
+    }
+
     public override void OnKeyDown(KeyEventArgs e) {
         base.OnKeyDown(e);
         if (!IsEnabled) { return; }
@@ -498,12 +519,12 @@ public class TextBoxBase : Control {
             e.Handled = true;
             return;
         }
-        if (e.Key == KeyCode.Up && _acceptsReturn && _textVisual != null && ParseUtil.IsValidHandle(_textVisual.__nativeHandle)) {
+        if (e.Key == KeyCode.Up && IsMultilineLayout() && _textVisual != null && ParseUtil.IsValidHandle(_textVisual.__nativeHandle)) {
             MoveCaretVertical(-1, shift);
             e.Handled = true;
             return;
         }
-        if (e.Key == KeyCode.Down && _acceptsReturn && _textVisual != null && ParseUtil.IsValidHandle(_textVisual.__nativeHandle)) {
+        if (e.Key == KeyCode.Down && IsMultilineLayout() && _textVisual != null && ParseUtil.IsValidHandle(_textVisual.__nativeHandle)) {
             MoveCaretVertical(1, shift);
             e.Handled = true;
             return;
@@ -546,7 +567,7 @@ public class TextBoxBase : Control {
             _textVisual.FontSize = FontSize;
             _textVisual.FontWeight = FontWeight;
             _textVisual.FontStyle = FontStyle;
-            _textVisual.VerticalAlignment = _acceptsReturn ? VerticalAlignment.Top : VerticalAlignment.Center;
+            SyncTextVisualAlignment();
             _textVisual.Margin = new Thickness(2.0f, 0.0f, 2.0f, 0.0f);
             if (host is ContentControl) {
                 ContentControl cc = host as ContentControl;
@@ -701,11 +722,16 @@ public class TextBox : TextBoxBase {
         set { ReplaceSelection(value); }
     }
 
+    protected override bool IsMultilineLayout() {
+        return AcceptsReturn || _textWrapping != TextWrapping.NoWrap || _maxLines > 1 || _minLines > 1;
+    }
+
     public TextWrapping TextWrapping {
         get { return _textWrapping; }
         set {
             _textWrapping = value;
             if (_textVisual != null) { _textVisual.TextWrapping = value; }
+            SyncTextVisualAlignment();
             UIElement host = GetTemplateChild("PART_ContentHost");
             if (host is ContentControl) {
                 if (_textWrapping != TextWrapping.NoWrap) {
@@ -764,6 +790,7 @@ public class TextBox : TextBoxBase {
             _textVisual.TextWrapping = _textWrapping;
             _textVisual.TextAlignment = _textAlignment;
         }
+        SyncTextVisualAlignment();
         UIElement host = GetTemplateChild("PART_ContentHost");
         if (host is ContentControl && _textWrapping != TextWrapping.NoWrap) {
             if (GetPropertyValue("ScrollViewer.HorizontalScrollBarVisibility") == null) {
@@ -775,11 +802,11 @@ public class TextBox : TextBoxBase {
 
     public int MaxLines {
         get { return _maxLines; }
-        set { _maxLines = value > 0 ? value : 0; SyncLineCountHeight(); }
+        set { _maxLines = value > 0 ? value : 0; SyncLineCountHeight(); SyncTextVisualAlignment(); }
     }
     public int MinLines {
         get { return _minLines; }
-        set { _minLines = value > 1 ? value : 1; SyncLineCountHeight(); }
+        set { _minLines = value > 1 ? value : 1; SyncLineCountHeight(); SyncTextVisualAlignment(); }
     }
 
     protected override void OnRawTextChanged(string newRaw) {

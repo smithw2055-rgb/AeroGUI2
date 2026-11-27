@@ -37,6 +37,8 @@ int __rs_native_Visual_SetClipToBounds(handle node, bool clip) { return 0; }
 public void Visual_SetClipToBounds(handle node, bool clip) { __rs_native_Visual_SetClipToBounds(node, clip); return; }
 int __rs_native_Visual_SetInteractiveFlags(handle node, bool enabled, bool hitTest, bool focusable) { return 0; }
 public void Visual_SetInteractiveFlags(handle node, bool enabled, bool hitTest, bool focusable) { __rs_native_Visual_SetInteractiveFlags(node, enabled, hitTest, focusable); return; }
+int __rs_native_Visual_SetHitTestBorderOnly(handle node, bool borderOnly) { return 0; }
+public void Visual_SetHitTestBorderOnly(handle node, bool borderOnly) { __rs_native_Visual_SetHitTestBorderOnly(node, borderOnly); return; }
 int __rs_native_Visual_SetLayoutMode(handle node, int mode, float p0, float p1, int i0, int i1) { return 0; }
 public void Visual_SetLayoutMode(handle node, int mode, float p0, float p1, int i0, int i1) { __rs_native_Visual_SetLayoutMode(node, mode, p0, p1, i0, i1); return; }
 int __rs_native_Visual_GridClearDefs(handle node) { return 0; }

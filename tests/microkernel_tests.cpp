@@ -669,6 +669,27 @@ void TestHitTestTransformsAndInputRouter() {
 
     router.SetClipboardText("hello_aero");
     CHECK(router.GetClipboardText() == "hello_aero");
+
+    // Border-only hit testing: hollow overlay box (bgRgba == 0, BorderThickness == 2) lets interior hits pass through
+    auto underBox = w.CreateNode(aero::VisualKind::Box);
+    auto hollowBorder = w.CreateNode(aero::VisualKind::Box);
+    w.AddChild(root, underBox);
+    w.AddChild(root, hollowBorder);
+    w.SetSize(underBox, 100.0f, 60.0f);
+    w.SetCanvasOffsets(underBox, 320.0f, 200.0f, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::quiet_NaN());
+    w.SetBoxStyle(underBox, 0xFF112233u, 0u, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+    w.SetInteractiveFlags(underBox, true, true, false);
+    w.SetSize(hollowBorder, 100.0f, 60.0f);
+    w.SetCanvasOffsets(hollowBorder, 320.0f, 200.0f, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::quiet_NaN());
+    w.SetBoxStyle(hollowBorder, 0u, 0xFFFFFFFFu, 2.0f, 2.0f, 2.0f, 2.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+    w.SetInteractiveFlags(hollowBorder, true, true, false);
+    w.SetHitTestBorderOnly(hollowBorder, true);
+    w.UpdateLayout(500.0f, 400.0f);
+
+    CHECK(router.HitTest(aero::Point{370.0f, 230.0f}) == underBox);
+    CHECK(router.HitTest(aero::Point{321.0f, 230.0f}) == hollowBorder);
+    w.SetHitTestBorderOnly(hollowBorder, false);
+    CHECK(router.HitTest(aero::Point{370.0f, 230.0f}) == hollowBorder);
 }
 
 void TestVisualRenderAdapterAndRasterizer() {
