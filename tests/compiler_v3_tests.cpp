@@ -836,6 +836,9 @@ public void RunVoidProbe(handle h) {
     const bool runSlow = ShouldRunSlowAotOptTests();
     aero::AeroV3CompileInput input;
     input.includeStdlib = true;
+    input.stdlibPackages = aero::AeroStdlibPkg_Core | aero::AeroStdlibPkg_Controls;
+    input.allowDiskCache = false;
+    input.allowStdlibCache = false;
     input.treeShakeStdlib = false;
     input.optimizeBytecode = runSlow;
     input.emitAotCpp = runSlow;
